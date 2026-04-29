@@ -142,17 +142,21 @@ void testDeposit(const std::vector<std::size_t>&      res,
 
   auto J_scat = Kokkos::Experimental::create_scatter_view(J);
 
-  // clang-format off
-  Kokkos::parallel_for("CurrentsDeposit", 10,
+  const kernel::DepositArrays arrays {
+    i1.data(),       i2.data(),       i3.data(),
+    i1_prev.data(),  i2_prev.data(),  i3_prev.data(),
+    dx1.data(),      dx2.data(),      dx3.data(),
+    dx1_prev.data(), dx2_prev.data(), dx3_prev.data(),
+    ux1.data(),      ux2.data(),      ux3.data(),
+    phi.data(),      weight.data(),   tag.data(),
+  };
+  Kokkos::parallel_for("CurrentsDeposit",
+                       10,
                        kernel::DepositCurrents_kernel<S, M, O>(J_scat,
-                                                            i1, i2, i3,
-                                                            i1_prev, i2_prev, i3_prev,
-                                                            dx1, dx2, dx3,
-                                                            dx1_prev, dx2_prev, dx3_prev,
-                                                            ux1, ux2, ux3,
-                                                            phi, weight, tag,
-                                                            metric, charge, inv_dt));
-  // clang-format on
+                                                               arrays,
+                                                               metric,
+                                                               charge,
+                                                               inv_dt));
 
   Kokkos::Experimental::contribute(J, J_scat);
 

@@ -27,6 +27,32 @@
 namespace kernel {
   using namespace ntt;
 
+  // Raw-pointer view of the per-particle SoA arrays used by
+  // DepositCurrents_kernel. Packing 18 pointers (~144 B) instead of 13
+  // Kokkos::View handles (~1352 B) shrinks the kernel argument so it fits
+  // in GRF — Advisor's `rec_kernel_complex_structure_c_dpcpp` recommendation.
+  // The caller must keep the underlying Views alive for the kernel's lifetime.
+  struct DepositArrays {
+    const int*      i1;
+    const int*      i2;
+    const int*      i3;
+    const int*      i1_prev;
+    const int*      i2_prev;
+    const int*      i3_prev;
+    const prtldx_t* dx1;
+    const prtldx_t* dx2;
+    const prtldx_t* dx3;
+    const prtldx_t* dx1_prev;
+    const prtldx_t* dx2_prev;
+    const prtldx_t* dx3_prev;
+    const real_t*   ux1;
+    const real_t*   ux2;
+    const real_t*   ux3;
+    const real_t*   phi;
+    const real_t*   weight;
+    const short*    tag;
+  };
+
   /**
    * @brief Algorithm for the current deposition
    */
@@ -35,63 +61,19 @@ namespace kernel {
     static_assert(O <= 11u, "Shape function order O must be <= 11");
     static constexpr auto D = M::Dim;
 
-    scatter_ndfield_t<D, 3>  J;
-    const array_t<int*>      i1, i2, i3;
-    const array_t<int*>      i1_prev, i2_prev, i3_prev;
-    const array_t<prtldx_t*> dx1, dx2, dx3;
-    const array_t<prtldx_t*> dx1_prev, dx2_prev, dx3_prev;
-    const array_t<real_t*>   ux1, ux2, ux3;
-    const array_t<real_t*>   phi;
-    const array_t<real_t*>   weight;
-    const array_t<short*>    tag;
-    const M                  metric;
-    const real_t             charge, inv_dt;
+    scatter_ndfield_t<D, 3> J;
+    const DepositArrays     arrays;
+    const M                 metric;
+    const real_t            charge, inv_dt;
 
   public:
-    /**
-     * @brief explicit constructor.
-     */
     DepositCurrents_kernel(const scatter_ndfield_t<D, 3>& scatter_cur,
-                           const array_t<int*>&           i1,
-                           const array_t<int*>&           i2,
-                           const array_t<int*>&           i3,
-                           const array_t<int*>&           i1_prev,
-                           const array_t<int*>&           i2_prev,
-                           const array_t<int*>&           i3_prev,
-                           const array_t<prtldx_t*>&      dx1,
-                           const array_t<prtldx_t*>&      dx2,
-                           const array_t<prtldx_t*>&      dx3,
-                           const array_t<prtldx_t*>&      dx1_prev,
-                           const array_t<prtldx_t*>&      dx2_prev,
-                           const array_t<prtldx_t*>&      dx3_prev,
-                           const array_t<real_t*>&        ux1,
-                           const array_t<real_t*>&        ux2,
-                           const array_t<real_t*>&        ux3,
-                           const array_t<real_t*>&        phi,
-                           const array_t<real_t*>&        weight,
-                           const array_t<short*>&         tag,
+                           const DepositArrays&           arrays,
                            const M&                       metric,
                            real_t                         charge,
                            const real_t                   dt)
       : J { scatter_cur }
-      , i1 { i1 }
-      , i2 { i2 }
-      , i3 { i3 }
-      , i1_prev { i1_prev }
-      , i2_prev { i2_prev }
-      , i3_prev { i3_prev }
-      , dx1 { dx1 }
-      , dx2 { dx2 }
-      , dx3 { dx3 }
-      , dx1_prev { dx1_prev }
-      , dx2_prev { dx2_prev }
-      , dx3_prev { dx3_prev }
-      , ux1 { ux1 }
-      , ux2 { ux2 }
-      , ux3 { ux3 }
-      , phi { phi }
-      , weight { weight }
-      , tag { tag }
+      , arrays { arrays }
       , metric { metric }
       , charge { charge }
       , inv_dt { ONE / dt } {
@@ -106,7 +88,29 @@ namespace kernel {
      * @param p index.
      */
     Inline auto operator()(index_t p) const -> void {
-      if (tag(p) == ParticleTag::dead) {
+      // Local raw-pointer aliases: the kernel-arg shrink lives in the
+      // DepositArrays struct above; these aliases just preserve the body's
+      // original `name[p]` syntax.
+      const int* const      i1       = arrays.i1;
+      const int* const      i2       = arrays.i2;
+      const int* const      i3       = arrays.i3;
+      const int* const      i1_prev  = arrays.i1_prev;
+      const int* const      i2_prev  = arrays.i2_prev;
+      const int* const      i3_prev  = arrays.i3_prev;
+      const prtldx_t* const dx1      = arrays.dx1;
+      const prtldx_t* const dx2      = arrays.dx2;
+      const prtldx_t* const dx3      = arrays.dx3;
+      const prtldx_t* const dx1_prev = arrays.dx1_prev;
+      const prtldx_t* const dx2_prev = arrays.dx2_prev;
+      const prtldx_t* const dx3_prev = arrays.dx3_prev;
+      const real_t* const   ux1      = arrays.ux1;
+      const real_t* const   ux2      = arrays.ux2;
+      const real_t* const   ux3      = arrays.ux3;
+      const real_t* const   phi      = arrays.phi;
+      const real_t* const   weight   = arrays.weight;
+      const short* const    tag      = arrays.tag;
+
+      if (tag[p] == ParticleTag::dead) {
         return;
       }
       // recover particle velocity to deposit in unsimulated direction
@@ -114,27 +118,27 @@ namespace kernel {
       {
         coord_t<M::PrtlDim> xp { ZERO };
         if constexpr (D == Dim::_1D) {
-          xp[0] = i_di_to_Xi(i1(p), dx1(p));
+          xp[0] = i_di_to_Xi(i1[p], dx1[p]);
         } else if constexpr (D == Dim::_2D) {
           if constexpr (M::PrtlDim == Dim::_3D) {
-            xp[0] = i_di_to_Xi(i1(p), dx1(p));
-            xp[1] = i_di_to_Xi(i2(p), dx2(p));
-            xp[2] = phi(p);
+            xp[0] = i_di_to_Xi(i1[p], dx1[p]);
+            xp[1] = i_di_to_Xi(i2[p], dx2[p]);
+            xp[2] = phi[p];
           } else {
-            xp[0] = i_di_to_Xi(i1(p), dx1(p));
-            xp[1] = i_di_to_Xi(i2(p), dx2(p));
+            xp[0] = i_di_to_Xi(i1[p], dx1[p]);
+            xp[1] = i_di_to_Xi(i2[p], dx2[p]);
           }
         } else {
-          xp[0] = i_di_to_Xi(i1(p), dx1(p));
-          xp[1] = i_di_to_Xi(i2(p), dx2(p));
-          xp[2] = i_di_to_Xi(i3(p), dx3(p));
+          xp[0] = i_di_to_Xi(i1[p], dx1[p]);
+          xp[1] = i_di_to_Xi(i2[p], dx2[p]);
+          xp[2] = i_di_to_Xi(i3[p], dx3[p]);
         }
         auto inv_energy { ZERO };
         if constexpr (S == SimEngine::SRPIC) {
           metric.template transform_xyz<Idx::XYZ, Idx::U>(xp,
-                                                          { ux1(p), ux2(p), ux3(p) },
+                                                          { ux1[p], ux2[p], ux3[p] },
                                                           vp);
-          inv_energy = ONE / math::sqrt(ONE + NORM_SQR(ux1(p), ux2(p), ux3(p)));
+          inv_energy = ONE / math::sqrt(ONE + NORM_SQR(ux1[p], ux2[p], ux3[p]));
         } else {
           coord_t<Dim::_2D> xp_ { ZERO };
           xp_[0] = xp[0];
@@ -151,11 +155,11 @@ namespace kernel {
           }
           xp_[1] = theta_Cd;
           metric.template transform<Idx::D, Idx::U>(xp_,
-                                                    { ux1(p), ux2(p), ux3(p) },
+                                                    { ux1[p], ux2[p], ux3[p] },
                                                     vp);
           inv_energy = metric.alpha(xp_) /
-                       math::sqrt(ONE + ux1(p) * vp[0] + ux2(p) * vp[1] +
-                                  ux3(p) * vp[2]);
+                       math::sqrt(ONE + ux1[p] * vp[0] + ux2[p] * vp[1] +
+                                  ux3[p] * vp[2]);
         }
         if (Kokkos::isnan(vp[2]) || Kokkos::isinf(vp[2])) {
           vp[2] = ZERO;
@@ -165,30 +169,30 @@ namespace kernel {
         vp[2] *= inv_energy;
       }
 
-      const real_t coeff { weight(p) * charge };
+      const real_t coeff { weight[p] * charge };
 
       // ToDo: interpolation_order as parameter
       if constexpr (O == 0u) {
         /*
           Zig-zag deposit
         */
-        const auto dxp_r_1 { static_cast<prtldx_t>(i1(p) == i1_prev(p)) *
-                             (dx1(p) + dx1_prev(p)) *
+        const auto dxp_r_1 { static_cast<prtldx_t>(i1[p] == i1_prev[p]) *
+                             (dx1[p] + dx1_prev[p]) *
                              static_cast<prtldx_t>(INV_2) };
 
-        const real_t Wx1_1 { INV_2 * (dxp_r_1 + dx1_prev(p) +
-                                      static_cast<real_t>(i1(p) > i1_prev(p))) };
-        const real_t Wx1_2 { INV_2 * (dx1(p) + dxp_r_1 +
+        const real_t Wx1_1 { INV_2 * (dxp_r_1 + dx1_prev[p] +
+                                      static_cast<real_t>(i1[p] > i1_prev[p])) };
+        const real_t Wx1_2 { INV_2 * (dx1[p] + dxp_r_1 +
                                       static_cast<real_t>(
-                                        static_cast<int>(i1(p) > i1_prev(p)) +
-                                        i1_prev(p) - i1(p))) };
-        const real_t Fx1_1 { (static_cast<real_t>(i1(p) > i1_prev(p)) +
-                              dxp_r_1 - dx1_prev(p)) *
+                                        static_cast<int>(i1[p] > i1_prev[p]) +
+                                        i1_prev[p] - i1[p])) };
+        const real_t Fx1_1 { (static_cast<real_t>(i1[p] > i1_prev[p]) +
+                              dxp_r_1 - dx1_prev[p]) *
                              coeff * inv_dt };
         const real_t Fx1_2 { (static_cast<real_t>(
-                                i1(p) - i1_prev(p) -
-                                static_cast<int>(i1(p) > i1_prev(p))) +
-                              dx1(p) - dxp_r_1) *
+                                i1[p] - i1_prev[p] -
+                                static_cast<int>(i1[p] > i1_prev[p])) +
+                              dx1[p] - dxp_r_1) *
                              coeff * inv_dt };
 
         auto J_acc = J.access();
@@ -200,206 +204,206 @@ namespace kernel {
           const real_t Fx3_1 { HALF * vp[2] * coeff };
           const real_t Fx3_2 { HALF * vp[2] * coeff };
 
-          J_acc(i1_prev(p) + N_GHOSTS, cur::jx1) += Fx1_1;
-          J_acc(i1(p) + N_GHOSTS, cur::jx1)      += Fx1_2;
+          J_acc(i1_prev[p] + N_GHOSTS, cur::jx1) += Fx1_1;
+          J_acc(i1[p] + N_GHOSTS, cur::jx1)      += Fx1_2;
 
-          J_acc(i1_prev(p) + N_GHOSTS, cur::jx2)     += Fx2_1 * (ONE - Wx1_1);
-          J_acc(i1_prev(p) + N_GHOSTS + 1, cur::jx2) += Fx2_1 * Wx1_1;
-          J_acc(i1(p) + N_GHOSTS, cur::jx2)          += Fx2_2 * (ONE - Wx1_2);
-          J_acc(i1(p) + N_GHOSTS + 1, cur::jx2)      += Fx2_2 * Wx1_2;
+          J_acc(i1_prev[p] + N_GHOSTS, cur::jx2)     += Fx2_1 * (ONE - Wx1_1);
+          J_acc(i1_prev[p] + N_GHOSTS + 1, cur::jx2) += Fx2_1 * Wx1_1;
+          J_acc(i1[p] + N_GHOSTS, cur::jx2)          += Fx2_2 * (ONE - Wx1_2);
+          J_acc(i1[p] + N_GHOSTS + 1, cur::jx2)      += Fx2_2 * Wx1_2;
 
-          J_acc(i1_prev(p) + N_GHOSTS, cur::jx3)     += Fx3_1 * (ONE - Wx1_1);
-          J_acc(i1_prev(p) + N_GHOSTS + 1, cur::jx3) += Fx3_1 * Wx1_1;
-          J_acc(i1(p) + N_GHOSTS, cur::jx3)          += Fx3_2 * (ONE - Wx1_2);
-          J_acc(i1(p) + N_GHOSTS + 1, cur::jx3)      += Fx3_2 * Wx1_2;
+          J_acc(i1_prev[p] + N_GHOSTS, cur::jx3)     += Fx3_1 * (ONE - Wx1_1);
+          J_acc(i1_prev[p] + N_GHOSTS + 1, cur::jx3) += Fx3_1 * Wx1_1;
+          J_acc(i1[p] + N_GHOSTS, cur::jx3)          += Fx3_2 * (ONE - Wx1_2);
+          J_acc(i1[p] + N_GHOSTS + 1, cur::jx3)      += Fx3_2 * Wx1_2;
         } else if constexpr (D == Dim::_2D || D == Dim::_3D) {
-          const auto dxp_r_2 { static_cast<prtldx_t>(i2(p) == i2_prev(p)) *
-                               (dx2(p) + dx2_prev(p)) *
+          const auto dxp_r_2 { static_cast<prtldx_t>(i2[p] == i2_prev[p]) *
+                               (dx2[p] + dx2_prev[p]) *
                                static_cast<prtldx_t>(INV_2) };
 
-          const real_t Wx2_1 { INV_2 * (dxp_r_2 + dx2_prev(p) +
-                                        static_cast<real_t>(i2(p) > i2_prev(p))) };
-          const real_t Wx2_2 { INV_2 * (dx2(p) + dxp_r_2 +
+          const real_t Wx2_1 { INV_2 * (dxp_r_2 + dx2_prev[p] +
+                                        static_cast<real_t>(i2[p] > i2_prev[p])) };
+          const real_t Wx2_2 { INV_2 * (dx2[p] + dxp_r_2 +
                                         static_cast<real_t>(
-                                          static_cast<int>(i2(p) > i2_prev(p)) +
-                                          i2_prev(p) - i2(p))) };
-          const real_t Fx2_1 { (static_cast<real_t>(i2(p) > i2_prev(p)) +
-                                dxp_r_2 - dx2_prev(p)) *
+                                          static_cast<int>(i2[p] > i2_prev[p]) +
+                                          i2_prev[p] - i2[p])) };
+          const real_t Fx2_1 { (static_cast<real_t>(i2[p] > i2_prev[p]) +
+                                dxp_r_2 - dx2_prev[p]) *
                                coeff * inv_dt };
           const real_t Fx2_2 { (static_cast<real_t>(
-                                  i2(p) - i2_prev(p) -
-                                  static_cast<int>(i2(p) > i2_prev(p))) +
-                                dx2(p) - dxp_r_2) *
+                                  i2[p] - i2_prev[p] -
+                                  static_cast<int>(i2[p] > i2_prev[p])) +
+                                dx2[p] - dxp_r_2) *
                                coeff * inv_dt };
 
           if constexpr (D == Dim::_2D) {
             const real_t Fx3_1 { HALF * vp[2] * coeff };
             const real_t Fx3_2 { HALF * vp[2] * coeff };
 
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS,
                   cur::jx1) += Fx1_1 * (ONE - Wx2_1);
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS + 1,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS + 1,
                   cur::jx1) += Fx1_1 * Wx2_1;
-            J_acc(i1(p) + N_GHOSTS, i2(p) + N_GHOSTS, cur::jx1) += Fx1_2 *
+            J_acc(i1[p] + N_GHOSTS, i2[p] + N_GHOSTS, cur::jx1) += Fx1_2 *
                                                                    (ONE - Wx2_2);
-            J_acc(i1(p) + N_GHOSTS, i2(p) + N_GHOSTS + 1, cur::jx1) += Fx1_2 * Wx2_2;
+            J_acc(i1[p] + N_GHOSTS, i2[p] + N_GHOSTS + 1, cur::jx1) += Fx1_2 * Wx2_2;
 
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS,
                   cur::jx2) += Fx2_1 * (ONE - Wx1_1);
-            J_acc(i1_prev(p) + N_GHOSTS + 1,
-                  i2_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS + 1,
+                  i2_prev[p] + N_GHOSTS,
                   cur::jx2) += Fx2_1 * Wx1_1;
-            J_acc(i1(p) + N_GHOSTS, i2(p) + N_GHOSTS, cur::jx2) += Fx2_2 *
+            J_acc(i1[p] + N_GHOSTS, i2[p] + N_GHOSTS, cur::jx2) += Fx2_2 *
                                                                    (ONE - Wx1_2);
-            J_acc(i1(p) + N_GHOSTS + 1, i2(p) + N_GHOSTS, cur::jx2) += Fx2_2 * Wx1_2;
+            J_acc(i1[p] + N_GHOSTS + 1, i2[p] + N_GHOSTS, cur::jx2) += Fx2_2 * Wx1_2;
 
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS,
                   cur::jx3) += Fx3_1 * (ONE - Wx1_1) * (ONE - Wx2_1);
-            J_acc(i1_prev(p) + N_GHOSTS + 1,
-                  i2_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS + 1,
+                  i2_prev[p] + N_GHOSTS,
                   cur::jx3) += Fx3_1 * Wx1_1 * (ONE - Wx2_1);
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS + 1,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS + 1,
                   cur::jx3) += Fx3_1 * (ONE - Wx1_1) * Wx2_1;
-            J_acc(i1_prev(p) + N_GHOSTS + 1,
-                  i2_prev(p) + N_GHOSTS + 1,
+            J_acc(i1_prev[p] + N_GHOSTS + 1,
+                  i2_prev[p] + N_GHOSTS + 1,
                   cur::jx3) += Fx3_1 * Wx1_1 * Wx2_1;
 
-            J_acc(i1(p) + N_GHOSTS,
-                  i2(p) + N_GHOSTS,
+            J_acc(i1[p] + N_GHOSTS,
+                  i2[p] + N_GHOSTS,
                   cur::jx3) += Fx3_2 * (ONE - Wx1_2) * (ONE - Wx2_2);
-            J_acc(i1(p) + N_GHOSTS + 1,
-                  i2(p) + N_GHOSTS,
+            J_acc(i1[p] + N_GHOSTS + 1,
+                  i2[p] + N_GHOSTS,
                   cur::jx3) += Fx3_2 * Wx1_2 * (ONE - Wx2_2);
-            J_acc(i1(p) + N_GHOSTS,
-                  i2(p) + N_GHOSTS + 1,
+            J_acc(i1[p] + N_GHOSTS,
+                  i2[p] + N_GHOSTS + 1,
                   cur::jx3) += Fx3_2 * (ONE - Wx1_2) * Wx2_2;
-            J_acc(i1(p) + N_GHOSTS + 1,
-                  i2(p) + N_GHOSTS + 1,
+            J_acc(i1[p] + N_GHOSTS + 1,
+                  i2[p] + N_GHOSTS + 1,
                   cur::jx3) += Fx3_2 * Wx1_2 * Wx2_2;
           } else {
-            const auto dxp_r_3 { static_cast<prtldx_t>(i3(p) == i3_prev(p)) *
-                                 (dx3(p) + dx3_prev(p)) *
+            const auto dxp_r_3 { static_cast<prtldx_t>(i3[p] == i3_prev[p]) *
+                                 (dx3[p] + dx3_prev[p]) *
                                  static_cast<prtldx_t>(INV_2) };
-            const real_t Wx3_1 { INV_2 * (dxp_r_3 + dx3_prev(p) +
-                                          static_cast<real_t>(i3(p) > i3_prev(p))) };
-            const real_t Wx3_2 { INV_2 * (dx3(p) + dxp_r_3 +
+            const real_t Wx3_1 { INV_2 * (dxp_r_3 + dx3_prev[p] +
+                                          static_cast<real_t>(i3[p] > i3_prev[p])) };
+            const real_t Wx3_2 { INV_2 * (dx3[p] + dxp_r_3 +
                                           static_cast<real_t>(
-                                            static_cast<int>(i3(p) > i3_prev(p)) +
-                                            i3_prev(p) - i3(p))) };
-            const real_t Fx3_1 { (static_cast<real_t>(i3(p) > i3_prev(p)) +
-                                  dxp_r_3 - dx3_prev(p)) *
+                                            static_cast<int>(i3[p] > i3_prev[p]) +
+                                            i3_prev[p] - i3[p])) };
+            const real_t Fx3_1 { (static_cast<real_t>(i3[p] > i3_prev[p]) +
+                                  dxp_r_3 - dx3_prev[p]) *
                                  coeff * inv_dt };
             const real_t Fx3_2 { (static_cast<real_t>(
-                                    i3(p) - i3_prev(p) -
-                                    static_cast<int>(i3(p) > i3_prev(p))) +
-                                  dx3(p) - dxp_r_3) *
+                                    i3[p] - i3_prev[p] -
+                                    static_cast<int>(i3[p] > i3_prev[p])) +
+                                  dx3[p] - dxp_r_3) *
                                  coeff * inv_dt };
 
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS,
-                  i3_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS,
+                  i3_prev[p] + N_GHOSTS,
                   cur::jx1) += Fx1_1 * (ONE - Wx2_1) * (ONE - Wx3_1);
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS + 1,
-                  i3_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS + 1,
+                  i3_prev[p] + N_GHOSTS,
                   cur::jx1) += Fx1_1 * Wx2_1 * (ONE - Wx3_1);
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS,
-                  i3_prev(p) + N_GHOSTS + 1,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS,
+                  i3_prev[p] + N_GHOSTS + 1,
                   cur::jx1) += Fx1_1 * (ONE - Wx2_1) * Wx3_1;
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS + 1,
-                  i3_prev(p) + N_GHOSTS + 1,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS + 1,
+                  i3_prev[p] + N_GHOSTS + 1,
                   cur::jx1) += Fx1_1 * Wx2_1 * Wx3_1;
 
-            J_acc(i1(p) + N_GHOSTS,
-                  i2(p) + N_GHOSTS,
-                  i3(p) + N_GHOSTS,
+            J_acc(i1[p] + N_GHOSTS,
+                  i2[p] + N_GHOSTS,
+                  i3[p] + N_GHOSTS,
                   cur::jx1) += Fx1_2 * (ONE - Wx2_2) * (ONE - Wx3_2);
-            J_acc(i1(p) + N_GHOSTS,
-                  i2(p) + N_GHOSTS + 1,
-                  i3(p) + N_GHOSTS,
+            J_acc(i1[p] + N_GHOSTS,
+                  i2[p] + N_GHOSTS + 1,
+                  i3[p] + N_GHOSTS,
                   cur::jx1) += Fx1_2 * Wx2_2 * (ONE - Wx3_2);
-            J_acc(i1(p) + N_GHOSTS,
-                  i2(p) + N_GHOSTS,
-                  i3(p) + N_GHOSTS + 1,
+            J_acc(i1[p] + N_GHOSTS,
+                  i2[p] + N_GHOSTS,
+                  i3[p] + N_GHOSTS + 1,
                   cur::jx1) += Fx1_2 * (ONE - Wx2_2) * Wx3_2;
-            J_acc(i1(p) + N_GHOSTS,
-                  i2(p) + N_GHOSTS + 1,
-                  i3(p) + N_GHOSTS + 1,
+            J_acc(i1[p] + N_GHOSTS,
+                  i2[p] + N_GHOSTS + 1,
+                  i3[p] + N_GHOSTS + 1,
                   cur::jx1) += Fx1_2 * Wx2_2 * Wx3_2;
 
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS,
-                  i3_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS,
+                  i3_prev[p] + N_GHOSTS,
                   cur::jx2) += Fx2_1 * (ONE - Wx1_1) * (ONE - Wx3_1);
-            J_acc(i1_prev(p) + N_GHOSTS + 1,
-                  i2_prev(p) + N_GHOSTS,
-                  i3_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS + 1,
+                  i2_prev[p] + N_GHOSTS,
+                  i3_prev[p] + N_GHOSTS,
                   cur::jx2) += Fx2_1 * Wx1_1 * (ONE - Wx3_1);
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS,
-                  i3_prev(p) + N_GHOSTS + 1,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS,
+                  i3_prev[p] + N_GHOSTS + 1,
                   cur::jx2) += Fx2_1 * (ONE - Wx1_1) * Wx3_1;
-            J_acc(i1_prev(p) + N_GHOSTS + 1,
-                  i2_prev(p) + N_GHOSTS,
-                  i3_prev(p) + N_GHOSTS + 1,
+            J_acc(i1_prev[p] + N_GHOSTS + 1,
+                  i2_prev[p] + N_GHOSTS,
+                  i3_prev[p] + N_GHOSTS + 1,
                   cur::jx2) += Fx2_1 * Wx1_1 * Wx3_1;
 
-            J_acc(i1(p) + N_GHOSTS,
-                  i2(p) + N_GHOSTS,
-                  i3(p) + N_GHOSTS,
+            J_acc(i1[p] + N_GHOSTS,
+                  i2[p] + N_GHOSTS,
+                  i3[p] + N_GHOSTS,
                   cur::jx2) += Fx2_2 * (ONE - Wx1_2) * (ONE - Wx3_2);
-            J_acc(i1(p) + N_GHOSTS + 1,
-                  i2(p) + N_GHOSTS,
-                  i3(p) + N_GHOSTS,
+            J_acc(i1[p] + N_GHOSTS + 1,
+                  i2[p] + N_GHOSTS,
+                  i3[p] + N_GHOSTS,
                   cur::jx2) += Fx2_2 * Wx1_2 * (ONE - Wx3_2);
-            J_acc(i1(p) + N_GHOSTS,
-                  i2(p) + N_GHOSTS,
-                  i3(p) + N_GHOSTS + 1,
+            J_acc(i1[p] + N_GHOSTS,
+                  i2[p] + N_GHOSTS,
+                  i3[p] + N_GHOSTS + 1,
                   cur::jx2) += Fx2_2 * (ONE - Wx1_2) * Wx3_2;
-            J_acc(i1(p) + N_GHOSTS + 1,
-                  i2(p) + N_GHOSTS,
-                  i3(p) + N_GHOSTS + 1,
+            J_acc(i1[p] + N_GHOSTS + 1,
+                  i2[p] + N_GHOSTS,
+                  i3[p] + N_GHOSTS + 1,
                   cur::jx2) += Fx2_2 * Wx1_2 * Wx3_2;
 
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS,
-                  i3_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS,
+                  i3_prev[p] + N_GHOSTS,
                   cur::jx3) += Fx3_1 * (ONE - Wx1_1) * (ONE - Wx2_1);
-            J_acc(i1_prev(p) + N_GHOSTS + 1,
-                  i2_prev(p) + N_GHOSTS,
-                  i3_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS + 1,
+                  i2_prev[p] + N_GHOSTS,
+                  i3_prev[p] + N_GHOSTS,
                   cur::jx3) += Fx3_1 * Wx1_1 * (ONE - Wx2_1);
-            J_acc(i1_prev(p) + N_GHOSTS,
-                  i2_prev(p) + N_GHOSTS + 1,
-                  i3_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS,
+                  i2_prev[p] + N_GHOSTS + 1,
+                  i3_prev[p] + N_GHOSTS,
                   cur::jx3) += Fx3_1 * (ONE - Wx1_1) * Wx2_1;
-            J_acc(i1_prev(p) + N_GHOSTS + 1,
-                  i2_prev(p) + N_GHOSTS + 1,
-                  i3_prev(p) + N_GHOSTS,
+            J_acc(i1_prev[p] + N_GHOSTS + 1,
+                  i2_prev[p] + N_GHOSTS + 1,
+                  i3_prev[p] + N_GHOSTS,
                   cur::jx3) += Fx3_1 * Wx1_1 * Wx2_1;
 
-            J_acc(i1(p) + N_GHOSTS,
-                  i2(p) + N_GHOSTS,
-                  i3(p) + N_GHOSTS,
+            J_acc(i1[p] + N_GHOSTS,
+                  i2[p] + N_GHOSTS,
+                  i3[p] + N_GHOSTS,
                   cur::jx3) += Fx3_2 * (ONE - Wx1_2) * (ONE - Wx2_2);
-            J_acc(i1(p) + N_GHOSTS + 1,
-                  i2(p) + N_GHOSTS,
-                  i3(p) + N_GHOSTS,
+            J_acc(i1[p] + N_GHOSTS + 1,
+                  i2[p] + N_GHOSTS,
+                  i3[p] + N_GHOSTS,
                   cur::jx3) += Fx3_2 * Wx1_2 * (ONE - Wx2_2);
-            J_acc(i1(p) + N_GHOSTS,
-                  i2(p) + N_GHOSTS + 1,
-                  i3(p) + N_GHOSTS,
+            J_acc(i1[p] + N_GHOSTS,
+                  i2[p] + N_GHOSTS + 1,
+                  i3[p] + N_GHOSTS,
                   cur::jx3) += Fx3_2 * (ONE - Wx1_2) * Wx2_2;
-            J_acc(i1(p) + N_GHOSTS + 1,
-                  i2(p) + N_GHOSTS + 1,
-                  i3(p) + N_GHOSTS,
+            J_acc(i1[p] + N_GHOSTS + 1,
+                  i2[p] + N_GHOSTS + 1,
+                  i3[p] + N_GHOSTS,
                   cur::jx3) += Fx3_2 * Wx1_2 * Wx2_2;
           }
         }
@@ -411,10 +415,10 @@ namespace kernel {
         int    i1_min, i1_max;
 
         // call shape function
-        prtl_shape::for_deposit<O>(i1_prev(p),
-                                   static_cast<real_t>(dx1_prev(p)),
-                                   i1(p),
-                                   static_cast<real_t>(dx1(p)),
+        prtl_shape::for_deposit<O>(i1_prev[p],
+                                   static_cast<real_t>(dx1_prev[p]),
+                                   i1[p],
+                                   static_cast<real_t>(dx1[p]),
                                    i1_min,
                                    i1_max,
                                    iS_x1,
@@ -476,10 +480,10 @@ namespace kernel {
           real_t iS_x2[O + 2], fS_x2[O + 2];
           int    i2_min, i2_max;
 
-          prtl_shape::for_deposit<O>(i2_prev(p),
-                                     static_cast<real_t>(dx2_prev(p)),
-                                     i2(p),
-                                     static_cast<real_t>(dx2(p)),
+          prtl_shape::for_deposit<O>(i2_prev[p],
+                                     static_cast<real_t>(dx2_prev[p]),
+                                     i2[p],
+                                     static_cast<real_t>(dx2[p]),
                                      i2_min,
                                      i2_max,
                                      iS_x2,
@@ -568,10 +572,10 @@ namespace kernel {
           // shape function in dim2
           real_t iS_x2[O + 2], fS_x2[O + 2];
           int    i2_min, i2_max;
-          prtl_shape::for_deposit<O>(i2_prev(p),
-                                     static_cast<real_t>(dx2_prev(p)),
-                                     i2(p),
-                                     static_cast<real_t>(dx2(p)),
+          prtl_shape::for_deposit<O>(i2_prev[p],
+                                     static_cast<real_t>(dx2_prev[p]),
+                                     i2[p],
+                                     static_cast<real_t>(dx2[p]),
                                      i2_min,
                                      i2_max,
                                      iS_x2,
@@ -580,10 +584,10 @@ namespace kernel {
           // shape function in dim3
           real_t iS_x3[O + 2], fS_x3[O + 2];
           int    i3_min, i3_max;
-          prtl_shape::for_deposit<O>(i3_prev(p),
-                                     static_cast<real_t>(dx3_prev(p)),
-                                     i3(p),
-                                     static_cast<real_t>(dx3(p)),
+          prtl_shape::for_deposit<O>(i3_prev[p],
+                                     static_cast<real_t>(dx3_prev[p]),
+                                     i3[p],
+                                     static_cast<real_t>(dx3[p]),
                                      i3_min,
                                      i3_max,
                                      iS_x3,
