@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is an astrophysical particle-in-cell plasma simulation code which works in arbitrary curvilinear coordinates and supports multiple simulation engines. It is built using the Kokkos performance portability library with C++20. It is parallelized with MPI, and uses the ADIOS2 library for outputting and checkpointing the simulation data.
 
+Entity also ships with an optional in-situ visualization interface to [Ascent](https://ascent.readthedocs.io/) (configured via `-D ascent=ON`). When enabled, the `[output.ascent]` block of the toml input controls which field quantities are published to Ascent each output cycle and which actions file (`actions_file`) drives the rendering pipeline. See `pgens/examples/ascent_cube` for a minimal example.
+
 ## Repository Structure
 
 ```

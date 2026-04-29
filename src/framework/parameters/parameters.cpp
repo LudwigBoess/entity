@@ -165,6 +165,45 @@ namespace ntt {
     output_params.read(dim, get<std::size_t>("particles.nspec"), toml_data);
     output_params.setParams(this);
 
+    /* [output.ascent] (in situ visualization) ------------------------------ */
+    set("output.ascent.enable",
+        toml::find_or<bool>(toml_data, "output", "ascent", "enable", false));
+    set("output.ascent.actions_file",
+        toml::find_or<std::string>(toml_data,
+                                   "output",
+                                   "ascent",
+                                   "actions_file",
+                                   ""));
+    set("output.ascent.fields",
+        toml::find_or<std::vector<std::string>>(toml_data,
+                                                "output",
+                                                "ascent",
+                                                "fields",
+                                                std::vector<std::string> {}));
+    {
+      // Cadence is independent of [output.fields]: when neither is set, fall
+      // back to the global [output] interval keys.
+      const auto a_int = toml::find_or<timestep_t>(toml_data,
+                                                   "output",
+                                                   "ascent",
+                                                   "interval",
+                                                   0);
+      const auto a_int_time = toml::find_or<simtime_t>(toml_data,
+                                                       "output",
+                                                       "ascent",
+                                                       "interval_time",
+                                                       -1.0);
+      if ((a_int == 0) and (a_int_time == -1.0)) {
+        set("output.ascent.interval",
+            get<timestep_t>("output.interval"));
+        set("output.ascent.interval_time",
+            get<simtime_t>("output.interval_time"));
+      } else {
+        set("output.ascent.interval", a_int);
+        set("output.ascent.interval_time", a_int_time);
+      }
+    }
+
     /* [checkpoint] --------------------------------------------------------- */
     set("checkpoint.interval",
         toml::find_or(toml_data,

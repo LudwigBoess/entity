@@ -40,5 +40,13 @@ Problem generators in this directory are just examples demonstrating how to use 
 
   https://github.com/user-attachments/assets/00edb648-af80-4d37-b1c2-c49872227d47
 
+- `ascent_cube`: minimal example demonstrating the in-situ visualization interface to [Ascent](https://ascent.readthedocs.io/). Renders a 3D pseudocolor plot of the `B3` component on a periodic cube every output cycle. Requires building Entity with `-D ascent=ON` (Ascent must be installed and discoverable via `Ascent_DIR`).
+
+- `turbulence_ascent`: 3D driven turbulence (re-using `pgens/turbulence`) with an Ascent pipeline that composites `B1, B2, B3` into a vector field, derives `|B|`, and ray-traces a volume render every render cycle. Requires `-D ascent=ON`.
+
+- `turbulence_lines`: same 3D turbulence setup as `turbulence_ascent`, but the Ascent pipeline traces magnetic field lines with the `streamline` filter from a uniform grid of seeds and rasterizes them as 3D tubes. Requires `-D ascent=ON`.
+
+- `turbulence_density_lines`: combines the previous two — a ray-traced volume of the particle density `N` overlaid with magnetic field lines, both composited into one PNG per render cycle. Requires `-D ascent=ON`.
+
 
 

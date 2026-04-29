@@ -608,6 +608,36 @@
     #   @default: false
     ghosts = ""
 
+  [output.ascent]
+    # Enable in-situ visualization via Ascent (https://ascent.readthedocs.io/)
+    #   @type: bool
+    #   @default: false
+    #   @note: Entity must be configured with `-D ascent=ON`; otherwise this is ignored
+    enable = ""
+    # Path to a YAML/JSON file describing the Ascent actions (scenes, plots, ...)
+    #   @type: string
+    #   @default: ""
+    #   @note: When empty, Ascent will look for `ascent_actions.yaml` in the cwd
+    actions_file = ""
+    # Names of field quantities to publish to Ascent every render cycle
+    #   @type: array<string>
+    #   @default: []
+    #   @note: Vector components are suffixed with the index, e.g. "B3" is the third component of B
+    fields = ""
+    # Number of timesteps between Ascent renders
+    #   @type: uint
+    #   @default: 0
+    #   @note: When `!= 0`, overrides `output.interval`
+    #   @note: When `== 0` and `interval_time == -1`, falls back to the global `output.interval`
+    #   @note: This cadence is independent of `output.fields.interval`
+    interval = ""
+    # Physical (code) time interval between Ascent renders
+    #   @type: float
+    #   @default: -1.0
+    #   @note: When `>= 0`, overrides `interval`
+    #   @note: This cadence is independent of `output.fields.interval_time`
+    interval_time = ""
+
   [output.stats]
     # Toggle for the stats output
     #   @type: bool

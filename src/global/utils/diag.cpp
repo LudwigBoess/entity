@@ -89,6 +89,7 @@ namespace diag {
                         const std::vector<npart_t>&     species_maxnpart,
                         bool                            print_prtl_clear,
                         bool                            print_output,
+                        bool                            print_ascent,
                         bool                            print_checkpoint,
                         bool                            print_colors) {
     DiagFlags  diag_flags  = Diag::Default;
@@ -104,6 +105,9 @@ namespace diag {
     }
     if (print_output) {
       timer_flags |= Timer::PrintOutput;
+    }
+    if (print_ascent) {
+      timer_flags |= Timer::PrintAscent;
     }
     if (print_checkpoint) {
       timer_flags |= Timer::PrintCheckpoint;
