@@ -282,7 +282,7 @@ namespace kernel {
                   i2(p) + N_GHOSTS + 1,
                   cur::jx3) += Fx3_2 * Wx1_2 * Wx2_2;
           } else {
-            const auto   dxp_r_3 { static_cast<prtldx_t>(i3(p) == i3_prev(p)) *
+            const auto dxp_r_3 { static_cast<prtldx_t>(i3(p) == i3_prev(p)) *
                                  (dx3(p) + dx3_prev(p)) *
                                  static_cast<prtldx_t>(INV_2) };
             const real_t Wx3_1 { INV_2 * (dxp_r_3 + dx3_prev(p) +
@@ -426,7 +426,6 @@ namespace kernel {
           real_t Wx23[O + 2];
 
           // Calculate weight function
-#pragma unroll
           for (int i = 0; i < O + 2; ++i) {
             // Esirkepov 2001, Eq. 38 for 1D case
             Wx1[i]  = fS_x1[i] - iS_x1[i];
@@ -443,7 +442,6 @@ namespace kernel {
 
           // Calculate current contribution
           jx1[0] = -Qdx1dt * Wx1[0];
-#pragma unroll
           for (int i = 1; i < O + 2; ++i) {
             jx1[i] = jx1[i - 1] - Qdx1dt * Wx1[i];
           }
@@ -474,12 +472,10 @@ namespace kernel {
 
         } else if constexpr (D == Dim::_2D) {
 
-          // shape function in dim1 -> always required
+          // shape function in dim2
           real_t iS_x2[O + 2], fS_x2[O + 2];
-          // indices of the shape function
           int    i2_min, i2_max;
 
-          // call shape function
           prtl_shape::for_deposit<O>(i2_prev(p),
                                      static_cast<real_t>(dx2_prev(p)),
                                      i2(p),
@@ -489,63 +485,10 @@ namespace kernel {
                                      iS_x2,
                                      fS_x2);
 
-          // define weight tensors
-          real_t Wx1[O + 2][O + 2];
-          real_t Wx2[O + 2][O + 2];
-          real_t Wx3[O + 2][O + 2];
-
-// Calculate weight function
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-              // Esirkepov 2001, Eq. 38 (simplified)
-              Wx1[i][j] = HALF * (fS_x1[i] - iS_x1[i]) * (fS_x2[j] + iS_x2[j]);
-
-              Wx2[i][j] = HALF * (fS_x1[i] + iS_x1[i]) * (fS_x2[j] - iS_x2[j]);
-
-              Wx3[i][j] = THIRD * (fS_x2[j] * (HALF * iS_x1[i] + fS_x1[i]) +
-                                   iS_x2[j] * (HALF * fS_x1[i] + iS_x1[i]));
-            }
-          }
-
-          // contribution within the shape function stencil
-          real_t jx1[O + 2][O + 2], jx2[O + 2][O + 2];
-
           // prefactors for j update
           const real_t Qdx1dt = coeff * inv_dt;
           const real_t Qdx2dt = coeff * inv_dt;
           const real_t QVx3   = coeff * vp[2];
-
-          // Calculate current contribution
-
-          // jx1
-#pragma unroll
-          for (int j = 0; j < O + 2; ++j) {
-            jx1[0][j] = -Qdx1dt * Wx1[0][j];
-          }
-
-#pragma unroll
-          for (int i = 1; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-              jx1[i][j] = jx1[i - 1][j] - Qdx1dt * Wx1[i][j];
-            }
-          }
-
-          // jx2
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-            jx2[i][0] = -Qdx2dt * Wx2[i][0];
-          }
-
-#pragma unroll
-          for (int j = 1; j < O + 2; ++j) {
-#pragma unroll
-            for (int i = 0; i < O + 2; ++i) {
-              jx2[i][j] = jx2[i][j - 1] - Qdx2dt * Wx2[i][j];
-            }
-          }
 
           // account for ghost cells
           i1_min += N_GHOSTS;
@@ -557,35 +500,74 @@ namespace kernel {
           const int di_x1 = i1_max - i1_min;
           const int di_x2 = i2_max - i2_min;
 
-          /*
-              Current update
-          */
+          // Esirkepov current update fused per-component: only one
+          // (O+2)^2 working array is live at a time, so the deposit
+          // does not spill to private memory at higher orders.
           auto J_acc = J.access();
 
-          for (int i = 0; i < di_x1; ++i) {
-            for (int j = 0; j <= di_x2; ++j) {
-              J_acc(i1_min + i, i2_min + j, cur::jx1) += jx1[i][j];
+          // jx1 (cumulative sum along i)
+          {
+            real_t jx1[O + 2][O + 2];
+
+            for (int j = 0; j < O + 2; ++j) {
+              const real_t Wx1_0j = HALF * (fS_x1[0] - iS_x1[0]) *
+                                    (fS_x2[j] + iS_x2[j]);
+              jx1[0][j]           = -Qdx1dt * Wx1_0j;
+            }
+
+            for (int i = 1; i < O + 2; ++i) {
+              for (int j = 0; j < O + 2; ++j) {
+                const real_t Wx1_ij = HALF * (fS_x1[i] - iS_x1[i]) *
+                                      (fS_x2[j] + iS_x2[j]);
+                jx1[i][j]           = jx1[i - 1][j] - Qdx1dt * Wx1_ij;
+              }
+            }
+            for (int i = 0; i < di_x1; ++i) {
+              for (int j = 0; j <= di_x2; ++j) {
+                J_acc(i1_min + i, i2_min + j, cur::jx1) += jx1[i][j];
+              }
             }
           }
 
-          for (int i = 0; i <= di_x1; ++i) {
-            for (int j = 0; j < di_x2; ++j) {
-              J_acc(i1_min + i, i2_min + j, cur::jx2) += jx2[i][j];
+          // jx2 (cumulative sum along j)
+          {
+            real_t jx2[O + 2][O + 2];
+
+            for (int i = 0; i < O + 2; ++i) {
+              const real_t Wx2_i0 = HALF * (fS_x1[i] + iS_x1[i]) *
+                                    (fS_x2[0] - iS_x2[0]);
+              jx2[i][0]           = -Qdx2dt * Wx2_i0;
+            }
+
+            for (int j = 1; j < O + 2; ++j) {
+              for (int i = 0; i < O + 2; ++i) {
+                const real_t Wx2_ij = HALF * (fS_x1[i] + iS_x1[i]) *
+                                      (fS_x2[j] - iS_x2[j]);
+                jx2[i][j]           = jx2[i][j - 1] - Qdx2dt * Wx2_ij;
+              }
+            }
+
+            for (int i = 0; i <= di_x1; ++i) {
+              for (int j = 0; j < di_x2; ++j) {
+                J_acc(i1_min + i, i2_min + j, cur::jx2) += jx2[i][j];
+              }
             }
           }
 
+          // jx3 (no cumulative sum: deposit Wx3 directly without an array)
           for (int i = 0; i <= di_x1; ++i) {
             for (int j = 0; j <= di_x2; ++j) {
-              J_acc(i1_min + i, i2_min + j, cur::jx3) += QVx3 * Wx3[i][j];
+              const real_t Wx3_ij = THIRD *
+                                    (fS_x2[j] * (HALF * iS_x1[i] + fS_x1[i]) +
+                                     iS_x2[j] * (HALF * fS_x1[i] + iS_x1[i]));
+              J_acc(i1_min + i, i2_min + j, cur::jx3) += QVx3 * Wx3_ij;
             }
           }
 
         } else if constexpr (D == Dim::_3D) {
           // shape function in dim2
           real_t iS_x2[O + 2], fS_x2[O + 2];
-          // indices of the shape function
           int    i2_min, i2_max;
-          // call shape function
           prtl_shape::for_deposit<O>(i2_prev(p),
                                      static_cast<real_t>(dx2_prev(p)),
                                      i2(p),
@@ -597,10 +579,7 @@ namespace kernel {
 
           // shape function in dim3
           real_t iS_x3[O + 2], fS_x3[O + 2];
-          // indices of the shape function
           int    i3_min, i3_max;
-
-          // call shape function
           prtl_shape::for_deposit<O>(i3_prev(p),
                                      static_cast<real_t>(dx3_prev(p)),
                                      i3(p),
@@ -610,104 +589,10 @@ namespace kernel {
                                      iS_x3,
                                      fS_x3);
 
-          // define weight tensors
-          real_t Wx1[O + 2][O + 2][O + 2];
-          real_t Wx2[O + 2][O + 2][O + 2];
-          real_t Wx3[O + 2][O + 2][O + 2];
-
-// Calculate weight function
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-#pragma unroll
-              for (int k = 0; k < O + 2; ++k) {
-                // Esirkepov 2001, Eq. 31
-                Wx1[i][j][k] = THIRD * (fS_x1[i] - iS_x1[i]) *
-                               ((iS_x2[j] * iS_x3[k] + fS_x2[j] * fS_x3[k]) +
-                                HALF * (iS_x3[k] * fS_x2[j] + iS_x2[j] * fS_x3[k]));
-
-                Wx2[i][j][k] = THIRD * (fS_x2[j] - iS_x2[j]) *
-                               (iS_x1[i] * iS_x3[k] + fS_x1[i] * fS_x3[k] +
-                                HALF * (iS_x3[k] * fS_x1[i] + iS_x1[i] * fS_x3[k]));
-
-                Wx3[i][j][k] = THIRD * (fS_x3[k] - iS_x3[k]) *
-                               (iS_x1[i] * iS_x2[j] + fS_x1[i] * fS_x2[j] +
-                                HALF * (iS_x1[i] * fS_x2[j] + iS_x2[j] * fS_x1[i]));
-              }
-            }
-          }
-
-          // contribution within the shape function stencil
-          real_t jx1[O + 2][O + 2][O + 2], jx2[O + 2][O + 2][O + 2],
-            jx3[O + 2][O + 2][O + 2];
-
           // prefactors to j update
           const real_t Qdxdt = coeff * inv_dt;
           const real_t Qdydt = coeff * inv_dt;
           const real_t Qdzdt = coeff * inv_dt;
-
-          // Calculate current contribution
-
-          // jx1
-#pragma unroll
-          for (int j = 0; j < O + 2; ++j) {
-#pragma unroll
-            for (int k = 0; k < O + 2; ++k) {
-              jx1[0][j][k] = -Qdxdt * Wx1[0][j][k];
-            }
-          }
-
-#pragma unroll
-          for (int i = 1; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-#pragma unroll
-              for (int k = 0; k < O + 2; ++k) {
-                jx1[i][j][k] = jx1[i - 1][j][k] - Qdxdt * Wx1[i][j][k];
-              }
-            }
-          }
-
-          // jx2
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int k = 0; k < O + 2; ++k) {
-              jx2[i][0][k] = -Qdydt * Wx2[i][0][k];
-            }
-          }
-
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 1; j < O + 2; ++j) {
-#pragma unroll
-              for (int k = 0; k < O + 2; ++k) {
-                jx2[i][j][k] = jx2[i][j - 1][k] - Qdydt * Wx2[i][j][k];
-              }
-            }
-          }
-
-          // jx3
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-              jx3[i][j][0] = -Qdydt * Wx3[i][j][0];
-            }
-          }
-
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-#pragma unroll
-              for (int k = 1; k < O + 2; ++k) {
-                jx3[i][j][k] = jx3[i][j][k - 1] - Qdzdt * Wx3[i][j][k];
-              }
-            }
-          }
 
           // account for ghost cells
           i1_min += N_GHOSTS;
@@ -722,31 +607,115 @@ namespace kernel {
           const int di_x2 = i2_max - i2_min;
           const int di_x3 = i3_max - i3_min;
 
-          /*
-            Current update
-          */
+          // Esirkepov current update fused per-component: only one
+          // (O+2)^3 working array is live at a time, so the 3D deposit
+          // does not spill to private memory at higher orders.
           auto J_acc = J.access();
 
-          for (int i = 0; i < di_x1; ++i) {
-            for (int j = 0; j <= di_x2; ++j) {
-              for (int k = 0; k <= di_x3; ++k) {
-                J_acc(i1_min + i, i2_min + j, i3_min + k, cur::jx1) += jx1[i][j][k];
+          // jx1 (cumulative sum along i)
+          {
+            real_t jx1[O + 2][O + 2][O + 2];
+
+            for (int j = 0; j < O + 2; ++j) {
+              for (int k = 0; k < O + 2; ++k) {
+                const real_t Wx1_0jk = THIRD * (fS_x1[0] - iS_x1[0]) *
+                                       ((iS_x2[j] * iS_x3[k] + fS_x2[j] * fS_x3[k]) +
+                                        HALF * (iS_x3[k] * fS_x2[j] +
+                                                iS_x2[j] * fS_x3[k]));
+                jx1[0][j][k] = -Qdxdt * Wx1_0jk;
+              }
+            }
+
+            for (int i = 1; i < O + 2; ++i) {
+              for (int j = 0; j < O + 2; ++j) {
+                for (int k = 0; k < O + 2; ++k) {
+                  const real_t Wx1_ijk = THIRD * (fS_x1[i] - iS_x1[i]) *
+                                         ((iS_x2[j] * iS_x3[k] +
+                                           fS_x2[j] * fS_x3[k]) +
+                                          HALF * (iS_x3[k] * fS_x2[j] +
+                                                  iS_x2[j] * fS_x3[k]));
+                  jx1[i][j][k]         = jx1[i - 1][j][k] - Qdxdt * Wx1_ijk;
+                }
+              }
+            }
+
+            for (int i = 0; i < di_x1; ++i) {
+              for (int j = 0; j <= di_x2; ++j) {
+                for (int k = 0; k <= di_x3; ++k) {
+                  J_acc(i1_min + i, i2_min + j, i3_min + k, cur::jx1) += jx1[i][j][k];
+                }
               }
             }
           }
 
-          for (int i = 0; i <= di_x1; ++i) {
-            for (int j = 0; j < di_x2; ++j) {
-              for (int k = 0; k <= di_x3; ++k) {
-                J_acc(i1_min + i, i2_min + j, i3_min + k, cur::jx2) += jx2[i][j][k];
+          // jx2 (cumulative sum along j)
+          {
+            real_t jx2[O + 2][O + 2][O + 2];
+
+            for (int i = 0; i < O + 2; ++i) {
+              for (int k = 0; k < O + 2; ++k) {
+                const real_t Wx2_i0k = THIRD * (fS_x2[0] - iS_x2[0]) *
+                                       (iS_x1[i] * iS_x3[k] + fS_x1[i] * fS_x3[k] +
+                                        HALF * (iS_x3[k] * fS_x1[i] +
+                                                iS_x1[i] * fS_x3[k]));
+                jx2[i][0][k] = -Qdydt * Wx2_i0k;
+              }
+            }
+
+            for (int i = 0; i < O + 2; ++i) {
+              for (int j = 1; j < O + 2; ++j) {
+                for (int k = 0; k < O + 2; ++k) {
+                  const real_t Wx2_ijk = THIRD * (fS_x2[j] - iS_x2[j]) *
+                                         (iS_x1[i] * iS_x3[k] +
+                                          fS_x1[i] * fS_x3[k] +
+                                          HALF * (iS_x3[k] * fS_x1[i] +
+                                                  iS_x1[i] * fS_x3[k]));
+                  jx2[i][j][k]         = jx2[i][j - 1][k] - Qdydt * Wx2_ijk;
+                }
+              }
+            }
+
+            for (int i = 0; i <= di_x1; ++i) {
+              for (int j = 0; j < di_x2; ++j) {
+                for (int k = 0; k <= di_x3; ++k) {
+                  J_acc(i1_min + i, i2_min + j, i3_min + k, cur::jx2) += jx2[i][j][k];
+                }
               }
             }
           }
 
-          for (int i = 0; i <= di_x1; ++i) {
-            for (int j = 0; j <= di_x2; ++j) {
-              for (int k = 0; k < di_x3; ++k) {
-                J_acc(i1_min + i, i2_min + j, i3_min + k, cur::jx3) += jx3[i][j][k];
+          // jx3 (cumulative sum along k)
+          {
+            real_t jx3[O + 2][O + 2][O + 2];
+
+            for (int i = 0; i < O + 2; ++i) {
+              for (int j = 0; j < O + 2; ++j) {
+                const real_t Wx3_ij0 = THIRD * (fS_x3[0] - iS_x3[0]) *
+                                       (iS_x1[i] * iS_x2[j] + fS_x1[i] * fS_x2[j] +
+                                        HALF * (iS_x1[i] * fS_x2[j] +
+                                                iS_x2[j] * fS_x1[i]));
+                jx3[i][j][0] = -Qdydt * Wx3_ij0;
+              }
+            }
+
+            for (int i = 0; i < O + 2; ++i) {
+              for (int j = 0; j < O + 2; ++j) {
+                for (int k = 1; k < O + 2; ++k) {
+                  const real_t Wx3_ijk = THIRD * (fS_x3[k] - iS_x3[k]) *
+                                         (iS_x1[i] * iS_x2[j] +
+                                          fS_x1[i] * fS_x2[j] +
+                                          HALF * (iS_x1[i] * fS_x2[j] +
+                                                  iS_x2[j] * fS_x1[i]));
+                  jx3[i][j][k]         = jx3[i][j][k - 1] - Qdzdt * Wx3_ijk;
+                }
+              }
+            }
+
+            for (int i = 0; i <= di_x1; ++i) {
+              for (int j = 0; j <= di_x2; ++j) {
+                for (int k = 0; k < di_x3; ++k) {
+                  J_acc(i1_min + i, i2_min + j, i3_min + k, cur::jx3) += jx3[i][j][k];
+                }
               }
             }
           }
