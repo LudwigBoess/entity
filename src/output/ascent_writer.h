@@ -44,9 +44,11 @@ namespace out {
     ascent::Ascent m_ascent;
     conduit::Node  m_mesh;
     conduit::Node  m_options;
+    conduit::Node  m_actions;
     bool           m_initialized { false };
     bool           m_mesh_defined { false };
     bool           m_pending_render { false };
+    bool           m_have_actions { false };
 
     Dimension                m_dim { Dim::_3D };
     std::vector<std::size_t> m_l_shape;

@@ -13,16 +13,76 @@
   #include <ascent.hpp>
   #include <conduit.hpp>
   #include <conduit_blueprint.hpp>
+  #include <conduit_relay.hpp>
 
   #if defined(MPI_ENABLED)
     #include <mpi.h>
   #endif
 
+  #include <cstdint>
   #include <filesystem>
+  #include <fstream>
+  #include <sstream>
   #include <string>
   #include <vector>
 
 namespace out {
+
+  namespace {
+    /*
+     * Conduit's YAML parser stores integer scalars as int64 by default, but
+     * many Ascent / VTK-h filters call `.as_int()` (i.e. int32) on their
+     * parameters and that check is strict. Walk the parsed actions tree
+     * once and demote int64 leaves to int32 when the value fits — this is
+     * safe for the small counters used in actions files (num_steps,
+     * num_seeds_*, image_width, ...).
+     *
+     * We also rewrite multi-element int64 arrays into int32 arrays so that
+     * filters like `point_list` whose params are int-vectors stay valid.
+     *
+     * Returns the number of leaves that were demoted.
+     */
+    auto demoteInt64ToInt32(conduit::Node& node) -> std::size_t {
+      std::size_t n_demoted = 0;
+      // Catch any integer leaf that isn't already int32. We use
+      // `.to_int64()` so we don't have to know the source type — it does
+      // a value-preserving cast for int8/16/32/64 and uint8/16/32/64.
+      if (node.dtype().is_integer() and not node.dtype().is_int32()) {
+        const auto nelem = node.dtype().number_of_elements();
+        if (nelem == 1) {
+          const conduit::int64 v = node.to_int64();
+          if (v >= static_cast<conduit::int64>(INT32_MIN) and
+              v <= static_cast<conduit::int64>(INT32_MAX)) {
+            node.set_int32(static_cast<conduit::int32>(v));
+            ++n_demoted;
+          }
+        } else if (nelem > 1) {
+          // multi-element int array → int32 array (if all values fit)
+          conduit::int64_array src = node.as_int64_array();
+          std::vector<conduit::int32> tmp;
+          tmp.reserve(static_cast<std::size_t>(nelem));
+          bool fits = true;
+          for (conduit::index_t i = 0; i < nelem; ++i) {
+            const conduit::int64 v = src[i];
+            if (v < static_cast<conduit::int64>(INT32_MIN) or
+                v > static_cast<conduit::int64>(INT32_MAX)) {
+              fits = false;
+              break;
+            }
+            tmp.push_back(static_cast<conduit::int32>(v));
+          }
+          if (fits) {
+            node.set(tmp.data(), tmp.size());
+            ++n_demoted;
+          }
+        }
+      }
+      for (conduit::index_t i = 0; i < node.number_of_children(); ++i) {
+        n_demoted += demoteInt64ToInt32(node.child(i));
+      }
+      return n_demoted;
+    }
+  } // namespace
 
   AscentWriter::~AscentWriter() {
     if (m_initialized) {
@@ -48,20 +108,68 @@ namespace out {
 
     m_tracker.init("ascent", interval, interval_time);
 
-    if (!std::filesystem::exists(m_root)) {
-      std::filesystem::create_directories(m_root);
-    }
+    // Mirror the layout used by the ADIOS field/particle writers:
+    // <sim_name>/<sub>/<files>. Renders go under <sim_name>/plots/.
+    const auto plots_dir = std::filesystem::path(m_root) / "plots";
+    std::filesystem::create_directories(plots_dir);
 
     m_options.reset();
   #if defined(MPI_ENABLED)
     m_options["mpi_comm"] = MPI_Comm_c2f(MPI_COMM_WORLD);
   #endif
-    if (!m_actions_file.empty()) {
-      m_options["actions_file"] = m_actions_file;
-    }
-    m_options["default_dir"] = m_root;
+    m_options["default_dir"] = plots_dir.string();
     m_options["exceptions"]  = "forward";
     m_options["messages"]    = "quiet";
+
+    // Pre-parse the user's actions file so we can demote int64 leaves to
+    // int32 (Conduit YAML defaults to int64 but many Ascent filters call
+    // `.as_int()` strictly). Only when this fails do we fall back to
+    // letting Ascent read the file itself.
+    m_actions.reset();
+    m_have_actions = false;
+    if (!m_actions_file.empty()) {
+      try {
+        if (!std::filesystem::exists(m_actions_file)) {
+          throw std::runtime_error("actions file not found at '" +
+                                   m_actions_file + "' (cwd: " +
+                                   std::filesystem::current_path().string() +
+                                   ")");
+        }
+        // Use the same loader Ascent uses internally so the parse is
+        // guaranteed compatible with the YAML schema Ascent expects.
+        conduit::relay::io::load(m_actions_file, "yaml", m_actions);
+        const auto n_demoted = demoteInt64ToInt32(m_actions);
+        m_have_actions = true;
+        logger::Checkpoint(
+          "Pre-loaded Ascent actions file '" + m_actions_file + "' (demoted " +
+            std::to_string(n_demoted) + " int64 -> int32 leaves)",
+          HERE);
+        // CRITICAL: Ascent's `execute()` always calls CheckForSettingsFile
+        // with merge=false, which REPLACES our in-memory actions with a
+        // freshly-parsed copy from disk if `actions_file` resolves to a
+        // file that exists. By default `actions_file` is unset, in which
+        // case Ascent falls back to "ascent_actions.yaml" in the cwd.
+        // Set actions_file to "" so `is_file("")` is false and the
+        // disk-load path (which would discard our int32 demotion) is
+        // skipped.
+        m_options["actions_file"] = "";
+        // Drop a copy of the patched actions inside the plots directory
+        // so users can inspect exactly what was sent to Ascent.
+        try {
+          const auto settings_path = plots_dir / "ascent_settings.yaml";
+          conduit::relay::io::save(m_actions, settings_path.string(), "yaml");
+        } catch (...) {
+          // best-effort debug dump; don't crash if it fails
+        }
+      } catch (const std::exception& e) {
+        raise::Warning(
+          "Could not pre-load Ascent actions file '" + m_actions_file +
+            "' (" + e.what() +
+            "); falling back to Ascent's own loader (int32 demotion skipped).",
+          HERE);
+        m_options["actions_file"] = m_actions_file;
+      }
+    }
 
     m_ascent.open(m_options);
     m_initialized = true;
@@ -190,6 +298,29 @@ namespace out {
     m_mesh[base + "/topology"]    = "mesh";
     m_mesh[base + "/association"] = "element";
     m_mesh[base + "/values"].set(values.data(), values.size());
+
+    // Vector-field bonus path: when the user-facing name ends in "1", "2",
+    // or "3" (e.g. B1/B2/B3, E1/E2/E3, J1/J2/J3) ALSO publish the same
+    // values as the matching component of an MCArray vector field whose
+    // name is the prefix (e.g. "B"). VTK-h filters that need a 3-vector
+    // (streamline, gradient, ...) can then reference the prefix name
+    // directly without an extra `composite_vector` pipeline step — that
+    // workflow currently produces a vector layout VTK-h's streamline
+    // backend in Ascent v0.9.x can't unpack as Vec<float,3>/Vec<double,3>.
+    if (short_name.size() >= 2u) {
+      const char idx = short_name.back();
+      if (idx >= '1' && idx <= '3') {
+        const std::string prefix = short_name.substr(0, short_name.size() - 1u);
+        if (!prefix.empty()) {
+          static const char* const sub[] = { "u", "v", "w" };
+          const std::string vec_base = "fields/" + prefix;
+          m_mesh[vec_base + "/topology"]    = "mesh";
+          m_mesh[vec_base + "/association"] = "element";
+          m_mesh[vec_base + "/values/" + sub[idx - '1']].set(values.data(),
+                                                              values.size());
+        }
+      }
+    }
     m_pending_render = true;
   }
 
@@ -217,10 +348,16 @@ namespace out {
 
     m_ascent.publish(m_mesh);
 
-    // Empty actions => Ascent reads from the actions file (or
-    // ascent_actions.yaml in the current directory) and applies it.
-    conduit::Node actions;
-    m_ascent.execute(actions);
+    // When we successfully pre-parsed the actions file in init(), pass it
+    // to execute() directly (with int64→int32 demotion already applied).
+    // Otherwise fall back to an empty node, so Ascent reads
+    // ascent_actions.yaml itself via the `actions_file` option.
+    if (m_have_actions) {
+      m_ascent.execute(m_actions);
+    } else {
+      conduit::Node actions;
+      m_ascent.execute(actions);
+    }
     m_pending_render = false;
     return true;
   }

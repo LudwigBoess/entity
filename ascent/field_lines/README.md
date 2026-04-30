@@ -51,11 +51,16 @@ The interesting knobs all live in `ascent_actions.yaml`:
 
 - `num_steps` × `step_size` controls how far each field line is integrated
   in code units. The default `200 × 0.5 = 100` covers ~1.5× the box width.
-- `tube_size` sets the rendered tube radius. Reduce it (e.g. `0.2`) for a
-  finer-looking line, or increase it for a thicker, easier-to-see line.
-- `seeds` controls where field lines start. The example uses a uniform
-  grid of `64` seeds in a sub-box. Other supported seed types are
-  `point`, `point_list`, and `line` — see the Ascent docs.
+- `rendering/tube_size` sets the rendered tube radius. Reduce it
+  (e.g. `0.2`) for a finer-looking line, or increase it for a thicker,
+  easier-to-see line.
+- `seeds.num_seeds_x` / `num_seeds_y` / `num_seeds_z` set how many seeds
+  are placed along each axis of the seeding box (for `sampling_type:
+  "uniform"`). The example uses a 4×4×4 grid (64 seeds total). Switch to
+  `sampling_type: "random"` to draw `num_seeds` random points instead.
+- `seeds.extents_x` / `extents_y` / `extents_z` define the seeding box.
+- Other supported `seeds.type` values are `point`, `point_list`, `line`
+  — see the Ascent `streamline` filter docs.
 - To color the tubes by some derived scalar, add another filter to the
   pipeline (e.g. `vector_magnitude` on `B`) before the streamline filter
   and reference the scalar in the plot's `field` key.
