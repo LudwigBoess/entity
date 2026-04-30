@@ -43,22 +43,12 @@ namespace ntt {
         if (species.npart() == 0 || cmp::AlmostZero(species.charge())) {
           continue;
         }
-        const kernel::DepositArrays arrays {
-          species.i1.data(),       species.i2.data(),
-          species.i3.data(),       species.i1_prev.data(),
-          species.i2_prev.data(),  species.i3_prev.data(),
-          species.dx1.data(),      species.dx2.data(),
-          species.dx3.data(),      species.dx1_prev.data(),
-          species.dx2_prev.data(), species.dx3_prev.data(),
-          species.ux1.data(),      species.ux2.data(),
-          species.ux3.data(),      species.phi.data(),
-          species.weight.data(),   species.tag.data(),
-        };
+        auto deposit_arrays = species.DepositKernelArrays();
         Kokkos::parallel_for("CurrentsDeposit",
                              species.rangeActiveParticles(),
                              kernel::DepositCurrents_kernel<SimEngine::GRPIC, M>(
                                scatter_cur0,
-                               arrays,
+                               deposit_arrays,
                                domain.mesh.metric,
                                (real_t)(species.charge()),
                                dt));

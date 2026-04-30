@@ -30,26 +30,16 @@ namespace ntt {
   namespace srpic {
 
     template <SRMetricClass M, unsigned short O>
-    void CallDepositKernel(const Particles<M::Dim, M::CoordType>& species,
-                           const M&                               local_metric,
-                           const scatter_ndfield_t<M::Dim, 3>&    scatter_cur,
-                           real_t                                 dt) {
-      const kernel::DepositArrays arrays {
-        species.i1.data(),       species.i2.data(),
-        species.i3.data(),       species.i1_prev.data(),
-        species.i2_prev.data(),  species.i3_prev.data(),
-        species.dx1.data(),      species.dx2.data(),
-        species.dx3.data(),      species.dx1_prev.data(),
-        species.dx2_prev.data(), species.dx3_prev.data(),
-        species.ux1.data(),      species.ux2.data(),
-        species.ux3.data(),      species.phi.data(),
-        species.weight.data(),   species.tag.data(),
-      };
+    void CallDepositKernel(Particles<M::Dim, M::CoordType>&   species,
+                           const M&                            local_metric,
+                           const scatter_ndfield_t<M::Dim, 3>& scatter_cur,
+                           real_t                              dt) {
+      auto deposit_arrays = species.DepositKernelArrays();
       Kokkos::parallel_for("CurrentsDeposit",
                            species.rangeActiveParticles(),
                            kernel::DepositCurrents_kernel<SimEngine::SRPIC, M, O>(
                              scatter_cur,
-                             arrays,
+                             deposit_arrays,
                              local_metric,
                              (real_t)(species.charge()),
                              dt));

@@ -39,6 +39,10 @@
 #include <string>
 #include <vector>
 
+namespace kernel {
+  struct DepositArrays;
+} // namespace kernel
+
 namespace ntt {
 
   /**
@@ -279,6 +283,12 @@ namespace ntt {
      * @returns The struct of arrays for the particle pusher kernel
      */
     auto PusherKernelArrays() -> kernel::PusherArrays;
+
+    /**
+     * @brief Get the arrays required for the current deposit kernel
+     * @returns The struct of arrays for the current deposit kernel
+     */
+    auto DepositKernelArrays() -> kernel::DepositArrays;
 
 #if defined(MPI_ENABLED)
     /**

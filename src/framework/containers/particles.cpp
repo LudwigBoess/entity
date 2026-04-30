@@ -6,6 +6,7 @@
 #include "arch/kokkos_aliases.h"
 
 #include "framework/containers/species.h"
+#include "kernels/currents_deposit.hpp"
 #include "kernels/pushers/context.h"
 
 #include <Kokkos_Core.hpp>
@@ -107,6 +108,30 @@ namespace ntt {
     pusher_arrays.weight   = weight;
     pusher_arrays.tag      = tag;
     return pusher_arrays;
+  }
+
+  template <Dimension D, Coord::type C>
+  auto Particles<D, C>::DepositKernelArrays() -> kernel::DepositArrays {
+    kernel::DepositArrays deposit_arrays { index() };
+    deposit_arrays.i1       = i1;
+    deposit_arrays.i2       = i2;
+    deposit_arrays.i3       = i3;
+    deposit_arrays.i1_prev  = i1_prev;
+    deposit_arrays.i2_prev  = i2_prev;
+    deposit_arrays.i3_prev  = i3_prev;
+    deposit_arrays.dx1      = dx1;
+    deposit_arrays.dx2      = dx2;
+    deposit_arrays.dx3      = dx3;
+    deposit_arrays.dx1_prev = dx1_prev;
+    deposit_arrays.dx2_prev = dx2_prev;
+    deposit_arrays.dx3_prev = dx3_prev;
+    deposit_arrays.ux1      = ux1;
+    deposit_arrays.ux2      = ux2;
+    deposit_arrays.ux3      = ux3;
+    deposit_arrays.phi      = phi;
+    deposit_arrays.weight   = weight;
+    deposit_arrays.tag      = tag;
+    return deposit_arrays;
   }
 
   template struct Particles<Dim::_1D, Coord::Cartesian>;
