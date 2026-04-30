@@ -473,6 +473,7 @@ namespace kernel {
           real_t Wx23[O + 2];
 
           // Calculate weight function
+#pragma unroll
           for (int i = 0; i < O + 2; ++i) {
             // Esirkepov 2001, Eq. 38 for 1D case
             Wx1[i]  = fS_x1[i] - iS_x1[i];
@@ -489,6 +490,7 @@ namespace kernel {
 
           // Calculate current contribution
           jx1[0] = -Qdx1dt * Wx1[0];
+#pragma unroll
           for (int i = 1; i < O + 2; ++i) {
             jx1[i] = jx1[i - 1] - Qdx1dt * Wx1[i];
           }
@@ -505,16 +507,21 @@ namespace kernel {
           */
           auto J_acc = J.access();
 
-          for (int i = 0; i < di_x1; ++i) {
-            J_acc(i1_min + i, cur::jx1) += jx1[i];
+          // Static bounds + per-iteration mask let the compiler keep
+          // jx1[]/Wx23[] in registers instead of spilling to private memory.
+#pragma unroll
+          for (int i = 0; i < O + 2; ++i) {
+            if (i < di_x1) {
+              J_acc(i1_min + i, cur::jx1) += jx1[i];
+            }
           }
 
-          for (int i = 0; i <= di_x1; ++i) {
-            J_acc(i1_min + i, cur::jx2) += QVx2 * Wx23[i];
-          }
-
-          for (int i = 0; i <= di_x1; ++i) {
-            J_acc(i1_min + i, cur::jx3) += QVx3 * Wx23[i];
+#pragma unroll
+          for (int i = 0; i < O + 2; ++i) {
+            if (i <= di_x1) {
+              J_acc(i1_min + i, cur::jx2) += QVx2 * Wx23[i];
+              J_acc(i1_min + i, cur::jx3) += QVx3 * Wx23[i];
+            }
           }
 
         } else if constexpr (D == Dim::_2D) {
@@ -548,30 +555,39 @@ namespace kernel {
           const int di_x2 = i2_max - i2_min;
 
           // Esirkepov current update fused per-component: only one
-          // (O+2)^2 working array is live at a time, so the deposit
-          // does not spill to private memory at higher orders.
+          // (O+2)^2 working array is live at a time. With every loop
+          // bound by the compile-time constant O+2 and unrolled, the
+          // (O+2)^2 arrays scalarize to GRF instead of spilling to
+          // private memory.
           auto J_acc = J.access();
 
           // jx1 (cumulative sum along i)
           {
             real_t jx1[O + 2][O + 2];
 
+#pragma unroll
             for (int j = 0; j < O + 2; ++j) {
               const real_t Wx1_0j = HALF * (fS_x1[0] - iS_x1[0]) *
                                     (fS_x2[j] + iS_x2[j]);
               jx1[0][j]           = -Qdx1dt * Wx1_0j;
             }
 
+#pragma unroll
             for (int i = 1; i < O + 2; ++i) {
+#pragma unroll
               for (int j = 0; j < O + 2; ++j) {
                 const real_t Wx1_ij = HALF * (fS_x1[i] - iS_x1[i]) *
                                       (fS_x2[j] + iS_x2[j]);
                 jx1[i][j]           = jx1[i - 1][j] - Qdx1dt * Wx1_ij;
               }
             }
-            for (int i = 0; i < di_x1; ++i) {
-              for (int j = 0; j <= di_x2; ++j) {
-                J_acc(i1_min + i, i2_min + j, cur::jx1) += jx1[i][j];
+#pragma unroll
+            for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+              for (int j = 0; j < O + 2; ++j) {
+                if (i < di_x1 && j <= di_x2) {
+                  J_acc(i1_min + i, i2_min + j, cur::jx1) += jx1[i][j];
+                }
               }
             }
           }
@@ -580,13 +596,16 @@ namespace kernel {
           {
             real_t jx2[O + 2][O + 2];
 
+#pragma unroll
             for (int i = 0; i < O + 2; ++i) {
               const real_t Wx2_i0 = HALF * (fS_x1[i] + iS_x1[i]) *
                                     (fS_x2[0] - iS_x2[0]);
               jx2[i][0]           = -Qdx2dt * Wx2_i0;
             }
 
+#pragma unroll
             for (int j = 1; j < O + 2; ++j) {
+#pragma unroll
               for (int i = 0; i < O + 2; ++i) {
                 const real_t Wx2_ij = HALF * (fS_x1[i] + iS_x1[i]) *
                                       (fS_x2[j] - iS_x2[j]);
@@ -594,20 +613,28 @@ namespace kernel {
               }
             }
 
-            for (int i = 0; i <= di_x1; ++i) {
-              for (int j = 0; j < di_x2; ++j) {
-                J_acc(i1_min + i, i2_min + j, cur::jx2) += jx2[i][j];
+#pragma unroll
+            for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+              for (int j = 0; j < O + 2; ++j) {
+                if (i <= di_x1 && j < di_x2) {
+                  J_acc(i1_min + i, i2_min + j, cur::jx2) += jx2[i][j];
+                }
               }
             }
           }
 
           // jx3 (no cumulative sum: deposit Wx3 directly without an array)
-          for (int i = 0; i <= di_x1; ++i) {
-            for (int j = 0; j <= di_x2; ++j) {
-              const real_t Wx3_ij = THIRD *
-                                    (fS_x2[j] * (HALF * iS_x1[i] + fS_x1[i]) +
-                                     iS_x2[j] * (HALF * fS_x1[i] + iS_x1[i]));
-              J_acc(i1_min + i, i2_min + j, cur::jx3) += QVx3 * Wx3_ij;
+#pragma unroll
+          for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+            for (int j = 0; j < O + 2; ++j) {
+              if (i <= di_x1 && j <= di_x2) {
+                const real_t Wx3_ij = THIRD *
+                                      (fS_x2[j] * (HALF * iS_x1[i] + fS_x1[i]) +
+                                       iS_x2[j] * (HALF * fS_x1[i] + iS_x1[i]));
+                J_acc(i1_min + i, i2_min + j, cur::jx3) += QVx3 * Wx3_ij;
+              }
             }
           }
 
@@ -655,15 +682,19 @@ namespace kernel {
           const int di_x3 = i3_max - i3_min;
 
           // Esirkepov current update fused per-component: only one
-          // (O+2)^3 working array is live at a time, so the 3D deposit
-          // does not spill to private memory at higher orders.
+          // (O+2)^3 working array is live at a time. With every loop
+          // bound by the compile-time constant O+2 and unrolled, the
+          // (O+2)^3 arrays scalarize to GRF instead of spilling to
+          // private memory.
           auto J_acc = J.access();
 
           // jx1 (cumulative sum along i)
           {
             real_t jx1[O + 2][O + 2][O + 2];
 
+#pragma unroll
             for (int j = 0; j < O + 2; ++j) {
+#pragma unroll
               for (int k = 0; k < O + 2; ++k) {
                 const real_t Wx1_0jk = THIRD * (fS_x1[0] - iS_x1[0]) *
                                        ((iS_x2[j] * iS_x3[k] + fS_x2[j] * fS_x3[k]) +
@@ -673,8 +704,11 @@ namespace kernel {
               }
             }
 
+#pragma unroll
             for (int i = 1; i < O + 2; ++i) {
+#pragma unroll
               for (int j = 0; j < O + 2; ++j) {
+#pragma unroll
                 for (int k = 0; k < O + 2; ++k) {
                   const real_t Wx1_ijk = THIRD * (fS_x1[i] - iS_x1[i]) *
                                          ((iS_x2[j] * iS_x3[k] +
@@ -686,10 +720,18 @@ namespace kernel {
               }
             }
 
-            for (int i = 0; i < di_x1; ++i) {
-              for (int j = 0; j <= di_x2; ++j) {
-                for (int k = 0; k <= di_x3; ++k) {
-                  J_acc(i1_min + i, i2_min + j, i3_min + k, cur::jx1) += jx1[i][j][k];
+#pragma unroll
+            for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+              for (int j = 0; j < O + 2; ++j) {
+#pragma unroll
+                for (int k = 0; k < O + 2; ++k) {
+                  if (i < di_x1 && j <= di_x2 && k <= di_x3) {
+                    J_acc(i1_min + i,
+                          i2_min + j,
+                          i3_min + k,
+                          cur::jx1) += jx1[i][j][k];
+                  }
                 }
               }
             }
@@ -699,7 +741,9 @@ namespace kernel {
           {
             real_t jx2[O + 2][O + 2][O + 2];
 
+#pragma unroll
             for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
               for (int k = 0; k < O + 2; ++k) {
                 const real_t Wx2_i0k = THIRD * (fS_x2[0] - iS_x2[0]) *
                                        (iS_x1[i] * iS_x3[k] + fS_x1[i] * fS_x3[k] +
@@ -709,8 +753,11 @@ namespace kernel {
               }
             }
 
+#pragma unroll
             for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
               for (int j = 1; j < O + 2; ++j) {
+#pragma unroll
                 for (int k = 0; k < O + 2; ++k) {
                   const real_t Wx2_ijk = THIRD * (fS_x2[j] - iS_x2[j]) *
                                          (iS_x1[i] * iS_x3[k] +
@@ -722,10 +769,18 @@ namespace kernel {
               }
             }
 
-            for (int i = 0; i <= di_x1; ++i) {
-              for (int j = 0; j < di_x2; ++j) {
-                for (int k = 0; k <= di_x3; ++k) {
-                  J_acc(i1_min + i, i2_min + j, i3_min + k, cur::jx2) += jx2[i][j][k];
+#pragma unroll
+            for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+              for (int j = 0; j < O + 2; ++j) {
+#pragma unroll
+                for (int k = 0; k < O + 2; ++k) {
+                  if (i <= di_x1 && j < di_x2 && k <= di_x3) {
+                    J_acc(i1_min + i,
+                          i2_min + j,
+                          i3_min + k,
+                          cur::jx2) += jx2[i][j][k];
+                  }
                 }
               }
             }
@@ -735,7 +790,9 @@ namespace kernel {
           {
             real_t jx3[O + 2][O + 2][O + 2];
 
+#pragma unroll
             for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
               for (int j = 0; j < O + 2; ++j) {
                 const real_t Wx3_ij0 = THIRD * (fS_x3[0] - iS_x3[0]) *
                                        (iS_x1[i] * iS_x2[j] + fS_x1[i] * fS_x2[j] +
@@ -745,8 +802,11 @@ namespace kernel {
               }
             }
 
+#pragma unroll
             for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
               for (int j = 0; j < O + 2; ++j) {
+#pragma unroll
                 for (int k = 1; k < O + 2; ++k) {
                   const real_t Wx3_ijk = THIRD * (fS_x3[k] - iS_x3[k]) *
                                          (iS_x1[i] * iS_x2[j] +
@@ -758,10 +818,18 @@ namespace kernel {
               }
             }
 
-            for (int i = 0; i <= di_x1; ++i) {
-              for (int j = 0; j <= di_x2; ++j) {
-                for (int k = 0; k < di_x3; ++k) {
-                  J_acc(i1_min + i, i2_min + j, i3_min + k, cur::jx3) += jx3[i][j][k];
+#pragma unroll
+            for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+              for (int j = 0; j < O + 2; ++j) {
+#pragma unroll
+                for (int k = 0; k < O + 2; ++k) {
+                  if (i <= di_x1 && j <= di_x2 && k < di_x3) {
+                    J_acc(i1_min + i,
+                          i2_min + j,
+                          i3_min + k,
+                          cur::jx3) += jx3[i][j][k];
+                  }
                 }
               }
             }
