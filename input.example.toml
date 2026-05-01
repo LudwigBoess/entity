@@ -632,6 +632,14 @@
     #   @type: bool
     #   @default: true
     vector_aliases = ""
+    # Per-axis stride applied when extracting fields for Ascent. A factor of
+    # `k` cuts the published mesh and per-render rendering cost by `k` along
+    # that axis (`k^Dim` overall in 3D). Aligned to the global grid so cells
+    # line up across MPI ranks. Independent of `output.fields.downsampling`.
+    #   @type: array<uint> [length = `grid.dim`] OR uint (broadcast to all axes)
+    #   @default: 1 (no downsampling)
+    #   @note: Each factor must be > 0 and small enough to leave at least one cell per rank.
+    downsample = ""
     # Number of timesteps between Ascent renders
     #   @type: uint
     #   @default: 0

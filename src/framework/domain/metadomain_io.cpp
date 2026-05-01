@@ -132,8 +132,35 @@ namespace ntt {
       const auto loc_corner = local_domain->offset_ncells();
       const auto loc_shape  = local_domain->mesh.n_active();
       std::vector<std::size_t> corner(loc_corner.begin(), loc_corner.end());
-      std::vector<std::size_t> shape(loc_shape.begin(), loc_shape.end());
-      g_ascent_writer.defineMesh(M::Dim, corner, shape);
+      std::vector<std::size_t> full_shape(loc_shape.begin(), loc_shape.end());
+
+      // Apply Ascent-specific downsampling. Stride is aligned to the
+      // global grid (using each rank's `offset_ncells`) so downsampled
+      // cells from neighboring ranks line up at domain boundaries.
+      const auto a_dwn = params.template get<std::vector<unsigned int>>(
+        "output.ascent.downsample");
+      std::vector<std::size_t> downsample(static_cast<std::size_t>(M::Dim), 1u);
+      std::vector<std::size_t> first_cell(static_cast<std::size_t>(M::Dim), 0u);
+      std::vector<std::size_t> shape = full_shape;
+      for (std::size_t d = 0; d < static_cast<std::size_t>(M::Dim); ++d) {
+        const std::size_t s = (d < a_dwn.size())
+                                ? static_cast<std::size_t>(a_dwn[d])
+                                : 1u;
+        downsample[d] = s;
+        if (s <= 1u) {
+          continue;
+        }
+        const std::size_t l_offset = corner[d];
+        const std::size_t n        = full_shape[d];
+        const std::size_t first    = (s - (l_offset % s)) % s;
+        raise::ErrorIf(first >= n,
+                       "output.ascent.downsample factor leaves a rank with "
+                       "no cells; reduce the factor or the decomposition",
+                       HERE);
+        first_cell[d] = first;
+        shape[d]      = (n - first + s - 1) / s;
+      }
+      g_ascent_writer.defineMesh(M::Dim, corner, shape, first_cell, downsample);
     }
 #endif
   }
@@ -470,22 +497,40 @@ namespace ntt {
         }
 
 #if defined(ASCENT_ENABLED)
-        // Ascent expects n+1 cell-edge coordinates (no downsampling)
+        // Ascent edge coordinates: must match the per-axis downsampling
+        // applied in publishField (defineMesh stored the same factors).
         if (render_ascent && g_ascent_writer.initialized()) {
-          const auto             nedges = local_domain->mesh.n_active()[dim] + 1;
+          const auto a_dwn = params.template get<std::vector<unsigned int>>(
+            "output.ascent.downsample");
+          const std::size_t s = (dim < a_dwn.size())
+                                  ? static_cast<std::size_t>(a_dwn[dim])
+                                  : 1u;
+          const std::size_t first = (s <= 1u) ? 0u
+                                              : ((s - (l_offset % s)) % s);
+          const std::size_t n_dwn = (l_size > first)
+                                      ? (l_size - first + s - 1) / s
+                                      : 0u;
+          const std::size_t nedges = n_dwn + 1;
           const array_t<real_t*> xe_full { "Xe_ascent", nedges };
           const auto&            metric_a = local_domain->mesh.metric;
+          // i in [0, n_dwn) maps to local cell-edge index `first + i*s`;
+          // the final edge (i == n_dwn) is clamped to the rank's right
+          // boundary (`l_size`) so neighboring ranks share an edge at the
+          // domain interface even when (l_size - first) % s != 0.
           Kokkos::parallel_for(
             "GenerateMeshAscent",
             nedges,
             Lambda(index_t i) {
-              const auto      i_ = static_cast<real_t>(i);
+              const std::size_t idx = (i == n_dwn) ? l_size
+                                                   : (first + i * s);
+              const auto      i_   = static_cast<real_t>(idx);
               coord_t<M::Dim> x_Cd { ZERO }, x_Ph { ZERO };
               x_Cd[dim] = i_;
               metric_a.template convert<Crd::Cd, Crd::Ph>(x_Cd, x_Ph);
               xe_full(i) = x_Ph[dim];
             });
-          g_ascent_writer.setMeshCoords(static_cast<unsigned short>(dim), xe_full);
+          g_ascent_writer.setMeshCoords(static_cast<unsigned short>(dim),
+                                        xe_full);
         }
 #endif
       }

@@ -175,6 +175,80 @@ namespace out {
 
     m_ascent.open(m_options);
     m_initialized = true;
+
+    // Surface the active Ascent runtime + backend so users can confirm
+    // they're getting the GPU-accelerated path. If the build accidentally
+    // fell back to the serial host runtime, rendering 10^7+ cells will be
+    // dominated by VTK-m on the CPU.
+    //
+    // `ascent::about(node)` is a free function (not a method on the
+    // ascent::Ascent instance) and reports build-time configuration:
+    // version, the default runtime, and per-runtime availability
+    // including the active VTK-m backend. The exact key layout varies
+    // between Ascent versions, so we probe a handful of well-known paths
+    // and fall back to dumping a YAML summary if none match.
+    try {
+      conduit::Node about_node;
+      ::ascent::about(about_node);
+
+      // Dump the full about node so users can read the exact key layout
+      // for the installed Ascent version (paths drift between releases).
+      try {
+        const auto about_path = plots_dir / "ascent_about.yaml";
+        conduit::relay::io::save(about_node, about_path.string(), "yaml");
+      } catch (...) {
+        // best-effort debug dump
+      }
+
+      std::string summary = "Ascent";
+      if (about_node.has_path("version")) {
+        summary += " v" + about_node["version"].as_string();
+      }
+      std::string default_runtime;
+      if (about_node.has_path("default_runtime")) {
+        default_runtime = about_node["default_runtime"].as_string();
+        summary += " runtime=" + default_runtime;
+      }
+
+      // Enumerate VTK-m backends marked "enabled" in the about node.
+      // Layout in Ascent 0.9.x:
+      //   runtimes/<default_runtime>/vtkm/backends/<name> = "enabled"|"disabled"
+      // This reports what was BUILT into VTK-m. The active dispatcher
+      // when the Kokkos backend is selected is determined by Kokkos's
+      // default execution space (printed below).
+      if (!default_runtime.empty()) {
+        const std::string backends_path = "runtimes/" + default_runtime +
+                                          "/vtkm/backends";
+        if (about_node.has_path(backends_path)) {
+          const auto& backends = about_node[backends_path];
+          std::string enabled_list;
+          for (conduit::index_t i = 0; i < backends.number_of_children();
+               ++i) {
+            const auto& c = backends.child(i);
+            if (c.dtype().is_string() && c.as_string() == "enabled") {
+              if (!enabled_list.empty()) {
+                enabled_list += ",";
+              }
+              enabled_list += c.name();
+            }
+          }
+          if (!enabled_list.empty()) {
+            summary += " vtkm-backends=" + enabled_list;
+          }
+        }
+      }
+
+      // Kokkos's default execution space is the actual dispatcher when
+      // Ascent runs through the Kokkos VTK-m backend. This name (SYCL /
+      // CUDA / HIP / OpenMP / Serial) is the source of truth for whether
+      // in situ rendering runs on the GPU.
+      summary += " kokkos=";
+      summary += Kokkos::DefaultExecutionSpace::name();
+
+      logger::Checkpoint(summary, HERE);
+    } catch (...) {
+      // never let an introspection failure abort init
+    }
     logger::Checkpoint("Initialized Ascent in situ writer", HERE);
   }
 
@@ -187,15 +261,40 @@ namespace out {
 
   void AscentWriter::defineMesh(Dimension                       dim,
                                 const std::vector<std::size_t>& l_corner,
-                                const std::vector<std::size_t>& l_shape) {
+                                const std::vector<std::size_t>& l_shape,
+                                const std::vector<std::size_t>& l_first_cell,
+                                const std::vector<std::size_t>& downsample) {
     raise::ErrorIf(!m_initialized, "AscentWriter not initialized", HERE);
     raise::ErrorIf(l_corner.size() != static_cast<std::size_t>(dim) ||
                      l_shape.size() != static_cast<std::size_t>(dim),
                    "AscentWriter::defineMesh size mismatch",
                    HERE);
+    raise::ErrorIf(!l_first_cell.empty() &&
+                     l_first_cell.size() != static_cast<std::size_t>(dim),
+                   "AscentWriter::defineMesh l_first_cell size mismatch",
+                   HERE);
+    raise::ErrorIf(!downsample.empty() &&
+                     downsample.size() != static_cast<std::size_t>(dim),
+                   "AscentWriter::defineMesh downsample size mismatch",
+                   HERE);
     m_dim      = dim;
     m_l_corner = l_corner;
     m_l_shape  = l_shape;
+
+    m_l_first_cell.assign(static_cast<std::size_t>(dim), 0u);
+    if (!l_first_cell.empty()) {
+      m_l_first_cell = l_first_cell;
+    }
+    m_downsample.assign(static_cast<std::size_t>(dim), 1u);
+    if (!downsample.empty()) {
+      m_downsample = downsample;
+      for (auto s : m_downsample) {
+        raise::ErrorIf(s == 0u, "downsample factor must be nonzero", HERE);
+      }
+    }
+    // Mesh structure is being (re)defined; force a fresh blueprint
+    // verification on the next render.
+    m_verified = false;
 
     m_mesh.reset();
     m_mesh["coordsets/coords/type"] = "rectilinear";
@@ -247,37 +346,58 @@ namespace out {
     const std::size_t gh  = ntt::N_GHOSTS;
     auto              buf = m_field_buf_d;
 
-    // Extract the active region of the requested component into the
-    // persistent flat buffer in i-fastest order (Conduit/Blueprint layout).
-    // Conduit's `set(...)` below copies out, so the buffer can be reused
-    // across fields and across renders without any locking.
+    // Extract the (possibly downsampled) active region of the requested
+    // component into the persistent flat buffer in i-fastest order
+    // (Conduit/Blueprint layout). Conduit's `set(...)` below copies out,
+    // so the buffer can be reused across fields and across renders.
+    //
+    // Source index for downsampled cell `i_dwn` along axis d is
+    //   i_src = m_l_first_cell[d] + i_dwn * m_downsample[d] + N_GHOSTS
+    // which matches how `output.fields.downsampling` strides through the
+    // ADIOS path.
     if constexpr (D == Dim::_3D) {
       const std::size_t n1 = m_l_shape[0];
       const std::size_t n2 = m_l_shape[1];
       const std::size_t n3 = m_l_shape[2];
+      const std::size_t f1 = m_l_first_cell[0];
+      const std::size_t f2 = m_l_first_cell[1];
+      const std::size_t f3 = m_l_first_cell[2];
+      const std::size_t s1 = m_downsample[0];
+      const std::size_t s2 = m_downsample[1];
+      const std::size_t s3 = m_downsample[2];
       Kokkos::parallel_for(
         "AscentExtract3D",
         CreateRangePolicy<Dim::_3D>({ 0, 0, 0 }, { n1, n2, n3 }),
         Lambda(index_t i1, index_t i2, index_t i3) {
           buf(i1 + n1 * (i2 + n2 * i3)) = static_cast<double>(
-            fld(i1 + gh, i2 + gh, i3 + gh, comp));
+            fld(f1 + i1 * s1 + gh,
+                f2 + i2 * s2 + gh,
+                f3 + i3 * s3 + gh,
+                comp));
         });
     } else if constexpr (D == Dim::_2D) {
       const std::size_t n1 = m_l_shape[0];
       const std::size_t n2 = m_l_shape[1];
+      const std::size_t f1 = m_l_first_cell[0];
+      const std::size_t f2 = m_l_first_cell[1];
+      const std::size_t s1 = m_downsample[0];
+      const std::size_t s2 = m_downsample[1];
       Kokkos::parallel_for(
         "AscentExtract2D",
         CreateRangePolicy<Dim::_2D>({ 0, 0 }, { n1, n2 }),
         Lambda(index_t i1, index_t i2) {
-          buf(i1 + n1 * i2) = static_cast<double>(fld(i1 + gh, i2 + gh, comp));
+          buf(i1 + n1 * i2) = static_cast<double>(
+            fld(f1 + i1 * s1 + gh, f2 + i2 * s2 + gh, comp));
         });
     } else { // Dim::_1D
       const std::size_t n1 = m_l_shape[0];
+      const std::size_t f1 = m_l_first_cell[0];
+      const std::size_t s1 = m_downsample[0];
       Kokkos::parallel_for(
         "AscentExtract1D",
         n1,
         Lambda(index_t i1) {
-          buf(i1) = static_cast<double>(fld(i1 + gh, comp));
+          buf(i1) = static_cast<double>(fld(f1 + i1 * s1 + gh, comp));
         });
     }
     Kokkos::deep_copy(m_field_buf_h, m_field_buf_d);
@@ -335,13 +455,21 @@ namespace out {
     m_mesh["state/domain_id"] = rank;
   #endif
 
-    conduit::Node verify_info;
-    if (!conduit::blueprint::mesh::verify(m_mesh, verify_info)) {
-      raise::Warning("Ascent blueprint verification failed: " +
-                       verify_info.to_yaml(),
-                     HERE);
-      m_pending_render = false;
-      return false;
+    // Mesh structure (coordsets, topologies, field names/associations) is
+    // identical from one render to the next — only state and field values
+    // change. Run the full Blueprint verify once; on subsequent renders it
+    // is pure overhead. `defineMesh` resets `m_verified` if the layout is
+    // re-declared.
+    if (!m_verified) {
+      conduit::Node verify_info;
+      if (!conduit::blueprint::mesh::verify(m_mesh, verify_info)) {
+        raise::Warning("Ascent blueprint verification failed: " +
+                         verify_info.to_yaml(),
+                       HERE);
+        m_pending_render = false;
+        return false;
+      }
+      m_verified = true;
     }
 
     m_ascent.publish(m_mesh);

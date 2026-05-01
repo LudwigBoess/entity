@@ -187,6 +187,41 @@ namespace ntt {
                             "vector_aliases",
                             true));
     {
+      // Per-axis stride applied when extracting fields for Ascent. A factor
+      // > 1 cuts the published mesh and rendered work by that factor in
+      // the corresponding direction. Accepts either a scalar (broadcast to
+      // all axes) or an array of length `dim`.
+      std::vector<unsigned int> a_dwn;
+      try {
+        a_dwn = toml::find<std::vector<unsigned int>>(toml_data,
+                                                      "output",
+                                                      "ascent",
+                                                      "downsample");
+      } catch (...) {
+        try {
+          const auto a_dwn_scalar = toml::find<unsigned int>(toml_data,
+                                                             "output",
+                                                             "ascent",
+                                                             "downsample");
+          a_dwn.assign(static_cast<std::size_t>(dim), a_dwn_scalar);
+        } catch (...) {
+          a_dwn.assign(static_cast<std::size_t>(dim), 1u);
+        }
+      }
+      if (a_dwn.size() > static_cast<std::size_t>(dim)) {
+        a_dwn.erase(a_dwn.begin() + dim, a_dwn.end());
+      }
+      raise::ErrorIf(a_dwn.size() != static_cast<std::size_t>(dim),
+                     "output.ascent.downsample must have length `grid.dim`",
+                     HERE);
+      for (const auto& d : a_dwn) {
+        raise::ErrorIf(d == 0u,
+                       "output.ascent.downsample factor must be nonzero",
+                       HERE);
+      }
+      set("output.ascent.downsample", a_dwn);
+    }
+    {
       // Cadence is independent of [output.fields]: when neither is set, fall
       // back to the global [output] interval keys.
       const auto a_int = toml::find_or<timestep_t>(toml_data,

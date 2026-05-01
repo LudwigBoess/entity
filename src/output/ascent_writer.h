@@ -50,10 +50,18 @@ namespace out {
     bool           m_pending_render { false };
     bool           m_have_actions { false };
     bool           m_vector_aliases { true };
+    // Blueprint mesh structure does not change between renders (only state
+    // values + field values do). Verify once, skip on subsequent renders.
+    bool           m_verified { false };
 
     Dimension                m_dim { Dim::_3D };
+    // m_l_shape stores the *downsampled* local cell shape (what gets
+    // published). m_l_first_cell + m_downsample define how to map each
+    // downsampled cell back to an original (full-resolution) cell index.
     std::vector<std::size_t> m_l_shape;
     std::vector<std::size_t> m_l_corner;
+    std::vector<std::size_t> m_l_first_cell;
+    std::vector<std::size_t> m_downsample;
     std::string              m_root;
     std::string              m_actions_file;
     std::vector<std::string> m_fields;
@@ -102,11 +110,17 @@ namespace out {
      * @brief Define the local rectilinear-mesh layout.
      * @param dim Dimensionality of the mesh (1/2/3).
      * @param l_corner Local lower-left corner in global cell index space.
-     * @param l_shape Local number of active cells in each direction.
+     * @param l_shape Local number of *downsampled* active cells in each direction.
+     * @param l_first_cell Per-axis offset (in original-grid cells) of the first
+     *        published cell within the local domain. Empty defaults to zeros.
+     * @param downsample Per-axis stride applied when sampling the original
+     *        full-resolution field. Empty defaults to ones (no downsampling).
      */
     void defineMesh(Dimension                       dim,
                     const std::vector<std::size_t>& l_corner,
-                    const std::vector<std::size_t>& l_shape);
+                    const std::vector<std::size_t>& l_shape,
+                    const std::vector<std::size_t>& l_first_cell = {},
+                    const std::vector<std::size_t>& downsample   = {});
 
     /**
      * @brief Set the cell-edge coordinate arrays for one dimension.
