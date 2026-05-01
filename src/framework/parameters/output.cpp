@@ -79,6 +79,11 @@ namespace ntt {
                                         "fields",
                                         "mom_smooth",
                                         defaults::output::mom_smooth);
+      fields_mom_shape_order   = toml::find_or(toml_data,
+                                             "output",
+                                             "fields",
+                                             "mom_shape_order",
+                                             defaults::output::mom_shape_order);
       fields_downsampling.emplace();
       try {
         auto field_dwn_ = toml::find<std::vector<unsigned int>>(toml_data,
@@ -191,6 +196,8 @@ namespace ntt {
       params->set("output.fields.quantities", fields_quantities.value());
       params->set("output.fields.custom", fields_custom_quantities.value());
       params->set("output.fields.mom_smooth", fields_mom_smooth.value());
+      params->set("output.fields.mom_shape_order",
+                  fields_mom_shape_order.value());
       params->set("output.fields.downsampling", fields_downsampling.value());
 
       params->set("output.particles.species", particles_species.value());

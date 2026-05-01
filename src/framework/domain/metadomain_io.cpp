@@ -195,22 +195,43 @@ namespace ntt {
     const auto inv_n0      = ONE / params.template get<real_t>("scales.n0");
     const auto window      = params.template get<unsigned short>(
       "output.fields.mom_smooth");
+    const auto shape_order = params.template get<unsigned short>(
+      "output.fields.mom_shape_order");
 
+    // Dispatch on the requested deposition method:
+    //   `output.fields.mom_shape_order = 0` (default) -> legacy uniform
+    //     window of half-size `window` (no shape function used).
+    //   `output.fields.mom_shape_order = O > 0`       -> SPH-like
+    //     deposition over a (O+1)-wide stencil weighted by the particle
+    //     shape function S_O at cell centers.
     for (const auto& sp : specs) {
       auto& prtl_spec = prtl_species[sp - 1];
       // clang-format off
-      Kokkos::parallel_for(
-        "ComputeMoments",
-        prtl_spec.rangeActiveParticles(),
-        kernel::ParticleMoments_kernel<S, M, F, 6>(components, scatter_buff, buff_idx,
-                                                   prtl_spec.i1, prtl_spec.i2, prtl_spec.i3,
-                                                   prtl_spec.dx1, prtl_spec.dx2, prtl_spec.dx3,
-                                                   prtl_spec.ux1, prtl_spec.ux2, prtl_spec.ux3,
-                                                   prtl_spec.phi, prtl_spec.weight, prtl_spec.tag,
-                                                   prtl_spec.mass(), prtl_spec.charge(),
-                                                   use_weights,
-                                                   mesh.metric, mesh.flds_bc(),
-                                                   ni2, inv_n0, window));
+#define LAUNCH_PMOM_KERNEL(SHAPE)                                              \
+  Kokkos::parallel_for(                                                        \
+      "ComputeMoments",                                                        \
+      prtl_spec.rangeActiveParticles(),                                        \
+      kernel::ParticleMoments_kernel<S, M, F, 6, (SHAPE)>(                     \
+          components, scatter_buff, buff_idx,                                  \
+          prtl_spec.i1, prtl_spec.i2, prtl_spec.i3,                            \
+          prtl_spec.dx1, prtl_spec.dx2, prtl_spec.dx3,                         \
+          prtl_spec.ux1, prtl_spec.ux2, prtl_spec.ux3,                         \
+          prtl_spec.phi, prtl_spec.weight, prtl_spec.tag,                      \
+          prtl_spec.mass(), prtl_spec.charge(),                                \
+          use_weights,                                                         \
+          mesh.metric, mesh.flds_bc(),                                         \
+          ni2, inv_n0, window))
+      switch (shape_order) {
+        case 0u: LAUNCH_PMOM_KERNEL(0u); break;
+        case 1u: LAUNCH_PMOM_KERNEL(1u); break;
+        case 2u: LAUNCH_PMOM_KERNEL(2u); break;
+        case 3u: LAUNCH_PMOM_KERNEL(3u); break;
+        case 4u: LAUNCH_PMOM_KERNEL(4u); break;
+        case 5u: LAUNCH_PMOM_KERNEL(5u); break;
+        default:
+          raise::Error("output.fields.mom_shape_order must be in [0, 5]", HERE);
+      }
+#undef LAUNCH_PMOM_KERNEL
       // clang-format on
     }
     Kokkos::Experimental::contribute(buffer, scatter_buff);
