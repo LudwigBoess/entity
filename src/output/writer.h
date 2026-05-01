@@ -32,6 +32,7 @@
   #include <mpi.h>
 #endif
 
+#include <any>
 #include <string>
 #include <vector>
 
@@ -73,6 +74,11 @@ namespace out {
     std::vector<spidx_t> m_species_indices;
 
     WriteModeTags m_active_mode { WriteMode::None };
+
+    // Buffers handed to ADIOS2 via Mode::Deferred Put. These must remain
+    // valid until EndStep() flushes them, so they are stored here and
+    // released in endWriting() after EndStep returns.
+    std::vector<std::any> m_keepalive;
 
   public:
     Writer() {}

@@ -36,6 +36,16 @@ namespace checkpoint {
     m_io = p_adios->DeclareIO("Entity::Checkpoint");
     m_io.SetEngine("BPFile");
 
+    // BP5 tuning for DAOS/Lustre at scale; matches writer.cpp::Writer::init.
+    m_io.SetParameter("AggregationType", "TwoLevelShm");
+    m_io.SetParameter("NumAggregators", "0");
+    m_io.SetParameter("NumSubFiles", "0");
+    m_io.SetParameter("BufferChunkSize", "16777216");
+    m_io.SetParameter("MaxShmSize", "4294967296");
+    m_io.SetParameter("AsyncOpen", "true");
+    m_io.SetParameter("AsyncWrite", "true");
+    m_io.SetParameter("OpenTimeoutSecs", "600");
+
     m_io.DefineVariable<timestep_t>("Step");
     m_io.DefineVariable<simtime_t>("Time");
     m_io.DefineAttribute("NGhosts", ntt::N_GHOSTS);
@@ -75,8 +85,10 @@ namespace checkpoint {
     }
 
     m_writer.BeginStep();
-    m_writer.Put(m_io.InquireVariable<timestep_t>("Step"), &step);
-    m_writer.Put(m_io.InquireVariable<simtime_t>("Time"), &time);
+    // step/time are function-local; default Put mode is Deferred which would
+    // dangle by the time endSaving runs PerformPuts. Write synchronously.
+    m_writer.Put(m_io.InquireVariable<timestep_t>("Step"), &step, adios2::Mode::Sync);
+    m_writer.Put(m_io.InquireVariable<simtime_t>("Time"), &time, adios2::Mode::Sync);
   }
 
   void Writer::endSaving() {
