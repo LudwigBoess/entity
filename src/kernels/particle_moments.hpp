@@ -3,8 +3,19 @@
  * @brief Algorithm for computing different moments from particle distribution
  * @implements
  *   - kernel::ParticleMoments_kernel<>
+ *   - kernel::NormalizeVectorByRho_kernel<>
  * @namespaces:
  *   - kernel::
+ * @note
+ *   `ParticleMoments_kernel` has an optional `MomShOrd` template parameter
+ *   (default 0). When zero, deposition uses the legacy uniform window of
+ *   half-size `window`. When non-zero, the per-particle quantity is spread
+ *   over a stencil of cells weighted by the particle shape function `S` of
+ *   the requested order (see `kernels/particle_shapes.hpp`), so each
+ *   particle contributes a partition-of-unity (SPH-like) deposition. The
+ *   parameter is named `MomShOrd` (not `SHAPE_ORDER`) to avoid colliding
+ *   with the compile-time `SHAPE_ORDER` macro that controls the shape
+ *   used for current deposition / field interpolation in the pushers.
  */
 
 #ifndef KERNELS_PARTICLE_MOMENTS_HPP
@@ -14,6 +25,7 @@
 #include "global.h"
 
 #include "arch/kokkos_aliases.h"
+#include "kernels/particle_shapes.hpp"
 #include "traits/metric.h"
 #include "utils/comparators.h"
 #include "utils/error.h"
@@ -35,9 +47,15 @@ namespace kernel {
     }
   }
 
-  template <SimEngine::type S, MetricClass M, FldsID::type F, unsigned short N>
+  template <SimEngine::type S,
+            MetricClass        M,
+            FldsID::type       F,
+            unsigned short     N,
+            unsigned short     MomShOrd = 0u>
   class ParticleMoments_kernel {
-    static constexpr auto D = M::Dim;
+    static constexpr auto D             = M::Dim;
+    static constexpr bool USE_SHAPE     = (MomShOrd > 0u);
+    static constexpr int  SHAPE_STENCIL = static_cast<int>(MomShOrd) + 1;
 
     static_assert((S != SimEngine::GRPIC) || (F != FldsID::V),
                   "Bulk velocity not supported for GRPIC");
@@ -114,10 +132,21 @@ namespace kernel {
       , ni2 { static_cast<int>(ni2) }
       , window { window }
       , contrib { get_contrib<F>(mass, charge) }
-      , smooth { inv_n0 / (real_t)(math::pow(TWO * (real_t)window + ONE,
-                                             static_cast<int>(D))) } {
+      , smooth { USE_SHAPE
+                   ? inv_n0
+                   : inv_n0 / (real_t)(math::pow(TWO * (real_t)window + ONE,
+                                                 static_cast<int>(D))) } {
       raise::ErrorIf(buff_idx >= N, "Invalid buffer index", HERE);
       raise::ErrorIf(window > N_GHOSTS, "Window size too large", HERE);
+      if constexpr (USE_SHAPE) {
+        // The staggered stencil reaches at most `(MomShOrd + 1) / 2` cells
+        // beyond the particle's home cell on each side; that's what has
+        // to fit in the ghost region (NOT the full stencil width).
+        constexpr std::size_t half_reach = (MomShOrd + 1u) / 2u;
+        raise::ErrorIf(half_reach > N_GHOSTS,
+                       "Shape-deposition half-reach exceeds N_GHOSTS",
+                       HERE);
+      }
       raise::ErrorIf(((F == FldsID::Rho) || (F == FldsID::Charge)) && (mass == ZERO),
                      "Rho & Charge for massless particles not defined",
                      HERE);
@@ -253,7 +282,100 @@ namespace kernel {
         }
       }
       auto buff_access = Buff.access();
-      if constexpr (D == Dim::_1D) {
+      if constexpr (USE_SHAPE) {
+        // Shape-function deposition: spread the per-particle quantity
+        // `coeff` over a stencil of cells around the particle, weighted
+        // by the product of the 1D particle shape function S evaluated
+        // at each (cell_center - particle_position) offset. The shape
+        // weights form a partition of unity, so total deposition is
+        // exactly `coeff` per particle.
+        int    i1_min { 0 };
+        real_t S1[SHAPE_STENCIL];
+        prtl_shape::order<true, MomShOrd>(i1(p),
+                                          static_cast<real_t>(dx1(p)),
+                                          i1_min,
+                                          S1);
+        if constexpr (D == Dim::_1D) {
+          for (int n1 = 0; n1 < SHAPE_STENCIL; ++n1) {
+            buff_access(i1_min + n1 + N_GHOSTS, buff_idx) += coeff * S1[n1];
+          }
+        } else if constexpr (D == Dim::_2D) {
+          int    i2_min { 0 };
+          real_t S2[SHAPE_STENCIL];
+          prtl_shape::order<true, MomShOrd>(i2(p),
+                                            static_cast<real_t>(dx2(p)),
+                                            i2_min,
+                                            S2);
+          for (int n2 = 0; n2 < SHAPE_STENCIL; ++n2) {
+            const int j2 = i2_min + n2;
+            for (int n1 = 0; n1 < SHAPE_STENCIL; ++n1) {
+              const real_t w = coeff * S1[n1] * S2[n2];
+              if constexpr (M::CoordType == Coord::Cartesian) {
+                buff_access(i1_min + n1 + N_GHOSTS, j2 + N_GHOSTS, buff_idx) += w;
+              } else {
+                // reflect contribution at axes
+                if (is_axis_i2min && (j2 < 0)) {
+                  buff_access(i1_min + n1 + N_GHOSTS,
+                              N_GHOSTS - j2,
+                              buff_idx) += w;
+                } else if (is_axis_i2max && (j2 >= ni2)) {
+                  buff_access(i1_min + n1 + N_GHOSTS,
+                              2 * ni2 - j2 + N_GHOSTS,
+                              buff_idx) += w;
+                } else {
+                  buff_access(i1_min + n1 + N_GHOSTS,
+                              j2 + N_GHOSTS,
+                              buff_idx) += w;
+                }
+              }
+            }
+          }
+        } else if constexpr (D == Dim::_3D) {
+          int    i2_min { 0 };
+          int    i3_min { 0 };
+          real_t S2[SHAPE_STENCIL];
+          real_t S3[SHAPE_STENCIL];
+          prtl_shape::order<true, MomShOrd>(i2(p),
+                                            static_cast<real_t>(dx2(p)),
+                                            i2_min,
+                                            S2);
+          prtl_shape::order<true, MomShOrd>(i3(p),
+                                            static_cast<real_t>(dx3(p)),
+                                            i3_min,
+                                            S3);
+          for (int n3 = 0; n3 < SHAPE_STENCIL; ++n3) {
+            for (int n2 = 0; n2 < SHAPE_STENCIL; ++n2) {
+              const int j2 = i2_min + n2;
+              for (int n1 = 0; n1 < SHAPE_STENCIL; ++n1) {
+                const real_t w = coeff * S1[n1] * S2[n2] * S3[n3];
+                if constexpr (M::CoordType == Coord::Cartesian) {
+                  buff_access(i1_min + n1 + N_GHOSTS,
+                              j2 + N_GHOSTS,
+                              i3_min + n3 + N_GHOSTS,
+                              buff_idx) += w;
+                } else {
+                  if (is_axis_i2min && (j2 < 0)) {
+                    buff_access(i1_min + n1 + N_GHOSTS,
+                                N_GHOSTS - j2,
+                                i3_min + n3 + N_GHOSTS,
+                                buff_idx) += w;
+                  } else if (is_axis_i2max && (j2 >= ni2)) {
+                    buff_access(i1_min + n1 + N_GHOSTS,
+                                2 * ni2 - j2 + N_GHOSTS,
+                                i3_min + n3 + N_GHOSTS,
+                                buff_idx) += w;
+                  } else {
+                    buff_access(i1_min + n1 + N_GHOSTS,
+                                j2 + N_GHOSTS,
+                                i3_min + n3 + N_GHOSTS,
+                                buff_idx) += w;
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else if constexpr (D == Dim::_1D) {
         for (auto di1 { -window }; di1 <= window; ++di1) {
           buff_access(i1(p) + di1 + N_GHOSTS, buff_idx) += coeff;
         }
