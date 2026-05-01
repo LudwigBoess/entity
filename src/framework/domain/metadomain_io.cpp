@@ -126,7 +126,9 @@ namespace ntt {
                            params.template get<timestep_t>(
                              "output.ascent.interval"),
                            params.template get<simtime_t>(
-                             "output.ascent.interval_time"));
+                             "output.ascent.interval_time"),
+                           params.template get<bool>(
+                             "output.ascent.vector_aliases"));
       const auto loc_corner = local_domain->offset_ncells();
       const auto loc_shape  = local_domain->mesh.n_active();
       std::vector<std::size_t> corner(loc_corner.begin(), loc_corner.end());

@@ -99,12 +99,14 @@ namespace out {
                           const std::string&              actions_file,
                           const std::vector<std::string>& fields,
                           timestep_t                      interval,
-                          simtime_t                       interval_time) {
+                          simtime_t                       interval_time,
+                          bool                            vector_aliases) {
     raise::ErrorIf(m_initialized, "AscentWriter already initialized", HERE);
 
-    m_root         = title;
-    m_actions_file = actions_file;
-    m_fields       = fields;
+    m_root           = title;
+    m_actions_file   = actions_file;
+    m_fields         = fields;
+    m_vector_aliases = vector_aliases;
 
     m_tracker.init("ascent", interval, interval_time);
 
@@ -201,6 +203,17 @@ namespace out {
     m_mesh["topologies/mesh/type"]     = "rectilinear";
     m_mesh["topologies/mesh/coordset"] = "coords";
     m_mesh_defined                     = true;
+
+    // Allocate the per-field staging buffers once. Reused across every
+    // publishField() call (and across renders) to avoid the per-call
+    // device + host + std::vector allocation seen in earlier revisions.
+    std::size_t nelem = 1;
+    for (auto n : m_l_shape) {
+      nelem *= n;
+    }
+    m_buf_nelem   = nelem;
+    m_field_buf_d = array_t<double*>("ascent_field_buf", nelem);
+    m_field_buf_h = Kokkos::create_mirror_view(m_field_buf_d);
   }
 
   void AscentWriter::setMeshCoords(unsigned short          dim,
@@ -227,67 +240,47 @@ namespace out {
                                   const ndfield_t<D, N>& fld,
                                   std::size_t            comp) {
     raise::ErrorIf(!m_mesh_defined, "AscentWriter mesh not defined", HERE);
+    raise::ErrorIf(m_buf_nelem == 0,
+                   "AscentWriter staging buffer not allocated",
+                   HERE);
 
-    const std::size_t gh = ntt::N_GHOSTS;
-    std::vector<double> values;
+    const std::size_t gh  = ntt::N_GHOSTS;
+    auto              buf = m_field_buf_d;
 
+    // Extract the active region of the requested component into the
+    // persistent flat buffer in i-fastest order (Conduit/Blueprint layout).
+    // Conduit's `set(...)` below copies out, so the buffer can be reused
+    // across fields and across renders without any locking.
     if constexpr (D == Dim::_3D) {
       const std::size_t n1 = m_l_shape[0];
       const std::size_t n2 = m_l_shape[1];
       const std::size_t n3 = m_l_shape[2];
-      values.resize(n1 * n2 * n3);
-
-      ndarray_t<Dim::_3D> slice { "ascent_field", n1, n2, n3 };
       Kokkos::parallel_for(
         "AscentExtract3D",
         CreateRangePolicy<Dim::_3D>({ 0, 0, 0 }, { n1, n2, n3 }),
         Lambda(index_t i1, index_t i2, index_t i3) {
-          slice(i1, i2, i3) = fld(i1 + gh, i2 + gh, i3 + gh, comp);
+          buf(i1 + n1 * (i2 + n2 * i3)) = static_cast<double>(
+            fld(i1 + gh, i2 + gh, i3 + gh, comp));
         });
-      auto slice_h = Kokkos::create_mirror_view(slice);
-      Kokkos::deep_copy(slice_h, slice);
-      // Conduit/Blueprint expects logical-i fastest-varying for implicit topologies
-      for (std::size_t k = 0; k < n3; ++k) {
-        for (std::size_t j = 0; j < n2; ++j) {
-          for (std::size_t i = 0; i < n1; ++i) {
-            values[i + n1 * (j + n2 * k)] = static_cast<double>(slice_h(i, j, k));
-          }
-        }
-      }
     } else if constexpr (D == Dim::_2D) {
       const std::size_t n1 = m_l_shape[0];
       const std::size_t n2 = m_l_shape[1];
-      values.resize(n1 * n2);
-
-      ndarray_t<Dim::_2D> slice { "ascent_field", n1, n2 };
       Kokkos::parallel_for(
         "AscentExtract2D",
         CreateRangePolicy<Dim::_2D>({ 0, 0 }, { n1, n2 }),
         Lambda(index_t i1, index_t i2) {
-          slice(i1, i2) = fld(i1 + gh, i2 + gh, comp);
+          buf(i1 + n1 * i2) = static_cast<double>(fld(i1 + gh, i2 + gh, comp));
         });
-      auto slice_h = Kokkos::create_mirror_view(slice);
-      Kokkos::deep_copy(slice_h, slice);
-      for (std::size_t j = 0; j < n2; ++j) {
-        for (std::size_t i = 0; i < n1; ++i) {
-          values[i + n1 * j] = static_cast<double>(slice_h(i, j));
-        }
-      }
     } else { // Dim::_1D
       const std::size_t n1 = m_l_shape[0];
-      values.resize(n1);
-
-      ndarray_t<Dim::_1D> slice { "ascent_field", n1 };
       Kokkos::parallel_for(
         "AscentExtract1D",
         n1,
-        Lambda(index_t i1) { slice(i1) = fld(i1 + gh, comp); });
-      auto slice_h = Kokkos::create_mirror_view(slice);
-      Kokkos::deep_copy(slice_h, slice);
-      for (std::size_t i = 0; i < n1; ++i) {
-        values[i] = static_cast<double>(slice_h(i));
-      }
+        Lambda(index_t i1) {
+          buf(i1) = static_cast<double>(fld(i1 + gh, comp));
+        });
     }
+    Kokkos::deep_copy(m_field_buf_h, m_field_buf_d);
 
     // Internal field names carry a leading "f" prefix (see out::OutputField).
     // The user-facing name in Ascent / Conduit is the same name without it.
@@ -297,17 +290,21 @@ namespace out {
     const std::string base = "fields/" + short_name;
     m_mesh[base + "/topology"]    = "mesh";
     m_mesh[base + "/association"] = "element";
-    m_mesh[base + "/values"].set(values.data(), values.size());
+    m_mesh[base + "/values"].set(m_field_buf_h.data(), m_buf_nelem);
 
-    // Vector-field bonus path: when the user-facing name ends in "1", "2",
-    // or "3" (e.g. B1/B2/B3, E1/E2/E3, J1/J2/J3) ALSO publish the same
-    // values as the matching component of an MCArray vector field whose
-    // name is the prefix (e.g. "B"). VTK-h filters that need a 3-vector
-    // (streamline, gradient, ...) can then reference the prefix name
-    // directly without an extra `composite_vector` pipeline step — that
-    // workflow currently produces a vector layout VTK-h's streamline
-    // backend in Ascent v0.9.x can't unpack as Vec<float,3>/Vec<double,3>.
-    if (short_name.size() >= 2u) {
+    // Vector-field bonus path (gated by m_vector_aliases): when the
+    // user-facing name ends in "1", "2", or "3" (e.g. B1/B2/B3) ALSO
+    // publish the same values as the matching component of an MCArray
+    // vector field whose name is the prefix (e.g. "B"). VTK-h filters
+    // that need a 3-vector (streamline, gradient, ...) can then
+    // reference the prefix name directly without an extra
+    // `composite_vector` pipeline step — that workflow currently
+    // produces a vector layout VTK-h's streamline backend in Ascent
+    // v0.9.x can't unpack as Vec<float,3>/Vec<double,3>.
+    // Disable via `output.ascent.vector_aliases = false` in the toml
+    // input to halve published mesh size when the actions file only
+    // references the scalar form (or only the vector form).
+    if (m_vector_aliases && short_name.size() >= 2u) {
       const char idx = short_name.back();
       if (idx >= '1' && idx <= '3') {
         const std::string prefix = short_name.substr(0, short_name.size() - 1u);
@@ -316,8 +313,9 @@ namespace out {
           const std::string vec_base = "fields/" + prefix;
           m_mesh[vec_base + "/topology"]    = "mesh";
           m_mesh[vec_base + "/association"] = "element";
-          m_mesh[vec_base + "/values/" + sub[idx - '1']].set(values.data(),
-                                                              values.size());
+          m_mesh[vec_base + "/values/" + sub[idx - '1']].set(
+            m_field_buf_h.data(),
+            m_buf_nelem);
         }
       }
     }

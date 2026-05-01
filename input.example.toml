@@ -624,6 +624,14 @@
     #   @default: []
     #   @note: Vector components are suffixed with the index, e.g. "B3" is the third component of B
     fields = ""
+    # When true, components named "<X>1"/"<X>2"/"<X>3" are ALSO published as the
+    # u/v/w components of an MCArray vector field "<X>" (so streamline / gradient
+    # filters can reference the prefix directly). Disable to halve the published
+    # mesh size when the actions file only uses the scalar form (or only the
+    # vector form).
+    #   @type: bool
+    #   @default: true
+    vector_aliases = ""
     # Number of timesteps between Ascent renders
     #   @type: uint
     #   @default: 0

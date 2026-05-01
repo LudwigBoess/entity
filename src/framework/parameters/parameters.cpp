@@ -180,6 +180,12 @@ namespace ntt {
                                                 "ascent",
                                                 "fields",
                                                 std::vector<std::string> {}));
+    set("output.ascent.vector_aliases",
+        toml::find_or<bool>(toml_data,
+                            "output",
+                            "ascent",
+                            "vector_aliases",
+                            true));
     {
       // Cadence is independent of [output.fields]: when neither is set, fall
       // back to the global [output] interval keys.

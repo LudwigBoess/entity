@@ -49,6 +49,7 @@ namespace out {
     bool           m_mesh_defined { false };
     bool           m_pending_render { false };
     bool           m_have_actions { false };
+    bool           m_vector_aliases { true };
 
     Dimension                m_dim { Dim::_3D };
     std::vector<std::size_t> m_l_shape;
@@ -56,6 +57,13 @@ namespace out {
     std::string              m_root;
     std::string              m_actions_file;
     std::vector<std::string> m_fields;
+
+    // Persistent staging buffers reused across all publishField() calls.
+    // Sized once in defineMesh(); avoids per-render device + host allocations
+    // and a redundant LayoutLeft → C-order host reorder.
+    array_t<double*>        m_field_buf_d;
+    array_mirror_t<double*> m_field_buf_h;
+    std::size_t             m_buf_nelem { 0 };
 
     tools::Tracker m_tracker;
 
@@ -73,12 +81,17 @@ namespace out {
      * @param fields List of field names (e.g. "B3") that will be published.
      * @param interval Step interval between renders (used when interval_time<=0).
      * @param interval_time Sim-time interval between renders.
+     * @param vector_aliases If true, scalar components named B1/B2/B3 (etc.)
+     *        are *also* published as the matching component of an MCArray
+     *        vector field "B". Set to false to halve the data volume when
+     *        the actions file only references the scalar form.
      */
     void init(const std::string&              title,
               const std::string&              actions_file,
               const std::vector<std::string>& fields,
               timestep_t                      interval,
-              simtime_t                       interval_time);
+              simtime_t                       interval_time,
+              bool                            vector_aliases);
 
     /**
      * @brief Whether the writer should fire on the current cycle.
