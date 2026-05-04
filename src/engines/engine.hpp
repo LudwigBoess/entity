@@ -289,8 +289,7 @@ namespace ntt {
         });
         timers.stop("Custom");
       }
-      // dynamic load balancing (Cartesian metrics only)
-      if constexpr (CartesianMetricClass<M>) {
+      if constexpr (MetricClass<M>) {
         if (lb_enable and lb_interval > 0 and (step + 1) % lb_interval == 0 and
             lb_dim_mask != 0u) {
           timers.start("LoadBalance");

@@ -111,7 +111,7 @@ namespace ntt {
   void Metadomain<S, M>::Rebalance(unsigned int dim_mask,
                                    real_t       tolerance,
                                    ncells_t     max_shift_cells)
-    requires(CartesianMetricClass<M>)
+    requires(MetricClass<M>)
   {
 #if !defined(MPI_ENABLED)
     (void)dim_mask;
@@ -122,6 +122,14 @@ namespace ntt {
     raise::ErrorIf(l_subdomain_indices().size() != 1,
                    "Rebalance assumes one local subdomain per rank",
                    HERE);
+    // The theta dimension (idx 1) is bounded by the polar axis for any
+    // non-Cartesian metric: moving an interior boundary in theta is fine
+    // in principle, but the safety net here forbids it pending validation.
+    if constexpr (M::CoordType != ntt::Coord::Cartesian) {
+      raise::ErrorIf((dim_mask & (1u << 1)) != 0u,
+                     "Rebalance along the polar axis is not supported",
+                     HERE);
+    }
     // strip-width is constrained by N_GHOSTS so that any new active cells
     // are already present in the rank's old ghost zone (after the most
     // recent ghost-cell exchange).
@@ -243,20 +251,37 @@ namespace ntt {
     }
 
     /* --- 4. Per-position prefix sums (offset and physical extent) -------- */
+    // Face positions are queried from g_mesh.metric in the global code-coordinate
+    // system, so curvilinear stretches (log-r, eta-stretching) are honored.
     std::vector<std::vector<ncells_t>> new_offset_per_pos(M::Dim);
     std::vector<std::vector<std::pair<real_t, real_t>>> extent_per_pos(M::Dim);
+    auto face_phys = [this](unsigned int d, real_t x_code) -> real_t {
+      if (d == 0u) {
+        return g_mesh.metric.template convert<1, Crd::Cd, Crd::Ph>(x_code);
+      }
+      if constexpr (M::Dim == Dim::_2D or M::Dim == Dim::_3D) {
+        if (d == 1u) {
+          return g_mesh.metric.template convert<2, Crd::Cd, Crd::Ph>(x_code);
+        }
+      }
+      if constexpr (M::Dim == Dim::_3D) {
+        if (d == 2u) {
+          return g_mesh.metric.template convert<3, Crd::Cd, Crd::Ph>(x_code);
+        }
+      }
+      raise::Error("Invalid dimension index in Rebalance face_phys", HERE);
+      return ZERO;
+    };
     for (auto d { 0u }; d < M::Dim; ++d) {
       const auto N = g_ndomains_per_dim[d];
       new_offset_per_pos[d].assign(N, 0);
       extent_per_pos[d].resize(N);
-      const auto dx = g_mesh.metric.get_dx();
-      const auto x0 = g_mesh.extent()[d].first;
-      ncells_t   running { 0 };
+      ncells_t running { 0 };
       for (auto p { 0u }; p < N; ++p) {
         new_offset_per_pos[d][p] = running;
-        const auto x_lo = x0 + static_cast<real_t>(running) * dx;
+        const auto x_lo = face_phys(d, static_cast<real_t>(running));
         running        += new_ncells_per_pos[d][p];
-        const auto x_hi = x0 + static_cast<real_t>(running) * dx;
+        const auto x_hi = face_phys(d, static_cast<real_t>(running));
         extent_per_pos[d][p] = { x_lo, x_hi };
       }
     }
@@ -265,11 +290,16 @@ namespace ntt {
     auto&      local_dom         = g_subdomains[local_idx];
     const auto old_offset_ncells = local_dom.offset_ncells();
 
-    // Cartesian engines are SRPIC only; em is the only persistent field state.
-    static_assert(S == SimEngine::SRPIC,
-                  "Rebalance is only specialized for Cartesian/SRPIC");
     auto em_old_h = Kokkos::create_mirror_view(local_dom.fields.em);
     Kokkos::deep_copy(em_old_h, local_dom.fields.em);
+    auto em0_old_h  = decltype(Kokkos::create_mirror_view(local_dom.fields.em0)) {};
+    auto cur0_old_h = decltype(Kokkos::create_mirror_view(local_dom.fields.cur0)) {};
+    if constexpr (S == SimEngine::GRPIC) {
+      em0_old_h  = Kokkos::create_mirror_view(local_dom.fields.em0);
+      cur0_old_h = Kokkos::create_mirror_view(local_dom.fields.cur0);
+      Kokkos::deep_copy(em0_old_h, local_dom.fields.em0);
+      Kokkos::deep_copy(cur0_old_h, local_dom.fields.cur0);
+    }
 
     /* --- 6. Update bookkeeping for every g_subdomain --------------------- */
     std::vector<ncells_t> new_local_ncells(M::Dim);
@@ -305,6 +335,10 @@ namespace ntt {
 
     local_dom.fields = Fields<M::Dim, S> { new_local_ncells };
     CopyShifted<M::Dim, 6>(em_old_h, local_dom.fields.em, delta);
+    if constexpr (S == SimEngine::GRPIC) {
+      CopyShifted<M::Dim, 6>(em0_old_h, local_dom.fields.em0, delta);
+      CopyShifted<M::Dim, 3>(cur0_old_h, local_dom.fields.cur0, delta);
+    }
 
     /* --- 8. Refill ghost zones from neighbors ---------------------------- */
     CommunicateFields(local_dom, Comm::E | Comm::B);
@@ -387,7 +421,7 @@ namespace ntt {
 #define METADOMAIN_REBAL(S, M, D)                                              \
   template void Metadomain<S, M<D>>::Rebalance(unsigned int, real_t, ncells_t);
 
-  NTT_FOREACH_CARTESIAN_SPECIALIZATION(METADOMAIN_REBAL)
+  NTT_FOREACH_SPECIALIZATION(METADOMAIN_REBAL)
 #undef METADOMAIN_REBAL
   // NOLINTEND(bugprone-macro-parentheses)
 
