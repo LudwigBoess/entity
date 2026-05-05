@@ -74,6 +74,8 @@ namespace out {
 
     WriteModeTags m_active_mode { WriteMode::None };
 
+    void defineVtkXml();
+
   public:
     Writer() {}
 

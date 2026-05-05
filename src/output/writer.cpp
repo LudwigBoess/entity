@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <exception>
 #include <filesystem>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -133,6 +134,14 @@ namespace out {
       std::reverse(m_flds_l_shape_dwn.begin(), m_flds_l_shape_dwn.end());
       m_io.DefineAttribute("LayoutRight", 0);
     }
+
+    // Define trivial 1-element edge-coordinate variables for dimensions beyond ndim.
+    // These are referenced in the vtk.xml attribute so ADIOS2VTXReader can open the
+    // file as a RectilinearGrid without a sidecar, even for 1-D / 2-D runs.
+    for (auto i = glob_shape.size(); i < 3; ++i) {
+      m_io.DefineVariable<real_t>(
+        "X" + std::to_string(i + 1) + "e", {}, {}, { adios2::UnknownDim });
+    }
   }
 
   void Writer::defineFieldOutputs(const SimEngine&                S,
@@ -164,6 +173,75 @@ namespace out {
         }
       }
     }
+    defineVtkXml();
+  }
+
+  void Writer::defineVtkXml() {
+    using layout_t = typename ndfield_t<Dim::_3D, 6>::array_layout;
+    constexpr bool        lr        = std::is_same_v<layout_t, Kokkos::LayoutRight>;
+    constexpr const char* real_type = std::is_same_v<real_t, float> ? "Float32" : "Float64";
+
+    const auto ndim = m_flds_g_shape_dwn.size();
+
+    // Cell counts per VTK axis (k=0 → X = fastest, k=2 → Z = slowest).
+    // m_flds_g_shape_dwn[0] is the slowest ADIOS2 dimension, so VTK Z = dwn[0].
+    std::size_t vtk_counts[3] = { 0, 0, 0 };
+    for (auto k = 0u; k < ndim; ++k) {
+      vtk_counts[k] = m_flds_g_shape_dwn[ndim - 1 - k];
+    }
+
+    // Edge-coordinate variable name for VTK axis k.
+    // LayoutRight (C-order, X1 slowest):  VTK X = X(ndim), VTK Z = X1
+    //   k < ndim → "X" + (ndim-k) + "e";  k ≥ ndim (padding) → "X" + (k+1) + "e"
+    // LayoutLeft  (Fortran-order, X1 fastest): VTK X = X1
+    //   always → "X" + (k+1) + "e"
+    std::string coord_names[3];
+    for (auto k = 0u; k < 3; ++k) {
+      if constexpr (lr) {
+        coord_names[k] = (k < ndim) ? "X" + std::to_string(ndim - k) + "e"
+                                     : "X" + std::to_string(k + 1) + "e";
+      } else {
+        coord_names[k] = "X" + std::to_string(k + 1) + "e";
+      }
+    }
+
+    std::vector<std::string> field_names;
+    for (const auto& fld : m_flds_writers) {
+      if (fld.comp.empty()) {
+        field_names.push_back(fld.name());
+      } else {
+        for (auto i = 0u; i < fld.comp.size(); ++i) {
+          field_names.push_back(fld.name(i));
+        }
+      }
+    }
+
+    std::ostringstream xml;
+    xml << "<VTKFile type=\"RectilinearGrid\" version=\"0.1\""
+           " byte_order=\"LittleEndian\">\n"
+           "  <RectilinearGrid WholeExtent=\""
+        << "0 " << vtk_counts[0] << " 0 " << vtk_counts[1] << " 0 " << vtk_counts[2]
+        << "\">\n"
+           "    <Piece Extent=\""
+        << "0 " << vtk_counts[0] << " 0 " << vtk_counts[1] << " 0 " << vtk_counts[2]
+        << "\">\n"
+           "      <Coordinates>\n";
+    for (auto k = 0u; k < 3; ++k) {
+      xml << "        <DataArray Name=\"" << coord_names[k] << "\" type=\"" << real_type
+          << "\"/>\n";
+    }
+    xml << "      </Coordinates>\n"
+           "      <CellData>\n";
+    for (const auto& name : field_names) {
+      xml << "        <DataArray Name=\"" << name << "\" type=\"" << real_type
+          << "\"/>\n";
+    }
+    xml << "      </CellData>\n"
+           "    </Piece>\n"
+           "  </RectilinearGrid>\n"
+           "</VTKFile>";
+
+    m_io.DefineAttribute<std::string>("vtk.xml", xml.str());
   }
 
   void Writer::defineSpectraOutputs(const std::vector<spidx_t>& specs) {
@@ -403,6 +481,31 @@ namespace out {
     auto vard = m_io.InquireVariable<std::size_t>(
       "N" + std::to_string(dim + 1) + "l");
     m_writer.Put(vard, loc_off_sz.data(), adios2::Mode::Sync);
+
+    // On the last actual dimension, write the trivial padding edge-coordinate
+    // variables (1 element each) that the vtk.xml attribute references.
+    const auto ndim_act = static_cast<unsigned short>(m_flds_g_shape.size());
+    if (dim == ndim_act - 1) {
+      for (auto pad = ndim_act; pad < 3; ++pad) {
+        auto var_pad = m_io.InquireVariable<real_t>(
+          "X" + std::to_string(pad + 1) + "e");
+        const real_t zero { ZERO };
+#if defined(MPI_ENABLED)
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        if (rank == MPI_ROOT_RANK) {
+          var_pad.SetSelection(adios2::Box<adios2::Dims>({ 0u }, { 1u }));
+          m_writer.Put(var_pad, &zero, adios2::Mode::Sync);
+        } else {
+          var_pad.SetSelection(adios2::Box<adios2::Dims>({ 0u }, { 0u }));
+          m_writer.Put<real_t>(var_pad, nullptr);
+        }
+#else
+        var_pad.SetSelection(adios2::Box<adios2::Dims>({}, { 1u }));
+        m_writer.Put(var_pad, &zero, adios2::Mode::Sync);
+#endif
+      }
+    }
   }
 
   void Writer::beginWriting(WriteModeTags write_mode,
