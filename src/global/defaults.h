@@ -68,7 +68,7 @@ namespace ntt::defaults {
     const std::string              format           = "BPFile";
     const timestep_t               interval         = 100;
     const unsigned short           mom_smooth       = 0;
-    const unsigned short           mom_shape_order  = 0;
+    const bool                     mom_window       = false;
     const npart_t                  prtl_stride      = 100;
     const real_t                   spec_emin        = 1e-3;
     const real_t                   spec_emax        = 1e3;

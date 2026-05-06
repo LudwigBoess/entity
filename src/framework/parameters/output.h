@@ -44,7 +44,7 @@ namespace ntt {
       std::optional<std::vector<std::string>>  fields_quantities;
       std::optional<std::vector<std::string>>  fields_custom_quantities;
       std::optional<unsigned short>            fields_mom_smooth;
-      std::optional<unsigned short>            fields_mom_shape_order;
+      std::optional<bool>                      fields_mom_window;
       std::optional<std::vector<unsigned int>> fields_downsampling;
 
       std::optional<std::vector<spidx_t>> particles_species;

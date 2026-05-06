@@ -517,24 +517,24 @@
     # Smoothing window for the output of moments ("Rho", "Charge", "T", ...)
     #   @type: ushort
     #   @default: 0
+    #   @note: Only used when `window = true` (the legacy box smoothing).
     mom_smooth = ""
-    # Particle-shape deposition order for the output of moments
-    # ("Rho", "Charge", "N", "T", ...)
-    #   @type: ushort [0..5]
-    #   @default: 0
-    #   @note: When 0, deposition uses the legacy uniform window of size
-    #          `mom_smooth` (each cell within the window receives the same
-    #          fraction of the per-particle quantity).
-    #   @note: When > 0, the per-particle quantity is spread over an
-    #          (order+1)-wide stencil weighted by the b-spline particle
-    #          shape function S_order at cell centers (the same shape used
-    #          for current deposition; see kernels/particle_shapes.hpp).
-    #          Shape weights form a partition of unity, so the total
-    #          deposition equals the per-particle quantity.
-    #   @note: Useful with Ascent for smoother in-situ rendering of
-    #          particle-derived fields like N, Rho, T, ...
-    #   @note: When > 0, `mom_smooth` is ignored.
-    mom_shape_order = ""
+    # Deposition method for moment output ("Rho", "Charge", "N", "T", ...)
+    #   @type: bool
+    #   @default: false
+    #   @note: When `true`, deposition uses the legacy uniform box of
+    #          half-size `mom_smooth` (each cell within the window receives
+    #          the same fraction of the per-particle quantity).
+    #   @note: When `false`, the per-particle quantity is spread over a
+    #          (SHAPE_ORDER+1)-wide stencil weighted by the b-spline particle
+    #          shape function used for current deposition (see
+    #          kernels/particle_shapes.hpp). The compile-time `SHAPE_ORDER`
+    #          guarantees the stencil fits within `N_GHOSTS`, so cross-rank
+    #          contributions are correctly exchanged. Requires a build with
+    #          `-D deposit=esirkepov -D shape_order >= 1`.
+    #   @note: `false` is useful with Ascent for smoother in-situ rendering
+    #          of particle-derived fields like N, Rho, T, ...
+    window = ""
     # Number of timesteps between field outputs
     #   @type: uint
     #   @default: 0

@@ -197,39 +197,20 @@ namespace ntt {
     const auto use_weights = params.template get<bool>("particles.use_weights");
     const auto ni2         = mesh.n_active(in::x2);
     const auto inv_n0      = ONE / params.template get<real_t>("scales.n0");
-    const auto window      = params.template get<unsigned short>(
+    const auto mom_smooth = params.template get<unsigned short>(
       "output.fields.mom_smooth");
-    const auto shape_order = params.template get<unsigned short>(
-      "output.fields.mom_shape_order");
-
-    // The deposition stencil must fit inside the local ghost-zone strip:
-    // contributions written past index N_GHOSTS from the active domain are
-    // both out-of-bounds and outside what `SynchronizeFields(Comm::Bckp)`
-    // exchanges with neighbouring ranks, so they would silently corrupt
-    // memory and/or be lost across MPI boundaries.
-    //   - shape_order = O > 0: staggered stencil reach is (O + 1) / 2 cells
-    //   - shape_order = 0    : legacy box deposition reaches `window` cells
-    const unsigned short required_ghosts = (shape_order > 0u)
-                                             ? static_cast<unsigned short>(
-                                                 (shape_order + 1u) / 2u)
-                                             : window;
-    raise::ErrorIf(
-      required_ghosts > static_cast<unsigned short>(N_GHOSTS),
-      "Moment deposition stencil exceeds N_GHOSTS = " +
-        std::to_string(N_GHOSTS) +
-        " (need >= " + std::to_string(required_ghosts) +
-        ") for output.fields.mom_shape_order = " +
-        std::to_string(shape_order) +
-        ", output.fields.mom_smooth = " + std::to_string(window) +
-        "; rebuild with a larger SHAPE_ORDER or reduce mom_shape_order/mom_smooth",
-      HERE);
+    const auto use_window = params.template get<bool>(
+      "output.fields.mom_window");
 
     // Dispatch on the requested deposition method:
-    //   `output.fields.mom_shape_order = 0` (default) -> legacy uniform
-    //     window of half-size `window` (no shape function used).
-    //   `output.fields.mom_shape_order = O > 0`       -> SPH-like
-    //     deposition over a (O+1)-wide stencil weighted by the particle
-    //     shape function S_O at cell centers.
+    //   `output.fields.window = true` (default) -> legacy box smoothing of
+    //     half-size `mom_smooth` (no shape function used).
+    //   `output.fields.window = false`          -> SPH-like deposition over
+    //     a (SHAPE_ORDER+1)-wide stencil weighted by the particle shape
+    //     function evaluated at cell centers. Using the build's compile-time
+    //     SHAPE_ORDER guarantees the stencil fits within N_GHOSTS by
+    //     construction, so cross-rank deposition is faithfully exchanged by
+    //     `SynchronizeFields(..., Comm::Bckp, ...)` after this routine.
     for (const auto& sp : specs) {
       auto& prtl_spec = prtl_species[sp - 1];
       // clang-format off
@@ -246,16 +227,11 @@ namespace ntt {
           prtl_spec.mass(), prtl_spec.charge(),                                \
           use_weights,                                                         \
           mesh.metric, mesh.flds_bc(),                                         \
-          ni2, inv_n0, window))
-      switch (shape_order) {
-        case 0u: LAUNCH_PMOM_KERNEL(0u); break;
-        case 1u: LAUNCH_PMOM_KERNEL(1u); break;
-        case 2u: LAUNCH_PMOM_KERNEL(2u); break;
-        case 3u: LAUNCH_PMOM_KERNEL(3u); break;
-        case 4u: LAUNCH_PMOM_KERNEL(4u); break;
-        case 5u: LAUNCH_PMOM_KERNEL(5u); break;
-        default:
-          raise::Error("output.fields.mom_shape_order must be in [0, 5]", HERE);
+          ni2, inv_n0, mom_smooth))
+      if (use_window) {
+        LAUNCH_PMOM_KERNEL(0u);
+      } else {
+        LAUNCH_PMOM_KERNEL(static_cast<unsigned short>(SHAPE_ORDER));
       }
 #undef LAUNCH_PMOM_KERNEL
       // clang-format on
