@@ -19,6 +19,8 @@
     #include <mpi.h>
   #endif
 
+  #include <array>
+  #include <cmath>
   #include <cstdint>
   #include <filesystem>
   #include <fstream>
@@ -29,6 +31,140 @@
 namespace out {
 
   namespace {
+    /*
+     * Read a 3-vector from a Conduit float64/float32 array of length 3.
+     * Returns false (leaving `out` untouched) for any other layout — the
+     * caller then skips the transform for that camera entry instead of
+     * silently corrupting it.
+     */
+    auto readVec3(const conduit::Node&   arr,
+                  std::array<double, 3>& out) -> bool {
+      if (!arr.dtype().is_floating_point()) {
+        return false;
+      }
+      if (arr.dtype().number_of_elements() != 3) {
+        return false;
+      }
+      if (arr.dtype().is_float64()) {
+        const auto a = arr.as_float64_array();
+        out          = { a[0], a[1], a[2] };
+        return true;
+      }
+      if (arr.dtype().is_float32()) {
+        const auto a = arr.as_float32_array();
+        out          = { static_cast<double>(a[0]),
+                         static_cast<double>(a[1]),
+                         static_cast<double>(a[2]) };
+        return true;
+      }
+      return false;
+    }
+
+    /*
+     * Write a 3-vector back into the same Conduit array, preserving its
+     * original element type (float32/float64). No-op for unsupported
+     * layouts so the original values stay intact.
+     */
+    void writeVec3(conduit::Node& arr, const std::array<double, 3>& v) {
+      if (arr.dtype().number_of_elements() != 3) {
+        return;
+      }
+      if (arr.dtype().is_float64()) {
+        auto a = arr.as_float64_array();
+        a[0]   = v[0];
+        a[1]   = v[1];
+        a[2]   = v[2];
+      } else if (arr.dtype().is_float32()) {
+        auto a = arr.as_float32_array();
+        a[0]   = static_cast<conduit::float32>(v[0]);
+        a[1]   = static_cast<conduit::float32>(v[1]);
+        a[2]   = static_cast<conduit::float32>(v[2]);
+      }
+    }
+
+    /*
+     * Rodrigues' rotation: rotate `v` by `theta` (radians) about the
+     * unit axis `k`. Caller is responsible for normalizing `k`.
+     */
+    auto rotateAboutAxis(const std::array<double, 3>& v,
+                         const std::array<double, 3>& k,
+                         double                       theta)
+      -> std::array<double, 3> {
+      const double c   = std::cos(theta);
+      const double s   = std::sin(theta);
+      const double kdv = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+      const std::array<double, 3> kxv {
+        k[1] * v[2] - k[2] * v[1],
+        k[2] * v[0] - k[0] * v[2],
+        k[0] * v[1] - k[1] * v[0],
+      };
+      return {
+        v[0] * c + kxv[0] * s + k[0] * kdv * (1.0 - c),
+        v[1] * c + kxv[1] * s + k[1] * kdv * (1.0 - c),
+        v[2] * c + kxv[2] * s + k[2] * kdv * (1.0 - c),
+      };
+    }
+
+    /*
+     * Walk the actions tree and apply the v_drift / v_rot rewrite to
+     * every `camera` block:
+     *   1. rotate `position` about `look_at` by `theta` using `up` as
+     *      axis (skipped if `up` is missing or zero-length);
+     *   2. translate both `position` and `look_at` by `dx` along x.
+     * Step 1 commutes with step 2 — translating both end-points by the
+     * same vector preserves the rotation pivot — so this single pass
+     * also covers "rotate around the original (un-drifted) focus point
+     * and then translate".
+     *
+     * Applied freshly each render against the pristine pre-loaded base
+     * tree, never in place.
+     */
+    void applyCameraTransforms(conduit::Node& node, double dx, double theta) {
+      for (conduit::index_t i = 0; i < node.number_of_children(); ++i) {
+        auto&             child = node.child(i);
+        const std::string name  = child.name();
+        if (name == "camera") {
+          std::array<double, 3> position {};
+          std::array<double, 3> look_at {};
+          std::array<double, 3> up {};
+          const bool has_pos = child.has_child("position") &&
+                               readVec3(child["position"], position);
+          const bool has_look = child.has_child("look_at") &&
+                                readVec3(child["look_at"], look_at);
+          if (theta != 0.0 && has_pos && has_look) {
+            std::array<double, 3> axis { 0.0, 0.0, 1.0 };
+            if (child.has_child("up")) {
+              readVec3(child["up"], up);
+              const double n = std::sqrt(up[0] * up[0] + up[1] * up[1] +
+                                         up[2] * up[2]);
+              if (n > 0.0) {
+                axis = { up[0] / n, up[1] / n, up[2] / n };
+              }
+            }
+            const std::array<double, 3> rel { position[0] - look_at[0],
+                                              position[1] - look_at[1],
+                                              position[2] - look_at[2] };
+            const auto rotated = rotateAboutAxis(rel, axis, theta);
+            position           = { rotated[0] + look_at[0],
+                                   rotated[1] + look_at[1],
+                                   rotated[2] + look_at[2] };
+            writeVec3(child["position"], position);
+          }
+          if (dx != 0.0) {
+            if (has_pos) {
+              position[0] += dx;
+              writeVec3(child["position"], position);
+            }
+            if (has_look) {
+              look_at[0] += dx;
+              writeVec3(child["look_at"], look_at);
+            }
+          }
+        }
+        applyCameraTransforms(child, dx, theta);
+      }
+    }
+
     /*
      * Conduit's YAML parser stores integer scalars as int64 by default, but
      * many Ascent / VTK-h filters call `.as_int()` (i.e. int32) on their
@@ -100,13 +236,17 @@ namespace out {
                           const std::vector<std::string>& fields,
                           timestep_t                      interval,
                           simtime_t                       interval_time,
-                          bool                            vector_aliases) {
+                          bool                            vector_aliases,
+                          real_t                          v_drift,
+                          real_t                          v_rot) {
     raise::ErrorIf(m_initialized, "AscentWriter already initialized", HERE);
 
     m_root           = title;
     m_actions_file   = actions_file;
     m_fields         = fields;
     m_vector_aliases = vector_aliases;
+    m_v_drift        = v_drift;
+    m_v_rot          = v_rot;
 
     m_tracker.init("ascent", interval, interval_time);
 
@@ -478,8 +618,26 @@ namespace out {
     // to execute() directly (with int64→int32 demotion already applied).
     // Otherwise fall back to an empty node, so Ascent reads
     // ascent_actions.yaml itself via the `actions_file` option.
+    //
+    // With a non-zero `v_drift` or `v_rot` the camera entries in the
+    // actions tree need a fresh time-dependent rewrite each render, so
+    // we copy the pristine `m_actions` base into a working node and
+    // transform that. The base tree must remain untouched — applying
+    // the rewrite in place would compound across renders.
     if (m_have_actions) {
-      m_ascent.execute(m_actions);
+      const auto v_drift_zero = m_v_drift == static_cast<real_t>(0.0);
+      const auto v_rot_zero   = m_v_rot == static_cast<real_t>(0.0);
+      if (!v_drift_zero || !v_rot_zero) {
+        m_actions_work.set(m_actions);
+        const double dx    = static_cast<double>(m_v_drift) *
+                          static_cast<double>(time);
+        const double theta = static_cast<double>(m_v_rot) *
+                             static_cast<double>(time);
+        applyCameraTransforms(m_actions_work, dx, theta);
+        m_ascent.execute(m_actions_work);
+      } else {
+        m_ascent.execute(m_actions);
+      }
     } else {
       conduit::Node actions;
       m_ascent.execute(actions);

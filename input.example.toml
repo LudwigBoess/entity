@@ -670,6 +670,24 @@
     #   @note: When `>= 0`, overrides `interval`
     #   @note: This cadence is independent of `output.fields.interval_time`
     interval_time = ""
+    # Drift velocity along the x-axis (code units). At render time
+    # `v_drift * t` is added to the x-component of every `camera/position`
+    # and `camera/look_at` in the actions file, so the camera tracks a
+    # feature drifting through the simulation domain (e.g. a shock front
+    # under a moving window).
+    #   @type: float
+    #   @default: 0.0
+    #   @note: Zero leaves the actions file untouched.
+    v_drift = ""
+    # Rotational velocity (radians per code time unit) of the camera
+    # about its `look_at` point, using the camera's `up` vector as the
+    # rotation axis. Combined freely with `v_drift`: the camera orbits
+    # the (drifted) focus point at angular rate `v_rot`, so theta = v_rot * t.
+    #   @type: float
+    #   @default: 0.0
+    #   @note: Zero leaves camera positions unrotated.
+    #   @note: A full orbit takes `2*pi / v_rot` code time units.
+    v_rot = ""
 
   [output.stats]
     # Toggle for the stats output

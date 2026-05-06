@@ -128,7 +128,11 @@ namespace ntt {
                            params.template get<simtime_t>(
                              "output.ascent.interval_time"),
                            params.template get<bool>(
-                             "output.ascent.vector_aliases"));
+                             "output.ascent.vector_aliases"),
+                           params.template get<real_t>(
+                             "output.ascent.v_drift"),
+                           params.template get<real_t>(
+                             "output.ascent.v_rot"));
       const auto loc_corner = local_domain->offset_ncells();
       const auto loc_shape  = local_domain->mesh.n_active();
       std::vector<std::size_t> corner(loc_corner.begin(), loc_corner.end());
@@ -197,6 +201,28 @@ namespace ntt {
       "output.fields.mom_smooth");
     const auto shape_order = params.template get<unsigned short>(
       "output.fields.mom_shape_order");
+
+    // The deposition stencil must fit inside the local ghost-zone strip:
+    // contributions written past index N_GHOSTS from the active domain are
+    // both out-of-bounds and outside what `SynchronizeFields(Comm::Bckp)`
+    // exchanges with neighbouring ranks, so they would silently corrupt
+    // memory and/or be lost across MPI boundaries.
+    //   - shape_order = O > 0: staggered stencil reach is (O + 1) / 2 cells
+    //   - shape_order = 0    : legacy box deposition reaches `window` cells
+    const unsigned short required_ghosts = (shape_order > 0u)
+                                             ? static_cast<unsigned short>(
+                                                 (shape_order + 1u) / 2u)
+                                             : window;
+    raise::ErrorIf(
+      required_ghosts > static_cast<unsigned short>(N_GHOSTS),
+      "Moment deposition stencil exceeds N_GHOSTS = " +
+        std::to_string(N_GHOSTS) +
+        " (need >= " + std::to_string(required_ghosts) +
+        ") for output.fields.mom_shape_order = " +
+        std::to_string(shape_order) +
+        ", output.fields.mom_smooth = " + std::to_string(window) +
+        "; rebuild with a larger SHAPE_ORDER or reduce mom_shape_order/mom_smooth",
+      HERE);
 
     // Dispatch on the requested deposition method:
     //   `output.fields.mom_shape_order = 0` (default) -> legacy uniform

@@ -44,12 +44,29 @@ namespace out {
     ascent::Ascent m_ascent;
     conduit::Node  m_mesh;
     conduit::Node  m_options;
+    // Pristine pre-loaded actions tree (int64 leaves already demoted to
+    // int32 once at init time). Used as the source for `m_actions_work`
+    // when a non-zero `v_drift` requires a per-render rewrite.
     conduit::Node  m_actions;
+    // Working copy with `v_drift * t` applied to camera positions /
+    // look-at points. Allocated lazily; only populated when v_drift != 0.
+    conduit::Node  m_actions_work;
     bool           m_initialized { false };
     bool           m_mesh_defined { false };
     bool           m_pending_render { false };
     bool           m_have_actions { false };
     bool           m_vector_aliases { true };
+    // Drift velocity along the x-axis (code units). At render time the
+    // first component of each `camera/position` and `camera/look_at`
+    // entry in the actions tree is shifted by `m_v_drift * time`. Zero
+    // means the actions file is executed unmodified.
+    real_t         m_v_drift { 0.0 };
+    // Rotational velocity (radians per code time unit) around each
+    // camera's `look_at` point, using `up` as the rotation axis. The
+    // rotation `m_v_rot * time` is applied to the camera position
+    // before the v_drift translation, so the camera orbits the drifted
+    // focus point. Zero leaves the camera unrotated.
+    real_t         m_v_rot { 0.0 };
     // Blueprint mesh structure does not change between renders (only state
     // values + field values do). Verify once, skip on subsequent renders.
     bool           m_verified { false };
@@ -93,13 +110,24 @@ namespace out {
      *        are *also* published as the matching component of an MCArray
      *        vector field "B". Set to false to halve the data volume when
      *        the actions file only references the scalar form.
+     * @param v_drift Drift velocity along the x-axis (code units). At
+     *        render time `v_drift * time` is added to the x-component of
+     *        every `camera/position` and `camera/look_at` in the actions
+     *        tree, letting the camera follow a moving window. Zero
+     *        disables the rewrite and keeps the actions file untouched.
+     * @param v_rot Rotational velocity (radians per code time unit)
+     *        applied to each camera position about its `look_at` point,
+     *        using `up` as the rotation axis. Combined freely with
+     *        `v_drift`. Zero leaves the camera position unrotated.
      */
     void init(const std::string&              title,
               const std::string&              actions_file,
               const std::vector<std::string>& fields,
               timestep_t                      interval,
               simtime_t                       interval_time,
-              bool                            vector_aliases);
+              bool                            vector_aliases,
+              real_t                          v_drift,
+              real_t                          v_rot);
 
     /**
      * @brief Whether the writer should fire on the current cycle.

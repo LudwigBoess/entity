@@ -186,6 +186,28 @@ namespace ntt {
                             "ascent",
                             "vector_aliases",
                             true));
+    // Shift applied at render time to the x-component of every
+    // `camera/position` and `camera/look_at` in the actions file:
+    // dx = v_drift * t. Lets the camera ride along with a moving
+    // window so the rendered region tracks a feature drifting through
+    // the simulation domain (e.g. a shock front).
+    set("output.ascent.v_drift",
+        toml::find_or<real_t>(toml_data,
+                              "output",
+                              "ascent",
+                              "v_drift",
+                              ZERO));
+    // Rotational velocity (radians per code time unit) around the
+    // camera's `look_at` point, with the camera's `up` vector as the
+    // rotation axis. The rotation angle theta = v_rot * t is applied
+    // before any v_drift translation, which keeps the camera orbiting
+    // the (drifted) focus point regardless of v_drift.
+    set("output.ascent.v_rot",
+        toml::find_or<real_t>(toml_data,
+                              "output",
+                              "ascent",
+                              "v_rot",
+                              ZERO));
     {
       // Per-axis stride applied when extracting fields for Ascent. A factor
       // > 1 cuts the published mesh and rendered work by that factor in
