@@ -104,3 +104,19 @@ else()
 endif()
 
 set_property(CACHE default_gpu_aware_mpi PROPERTY TYPE BOOL)
+
+# ---------------------------- Pattern A defaults --------------------------- #
+if(DEFINED ENV{Entity_ENABLE_PATTERN_A})
+  set(default_pattern_a
+      $ENV{Entity_ENABLE_PATTERN_A}
+      CACHE INTERNAL "Default flag for Pattern A tile-blocked kernels")
+else()
+  set(default_pattern_a
+      OFF
+      CACHE INTERNAL "Default flag for Pattern A tile-blocked kernels")
+endif()
+set_property(CACHE default_pattern_a PROPERTY TYPE BOOL)
+
+set(default_pattern_a_tile_size
+    4
+    CACHE INTERNAL "Default tile edge length in cells for Pattern A")

@@ -25,6 +25,7 @@
 #include "traits/metric.h"
 #include "utils/error.h"
 #include "utils/formatting.h"
+#include "utils/sorting.h"
 
 #include "framework/containers/species.h"
 #include "framework/domain/grid.h"
@@ -83,6 +84,14 @@ namespace ntt {
     npart_t m_npart { 0 };
     npart_t m_counter { 0 };
     bool    m_is_sorted { false };
+
+    // Pattern A: tile metadata produced by SortSpatially and consumed by
+    // the tiled deposit / pusher kernels. Lazily allocated on first sort.
+    // The sort backend itself (oneDPL on SYCL, Thrust on CUDA, std::sort
+    // on Host, Kokkos::BinSort otherwise) is selected at compile time
+    // based on the Kokkos device and the vendor libraries detected by
+    // CMake.
+    TileLayout<D> m_tile_layout {};
 
 #if !defined(MPI_ENABLED)
     const uint8_t m_ntags { 2u };
@@ -276,8 +285,34 @@ namespace ntt {
     /**
      * @brief Sort particles spatially by their cell indices
      * @param grid The grid object to get the cell information for sorting
+     * @note In Pattern A mode (compile-time `pattern_a=ON`), also populates
+     *       `m_tile_layout` with tile-offset and per-tile permutation
+     *       metadata that the tiled deposit/pusher kernels consume.
      */
     void SortSpatially(const Grid<D>&);
+
+#if defined(PATTERN_A)
+  private:
+    /**
+     * @brief Apply a particle-index permutation to every SoA member array.
+     *        After return, particle p's data lives at SoA index p, where
+     *        the new ordering is sorted by `m_tile_layout`.
+     */
+    void apply_permutation_to_soa(const prtl_perm_t& perm);
+
+  public:
+#endif
+
+    /**
+     * @brief Read-only access to the tile layout produced by the most
+     *        recent SortSpatially call. Returns a default-constructed
+     *        layout (`ntiles_total == 0`) when the species has not yet
+     *        been sorted.
+     */
+    [[nodiscard]]
+    auto tile_layout() const -> const TileLayout<D>& {
+      return m_tile_layout;
+    }
 
     /**
      * @brief Copy particle data from device to host.

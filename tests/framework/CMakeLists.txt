@@ -44,6 +44,12 @@ else()
   gen_test(particles_sort false)
 endif()
 
+# Pattern A X-3: per-backend sort_by_key permutation test (only built when
+# the compile-time pattern_a toggle is on).
+if(${pattern_a})
+  gen_test(sort_by_key false)
+endif()
+
 gen_test(fields false)
 gen_test(grid_mesh false)
 if(${DEBUG})

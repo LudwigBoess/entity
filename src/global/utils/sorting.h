@@ -5,6 +5,7 @@
  *   - sort::BinBool<>
  *   - sort::BinTag<>
  *   - sort::PositionToTileIndex<>
+ *   - sort::backend tag types (compile-time tag dispatch for sort_by_key)
  * @namespaces:
  *   - sort::
  * @note BinBool sorts by boolean values "true" then "false"
@@ -62,9 +63,27 @@ namespace sort {
     const int m_max_bins;
   };
 
-  template <Dimension D, bool Count>
+  /**
+   * @brief Bin a particle into a tile of edge length `tile_size` cells.
+   * @tparam D     Dimension.
+   * @tparam Count If true, atomic-increment `num_ppt[tile]` for each live
+   *               particle (used to populate per-tile counts in one pass).
+   * @tparam UsePrev If true, the bin key uses `min(i_curr, i_prev)` instead
+   *                 of `i_curr` alone. This guarantees that a particle whose
+   *                 Esirkepov stencil straddles a tile boundary (because it
+   *                 crossed the boundary during the pusher) lands in the
+   *                 lower-indexed of the two tiles. Combined with a halo of
+   *                 `O+1` cells in the deposit's per-tile scratch, this
+   *                 keeps every particle's stencil inside its assigned
+   *                 tile's interior+halo region. See plan §S2.4.
+   *
+   * Dead particles get the sentinel `total_tiles + 1u` so they sort to the
+   * end (or get skipped, depending on the consumer).
+   */
+  template <Dimension D, bool Count, bool UsePrev = false>
   struct PositionToTileIndex {
     const array_t<int*>   i1, i2, i3;
+    const array_t<int*>   i1_prev, i2_prev, i3_prev;
     const array_t<short*> tag;
     array_t<ncells_t*>    tile_indices;
     ncells_t              tile_size;
@@ -73,21 +92,27 @@ namespace sort {
     ncells_t ntx2 { 0u }, ntx3 { 0u };
     ncells_t total_tiles { 0u };
 
-    PositionToTileIndex(const array_t<int*>&         i1,
-                        const array_t<int*>&         i2,
-                        const array_t<int*>&         i3,
-                        const array_t<short*>&       tag,
-                        array_t<ncells_t*>&          tile_indices,
+    PositionToTileIndex(const array_t<int*>&         i1_,
+                        const array_t<int*>&         i2_,
+                        const array_t<int*>&         i3_,
+                        const array_t<short*>&       tag_,
+                        array_t<ncells_t*>&          tile_indices_,
                         const std::vector<ncells_t>& ncells,
-                        ncells_t                     tile_size = 1u,
-                        const array_t<npart_t*>& num_ppt = { "num_ppt", 0u })
-      : i1 { i1 }
-      , i2 { i2 }
-      , i3 { i3 }
-      , tag { tag }
-      , tile_indices { tile_indices }
-      , tile_size { tile_size }
-      , num_ppt { num_ppt }
+                        ncells_t                     tile_size_ = 1u,
+                        const array_t<npart_t*>& num_ppt_ = { "num_ppt", 0u },
+                        const array_t<int*>& i1_prev_ = {},
+                        const array_t<int*>& i2_prev_ = {},
+                        const array_t<int*>& i3_prev_ = {})
+      : i1 { i1_ }
+      , i2 { i2_ }
+      , i3 { i3_ }
+      , i1_prev { i1_prev_ }
+      , i2_prev { i2_prev_ }
+      , i3_prev { i3_prev_ }
+      , tag { tag_ }
+      , tile_indices { tile_indices_ }
+      , tile_size { tile_size_ }
+      , num_ppt { num_ppt_ }
       , ntx2 { 1u }
       , ntx3 { 1u }
       , total_tiles { 1u } {
@@ -114,22 +139,63 @@ namespace sort {
                        "num_ppt must have extent equal to total tiles",
                        HERE);
       }
+      if constexpr (UsePrev) {
+        raise::ErrorIf(
+          i1_prev.extent(0) == 0u,
+          "PositionToTileIndex<UsePrev=true> requires i1_prev to be set",
+          HERE);
+        if constexpr ((D == Dim::_2D) or (D == Dim::_3D)) {
+          raise::ErrorIf(
+            i2_prev.extent(0) == 0u,
+            "PositionToTileIndex<UsePrev=true> requires i2_prev to be set",
+            HERE);
+        }
+        if constexpr (D == Dim::_3D) {
+          raise::ErrorIf(
+            i3_prev.extent(0) == 0u,
+            "PositionToTileIndex<UsePrev=true> requires i3_prev to be set",
+            HERE);
+        }
+      }
     }
 
     Inline auto operator()(prtldx_t p) const {
       if (tag(p) != ntt::ParticleTag::alive) {
         tile_indices(p) = total_tiles + 1u;
       } else {
+        // bin key per-axis: use min(i, i_prev) when UsePrev so that a
+        // particle straddling a boundary lands in the lower tile.
+        const auto key1 = [&]() -> int {
+          if constexpr (UsePrev) {
+            return (i1(p) < i1_prev(p)) ? i1(p) : i1_prev(p);
+          } else {
+            return i1(p);
+          }
+        }();
+        const auto key2 = [&]() -> int {
+          if constexpr (UsePrev) {
+            return (i2(p) < i2_prev(p)) ? i2(p) : i2_prev(p);
+          } else {
+            return i2(p);
+          }
+        }();
+        const auto key3 = [&]() -> int {
+          if constexpr (UsePrev) {
+            return (i3(p) < i3_prev(p)) ? i3(p) : i3_prev(p);
+          } else {
+            return i3(p);
+          }
+        }();
         if constexpr (D == Dim::_1D) {
-          tile_indices(p) = static_cast<ncells_t>(i1(p) / tile_size);
+          tile_indices(p) = static_cast<ncells_t>(key1 / tile_size);
         } else if constexpr (D == Dim::_2D) {
-          tile_indices(p) = static_cast<ncells_t>(i1(p) / tile_size) * ntx2 +
-                            static_cast<ncells_t>(i2(p) / tile_size);
+          tile_indices(p) = static_cast<ncells_t>(key1 / tile_size) * ntx2 +
+                            static_cast<ncells_t>(key2 / tile_size);
         } else if constexpr (D == Dim::_3D) {
-          tile_indices(p) = (static_cast<ncells_t>(i1(p) / tile_size) * ntx2 +
-                             static_cast<ncells_t>(i2(p) / tile_size)) *
+          tile_indices(p) = (static_cast<ncells_t>(key1 / tile_size) * ntx2 +
+                             static_cast<ncells_t>(key2 / tile_size)) *
                               ntx3 +
-                            static_cast<ncells_t>(i3(p) / tile_size);
+                            static_cast<ncells_t>(key3 / tile_size);
         } else {
           raise::KernelError(HERE, "Wrong D in SortSpatially");
         }
@@ -139,6 +205,20 @@ namespace sort {
       }
     }
   };
+
+  // -------------------- Backend dispatch for sort_by_key ------------------- //
+  // Compile-time tags for tag-dispatch into backend-specific
+  // sort_by_key implementations. Selection is fully compile-time: the
+  // backend that resolves depends on the active Kokkos device and the
+  // availability of the corresponding vendor library.
+  namespace backend {
+    struct OneDPL {};
+    struct Thrust {};
+    struct Rocthrust {};
+    struct StdSort {};
+    // Always-available legacy fallback using Kokkos::BinSort.
+    struct BinSort {};
+  } // namespace backend
 
 } // namespace sort
 

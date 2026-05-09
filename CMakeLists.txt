@@ -61,6 +61,27 @@ set(gpu_aware_mpi
   ${default_gpu_aware_mpi}
   CACHE BOOL "Enable GPU-aware MPI")
 
+# ----------------------------- Pattern A ---------------------------------- #
+# Tile-blocked deposit + pusher (compile-time toggle, per design D-5).
+# When ON, SortSpatially also produces TileLayout metadata consumed by the
+# tiled kernels; sort backend (oneDPL/Thrust/BinSort) is selected at run
+# time via Particles::set_sort_backend.
+set(pattern_a
+  ${default_pattern_a}
+  CACHE BOOL "Enable Pattern A tile-blocked deposit/pusher kernels")
+set(pattern_a_tile_size
+  ${default_pattern_a_tile_size}
+  CACHE STRING "Pattern A tile edge length in cells (>=1)")
+# Optional backend libraries for the runtime-selectable sort path.
+# These default to "auto" (enable when the library is available for the
+# selected Kokkos device).
+set(pattern_a_onedpl
+  "auto"
+  CACHE STRING "Use oneDPL for sort_by_key on SYCL (auto/ON/OFF)")
+set(pattern_a_thrust
+  "auto"
+  CACHE STRING "Use Thrust for sort_by_key on CUDA (auto/ON/OFF)")
+
 # -------------------------- Compilation settings -------------------------- #
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -137,6 +158,55 @@ if(("${Kokkos_DEVICES}" MATCHES "CUDA")
   set(DEVICE_ENABLED ON)
 else()
   set(DEVICE_ENABLED OFF)
+endif()
+
+# ------------------------------- Pattern A wiring ------------------------- #
+if(${pattern_a})
+  if(NOT pattern_a_tile_size MATCHES "^[0-9]+$")
+    message(FATAL_ERROR
+      "${Red}pattern_a_tile_size must be a positive integer, got "
+      "'${pattern_a_tile_size}'${ColorReset}")
+  endif()
+  if(pattern_a_tile_size LESS 1)
+    message(FATAL_ERROR
+      "${Red}pattern_a_tile_size must be >= 1${ColorReset}")
+  endif()
+  add_compile_options("-D PATTERN_A")
+  add_compile_options("-D PATTERN_A_TILE_SIZE=${pattern_a_tile_size}")
+
+  # Try to enable oneDPL when SYCL is the active Kokkos device.
+  if("${Kokkos_DEVICES}" MATCHES "SYCL")
+    if(NOT pattern_a_onedpl STREQUAL "OFF")
+      find_package(oneDPL QUIET)
+      if(oneDPL_FOUND)
+        message(STATUS "Pattern A: oneDPL found, enabling SYCL sort_by_key")
+        add_compile_options("-D ONEDPL_ENABLED")
+        set(DEPENDENCIES ${DEPENDENCIES} oneDPL)
+      elseif(pattern_a_onedpl STREQUAL "ON")
+        message(FATAL_ERROR
+          "${Red}pattern_a_onedpl=ON requested but oneDPL not found.${ColorReset}")
+      else()
+        message(STATUS "Pattern A: oneDPL not found; using BinSort fallback "
+                       "for SYCL sort_by_key")
+      endif()
+    endif()
+  endif()
+
+  # Try to enable Thrust when CUDA is the active Kokkos device. Thrust
+  # ships with the CUDA toolkit and is header-only, so usually no
+  # find_package is required.
+  if("${Kokkos_DEVICES}" MATCHES "CUDA")
+    if(NOT pattern_a_thrust STREQUAL "OFF")
+      find_package(Thrust QUIET)
+      if(Thrust_FOUND OR pattern_a_thrust STREQUAL "ON")
+        message(STATUS "Pattern A: Thrust enabled for CUDA sort_by_key")
+        add_compile_options("-D THRUST_ENABLED")
+      else()
+        message(STATUS "Pattern A: Thrust not configured; using BinSort "
+                       "fallback for CUDA sort_by_key")
+      endif()
+    endif()
+  endif()
 endif()
 
 # MPI
