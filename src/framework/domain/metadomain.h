@@ -99,7 +99,7 @@ namespace ntt {
     void CommunicateFields(Domain<S, M>&, CommTags) const;
     void SynchronizeFields(Domain<S, M>&,
                            CommTags,
-                           const range_tuple_t& = { 0, 0 }) const;
+                           const cell_range_t& = { 0, 0 }) const;
 #if defined(MPI_ENABLED) && defined(OUTPUT_ENABLED)
     void CommunicateVectorPotential(unsigned short);
 #endif
@@ -137,6 +137,23 @@ namespace ntt {
     void ShiftByCells(int, in = in::x1)
       requires(CartesianMetricClass<M>);
 
+    /**
+     * @brief Rebalance the load (active particles) across MPI domains by
+     * shifting interior domain boundaries between neighbors.
+     * @param dim_mask bitmask: bit d (0,1,2) set => balance along dim x1/x2/x3
+     * @param tolerance skip if (max-min)/mean of the per-slice load is below
+     * this fraction
+     * @param max_shift_cells per-event cap for any single boundary movement,
+     * additionally clamped to N_GHOSTS so the field strip we need is already
+     * present in the local ghost zone
+     * @note Only neighbor communication is used (CommunicateFields ghosts +
+     * CommunicateParticles).
+     */
+    void Rebalance(unsigned int    dim_mask,
+                   real_t          tolerance,
+                   ncells_t        max_shift_cells)
+      requires(MetricClass<M>);
+
     /* output-related ------------------------------------------------------- */
 #if defined(OUTPUT_ENABLED)
     void InitWriter(adios2::ADIOS*, const SimulationParams&);
@@ -147,7 +164,7 @@ namespace ntt {
                simtime_t,
                const std::function<void(const std::string&,
                                         ndfield_t<M::Dim, 6>&,
-                                        index_t,
+                                        uint32_t,
                                         timestep_t,
                                         simtime_t,
                                         const Domain<S, M>&)>& = nullptr) -> bool;

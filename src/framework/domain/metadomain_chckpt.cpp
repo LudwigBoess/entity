@@ -17,6 +17,7 @@
   #include <mpi.h>
 #endif
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <string>
@@ -117,8 +118,19 @@ namespace ntt {
       }
       params.saveTOML(g_checkpoint_writer.written().back().second, current_time);
 
+      // Recompute the local with-ghosts shape/offset every step so the
+      // ADIOS variable selection tracks any rebalance that has happened
+      // since InitCheckpointWriter.
+      std::vector<ncells_t> loc_off_with_ghosts;
+      for (auto d { 0u }; d < M::Dim; ++d) {
+        loc_off_with_ghosts.push_back(
+          local_domain->offset_ncells()[d] +
+          2 * N_GHOSTS * local_domain->offset_ndomains()[d]);
+      }
       local_domain->fields.CheckpointWrite(g_checkpoint_writer.io(),
-                                           g_checkpoint_writer.writer());
+                                           g_checkpoint_writer.writer(),
+                                           local_domain->mesh.n_all(),
+                                           loc_off_with_ghosts);
 #if !defined(MPI_ENABLED)
       const std::size_t dom_tot = 1, dom_offset = 0;
 #else
@@ -178,21 +190,20 @@ namespace ntt {
       for (const auto& n : ncells_at_pos) {
         total += n;
       }
-      raise::ErrorIf(
-        total != g_mesh.n_active()[d],
-        fmt::format(
-          "total cells in dim %d changed between checkpoint (%lu) and current (%lu); "
-          "changing total domain size is not supported",
-          d + 1,
-          total,
-          g_mesh.n_active()[d]),
-        HERE);
+      raise::ErrorIf(total != g_mesh.n_active()[d],
+                     fmt::format("total cells in dim %d changed between "
+                                 "checkpoint (%lu) and current (%lu); "
+                                 "changing total domain size is not supported",
+                                 d + 1,
+                                 total,
+                                 g_mesh.n_active()[d]),
+                     HERE);
 
       ncells_t              running { 0 };
       std::vector<ncells_t> offset_at_pos(g_ndomains_per_dim[d], 0);
       for (unsigned int nd { 0 }; nd < g_ndomains_per_dim[d]; ++nd) {
-        offset_at_pos[nd] = running;
-        running += ncells_at_pos[nd];
+        offset_at_pos[nd]  = running;
+        running           += ncells_at_pos[nd];
       }
       for (unsigned int idx { 0 }; idx < g_ndomains; ++idx) {
         offset_ncells_per_dom[idx][d] = offset_at_pos[g_domain_offsets[idx][d]];
@@ -268,12 +279,12 @@ namespace ntt {
 
     // Phase 1: read all subdomain metadata to detect size changes
     std::vector<std::vector<ncells_t>> saved_ncells(g_ndomains,
-                                                     std::vector<ncells_t>(M::Dim));
+                                                    std::vector<ncells_t>(M::Dim));
     std::vector<boundaries_t<real_t>>  saved_extents(g_ndomains);
     boundaries_t<real_t>               global_extent;
     for (auto d { 0u }; d < M::Dim; ++d) {
       global_extent.emplace_back(std::numeric_limits<real_t>::max(),
-                                  std::numeric_limits<real_t>::lowest());
+                                 std::numeric_limits<real_t>::lowest());
     }
 
     bool needs_reconstruction = false;
