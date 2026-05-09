@@ -105,18 +105,19 @@ endif()
 
 set_property(CACHE default_gpu_aware_mpi PROPERTY TYPE BOOL)
 
-# ---------------------------- Pattern A defaults --------------------------- #
-if(DEFINED ENV{Entity_ENABLE_PATTERN_A})
-  set(default_pattern_a
-      $ENV{Entity_ENABLE_PATTERN_A}
-      CACHE INTERNAL "Default flag for Pattern A tile-blocked kernels")
+# --------------------------- team_policy defaults -------------------------- #
+# (Pattern A — tile-blocked deposit/pusher with TeamPolicy + scratch.)
+if(DEFINED ENV{Entity_ENABLE_TEAM_POLICY})
+  set(default_team_policy
+      $ENV{Entity_ENABLE_TEAM_POLICY}
+      CACHE INTERNAL "Default flag for team_policy tile-blocked kernels")
 else()
-  set(default_pattern_a
+  set(default_team_policy
       OFF
-      CACHE INTERNAL "Default flag for Pattern A tile-blocked kernels")
+      CACHE INTERNAL "Default flag for team_policy tile-blocked kernels")
 endif()
-set_property(CACHE default_pattern_a PROPERTY TYPE BOOL)
+set_property(CACHE default_team_policy PROPERTY TYPE BOOL)
 
-set(default_pattern_a_tile_size
+set(default_team_policy_tile_size
     4
-    CACHE INTERNAL "Default tile edge length in cells for Pattern A")
+    CACHE INTERNAL "Default tile edge length in cells for team_policy")

@@ -61,24 +61,28 @@ set(gpu_aware_mpi
   ${default_gpu_aware_mpi}
   CACHE BOOL "Enable GPU-aware MPI")
 
-# ----------------------------- Pattern A ---------------------------------- #
-# Tile-blocked deposit + pusher (compile-time toggle, per design D-5).
-# When ON, SortSpatially also produces TileLayout metadata consumed by the
-# tiled kernels; sort backend (oneDPL/Thrust/BinSort) is selected at run
-# time via Particles::set_sort_backend.
-set(pattern_a
-  ${default_pattern_a}
-  CACHE BOOL "Enable Pattern A tile-blocked deposit/pusher kernels")
-set(pattern_a_tile_size
-  ${default_pattern_a_tile_size}
-  CACHE STRING "Pattern A tile edge length in cells (>=1)")
-# Optional backend libraries for the runtime-selectable sort path.
-# These default to "auto" (enable when the library is available for the
-# selected Kokkos device).
-set(pattern_a_onedpl
+# ----------------------------- team_policy -------------------------------- #
+# Pattern A: tile-blocked deposit + pusher running under Kokkos::TeamPolicy
+# with per-team scratch. Compile-time toggle (per design D-5). When ON,
+# SortSpatially also produces TileLayout metadata consumed by the tiled
+# kernels; the sort_by_key backend (oneDPL on SYCL, Thrust on CUDA,
+# Kokkos::BinSort otherwise) is selected at compile time from the active
+# Kokkos device.
+set(team_policy
+  ${default_team_policy}
+  CACHE BOOL "Enable team_policy tile-blocked deposit/pusher kernels")
+set(team_policy_tile_size
+  ${default_team_policy_tile_size}
+  CACHE STRING "team_policy tile edge length in cells")
+set(team_policy_tile_sizes
+  "4;8;12"
+  CACHE STRING "team_policy tile-size choices")
+# Optional vendor sort libraries. "auto" enables when the library is
+# available for the selected Kokkos device.
+set(team_policy_onedpl
   "auto"
   CACHE STRING "Use oneDPL for sort_by_key on SYCL (auto/ON/OFF)")
-set(pattern_a_thrust
+set(team_policy_thrust
   "auto"
   CACHE STRING "Use Thrust for sort_by_key on CUDA (auto/ON/OFF)")
 
@@ -160,33 +164,30 @@ else()
   set(DEVICE_ENABLED OFF)
 endif()
 
-# ------------------------------- Pattern A wiring ------------------------- #
-if(${pattern_a})
-  if(NOT pattern_a_tile_size MATCHES "^[0-9]+$")
+# ------------------------------ team_policy wiring ------------------------ #
+if(${team_policy})
+  list(FIND team_policy_tile_sizes "${team_policy_tile_size}" _tps_idx)
+  if(_tps_idx EQUAL -1)
     message(FATAL_ERROR
-      "${Red}pattern_a_tile_size must be a positive integer, got "
-      "'${pattern_a_tile_size}'${ColorReset}")
+      "${Red}team_policy_tile_size must be one of ${team_policy_tile_sizes}, "
+      "got '${team_policy_tile_size}'${ColorReset}")
   endif()
-  if(pattern_a_tile_size LESS 1)
-    message(FATAL_ERROR
-      "${Red}pattern_a_tile_size must be >= 1${ColorReset}")
-  endif()
-  add_compile_options("-D PATTERN_A")
-  add_compile_options("-D PATTERN_A_TILE_SIZE=${pattern_a_tile_size}")
+  add_compile_options("-D TEAM_POLICY")
+  add_compile_options("-D TEAM_POLICY_TILE_SIZE=${team_policy_tile_size}")
 
   # Try to enable oneDPL when SYCL is the active Kokkos device.
   if("${Kokkos_DEVICES}" MATCHES "SYCL")
-    if(NOT pattern_a_onedpl STREQUAL "OFF")
+    if(NOT team_policy_onedpl STREQUAL "OFF")
       find_package(oneDPL QUIET)
       if(oneDPL_FOUND)
-        message(STATUS "Pattern A: oneDPL found, enabling SYCL sort_by_key")
+        message(STATUS "team_policy: oneDPL found, enabling SYCL sort_by_key")
         add_compile_options("-D ONEDPL_ENABLED")
         set(DEPENDENCIES ${DEPENDENCIES} oneDPL)
-      elseif(pattern_a_onedpl STREQUAL "ON")
+      elseif(team_policy_onedpl STREQUAL "ON")
         message(FATAL_ERROR
-          "${Red}pattern_a_onedpl=ON requested but oneDPL not found.${ColorReset}")
+          "${Red}team_policy_onedpl=ON requested but oneDPL not found.${ColorReset}")
       else()
-        message(STATUS "Pattern A: oneDPL not found; using BinSort fallback "
+        message(STATUS "team_policy: oneDPL not found; using BinSort fallback "
                        "for SYCL sort_by_key")
       endif()
     endif()
@@ -196,13 +197,13 @@ if(${pattern_a})
   # ships with the CUDA toolkit and is header-only, so usually no
   # find_package is required.
   if("${Kokkos_DEVICES}" MATCHES "CUDA")
-    if(NOT pattern_a_thrust STREQUAL "OFF")
+    if(NOT team_policy_thrust STREQUAL "OFF")
       find_package(Thrust QUIET)
-      if(Thrust_FOUND OR pattern_a_thrust STREQUAL "ON")
-        message(STATUS "Pattern A: Thrust enabled for CUDA sort_by_key")
+      if(Thrust_FOUND OR team_policy_thrust STREQUAL "ON")
+        message(STATUS "team_policy: Thrust enabled for CUDA sort_by_key")
         add_compile_options("-D THRUST_ENABLED")
       else()
-        message(STATUS "Pattern A: Thrust not configured; using BinSort "
+        message(STATUS "team_policy: Thrust not configured; using BinSort "
                        "fallback for CUDA sort_by_key")
       endif()
     endif()

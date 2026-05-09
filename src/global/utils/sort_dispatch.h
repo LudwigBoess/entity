@@ -1,12 +1,12 @@
 /**
  * @file utils/sort_dispatch.h
- * @brief Backend-dispatched sort_by_key for Pattern A SortSpatially.
+ * @brief Backend-dispatched sort_by_key for team_policy SortSpatially.
  * @implements
  *   - sort_helpers::sort_by_key_dispatch -> void  (BinSort, OneDPL, Thrust, StdSort)
  * @namespaces:
  *   - ntt::sort_helpers::
  * @macros:
- *   - PATTERN_A
+ *   - TEAM_POLICY
  *   - SYCL_ENABLED, ONEDPL_ENABLED  (oneDPL overload)
  *   - CUDA_ENABLED, THRUST_ENABLED  (Thrust overload)
  *
@@ -21,8 +21,8 @@
 #ifndef GLOBAL_UTILS_SORT_DISPATCH_H
 #define GLOBAL_UTILS_SORT_DISPATCH_H
 
-#if !defined(PATTERN_A)
-  #error "sort_dispatch.h is only meaningful when PATTERN_A is defined"
+#if !defined(TEAM_POLICY)
+  #error "sort_dispatch.h is only meaningful when TEAM_POLICY is defined"
 #endif
 
 #include "global.h"

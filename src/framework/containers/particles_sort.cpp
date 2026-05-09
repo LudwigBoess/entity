@@ -8,7 +8,8 @@
 #include "framework/containers/particles.h"
 #include "framework/domain/grid.h"
 
-#if defined(PATTERN_A)
+#if defined(TEAM_POLICY)
+  #include "utils/log.h"
   #include "utils/sort_dispatch.h"
 #endif
 
@@ -193,8 +194,31 @@ namespace ntt {
 
   template <Dimension D, Coord::type C>
   void Particles<D, C>::SortSpatially(const Grid<D>& grid) {
-#if defined(PATTERN_A)
-    // ---------------------- Pattern A: tile-based sort -------------------- //
+#if defined(TEAM_POLICY)
+    // ---------------------- team_policy: tile-based sort ------------------ //
+    // One-shot announcement (rank 0, once per process) of the active
+    // sort backend — diagnostic for verifying that the compile-time
+    // selection actually picked what was expected. Once-flag means this
+    // costs essentially nothing on subsequent sort calls.
+    static constexpr const char* k_sort_backend_name =
+  #if defined(SYCL_ENABLED) && defined(ONEDPL_ENABLED)
+      "OneDPL (SYCL)";
+  #elif defined(CUDA_ENABLED) && defined(THRUST_ENABLED)
+      "Thrust (CUDA)";
+  #elif !defined(DEVICE_ENABLED)
+      "StdSort (host)";
+  #else
+      "Kokkos::BinSort (fallback)";
+  #endif
+    info::Print(std::string("[team_policy] sort backend: ") +
+                  k_sort_backend_name +
+                  " (tile_size=" +
+                  std::to_string(static_cast<int>(TEAM_POLICY_TILE_SIZE)) + ")",
+                /*colored=*/false,
+                /*stdout=*/true,
+                /*once=*/true,
+                /*info=*/true);
+
     const auto npart_local = npart();
     if (npart_local == 0u) {
       m_tile_layout = TileLayout<D> {};
@@ -203,8 +227,8 @@ namespace ntt {
     }
 
     constexpr unsigned short T = static_cast<unsigned short>(
-      PATTERN_A_TILE_SIZE);
-    static_assert(T > 0u, "PATTERN_A_TILE_SIZE must be > 0");
+      TEAM_POLICY_TILE_SIZE);
+    static_assert(T > 0u, "TEAM_POLICY_TILE_SIZE must be > 0");
 
     // 1. Compute per-axis tile counts and total_tiles.
     const auto ncells_active = grid.n_active();
@@ -318,7 +342,7 @@ namespace ntt {
     m_tile_layout.tile_offsets       = tile_offsets;
     m_tile_layout.tile_perm          = perm;
     m_is_sorted                      = true;
-#else  // !PATTERN_A — legacy in-place BinSort by global cell index
+#else  // !TEAM_POLICY — legacy in-place BinSort by global cell index
     const auto total_cells = grid.num_active();
 
     array_t<ncells_t*> cell_indices { "cell_indices", npart() };
@@ -373,10 +397,10 @@ namespace ntt {
       sorter.sort(Kokkos::subview(pld_i, slice, pldi));
     }
     m_is_sorted = true;
-#endif // PATTERN_A
+#endif // TEAM_POLICY
   }
 
-#if defined(PATTERN_A)
+#if defined(TEAM_POLICY)
   template <Dimension D, Coord::type C>
   void Particles<D, C>::apply_permutation_to_soa(const prtl_perm_t& perm) {
     const auto n = npart();
@@ -538,14 +562,14 @@ namespace ntt {
       Kokkos::deep_copy(Kokkos::subview(pld_i, slice, Kokkos::ALL), buf_pld_i);
     }
   }
-#endif // PATTERN_A
+#endif // TEAM_POLICY
 
-#if defined(PATTERN_A)
-  #define PATTERN_A_INSTANTIATE_APPLY(D, C)                                    \
+#if defined(TEAM_POLICY)
+  #define TEAM_POLICY_INSTANTIATE_APPLY(D, C)                                    \
     template void Particles<D, C>::apply_permutation_to_soa(                   \
       const prtl_perm_t&);
 #else
-  #define PATTERN_A_INSTANTIATE_APPLY(D, C)
+  #define TEAM_POLICY_INSTANTIATE_APPLY(D, C)
 #endif
 
 #define PARTICLES_SORT(D, C)                                                   \
@@ -553,7 +577,7 @@ namespace ntt {
     -> std::pair<std::vector<npart_t>, array_t<npart_t*>>;                     \
   template void Particles<D, C>::RemoveDead();                                 \
   template void Particles<D, C>::SortSpatially(const Grid<D>&);                \
-  PATTERN_A_INSTANTIATE_APPLY(D, C)
+  TEAM_POLICY_INSTANTIATE_APPLY(D, C)
 
   PARTICLES_SORT(Dim::_1D, Coord::Cartesian)
   PARTICLES_SORT(Dim::_2D, Coord::Cartesian)
@@ -563,6 +587,6 @@ namespace ntt {
   PARTICLES_SORT(Dim::_3D, Coord::Spherical)
   PARTICLES_SORT(Dim::_3D, Coord::Qspherical)
 #undef PARTICLES_SORT
-#undef PATTERN_A_INSTANTIATE_APPLY
+#undef TEAM_POLICY_INSTANTIATE_APPLY
 
 } // namespace ntt

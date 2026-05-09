@@ -85,12 +85,12 @@ namespace ntt {
     npart_t m_counter { 0 };
     bool    m_is_sorted { false };
 
-    // Pattern A: tile metadata produced by SortSpatially and consumed by
-    // the tiled deposit / pusher kernels. Lazily allocated on first sort.
-    // The sort backend itself (oneDPL on SYCL, Thrust on CUDA, std::sort
-    // on Host, Kokkos::BinSort otherwise) is selected at compile time
-    // based on the Kokkos device and the vendor libraries detected by
-    // CMake.
+    // team_policy (Pattern A): tile metadata produced by SortSpatially
+    // and consumed by the tiled deposit / pusher kernels. Lazily
+    // allocated on first sort. The sort backend itself (oneDPL on SYCL,
+    // Thrust on CUDA, std::sort on Host, Kokkos::BinSort otherwise) is
+    // selected at compile time based on the Kokkos device and the
+    // vendor libraries detected by CMake.
     TileLayout<D> m_tile_layout {};
 
 #if !defined(MPI_ENABLED)
@@ -285,13 +285,14 @@ namespace ntt {
     /**
      * @brief Sort particles spatially by their cell indices
      * @param grid The grid object to get the cell information for sorting
-     * @note In Pattern A mode (compile-time `pattern_a=ON`), also populates
-     *       `m_tile_layout` with tile-offset and per-tile permutation
-     *       metadata that the tiled deposit/pusher kernels consume.
+     * @note In team_policy mode (compile-time `team_policy=ON`), also
+     *       populates `m_tile_layout` with tile-offset and per-tile
+     *       permutation metadata that the tiled deposit/pusher kernels
+     *       consume.
      */
     void SortSpatially(const Grid<D>&);
 
-#if defined(PATTERN_A)
+#if defined(TEAM_POLICY)
   private:
     /**
      * @brief Apply a particle-index permutation to every SoA member array.

@@ -44,9 +44,9 @@ else()
   gen_test(particles_sort false)
 endif()
 
-# Pattern A X-3: per-backend sort_by_key permutation test (only built when
-# the compile-time pattern_a toggle is on).
-if(${pattern_a})
+# team_policy X-3: per-backend sort_by_key permutation test (only built
+# when the compile-time team_policy toggle is on).
+if(${team_policy})
   gen_test(sort_by_key false)
 endif()
 
