@@ -507,8 +507,11 @@ namespace out {
       const std::size_t s3 = m_downsample[2];
       Kokkos::parallel_for(
         "AscentExtract3D",
-        CreateRangePolicy<Dim::_3D>({ 0, 0, 0 }, { n1, n2, n3 }),
-        Lambda(index_t i1, index_t i2, index_t i3) {
+        CreateRangePolicy<Dim::_3D>({ 0, 0, 0 },
+                                    { static_cast<ncells_t>(n1),
+                                      static_cast<ncells_t>(n2),
+                                      static_cast<ncells_t>(n3) }),
+        Lambda(cellidx_t i1, cellidx_t i2, cellidx_t i3) {
           buf(i1 + n1 * (i2 + n2 * i3)) = static_cast<double>(
             fld(f1 + i1 * s1 + gh,
                 f2 + i2 * s2 + gh,
@@ -524,8 +527,10 @@ namespace out {
       const std::size_t s2 = m_downsample[1];
       Kokkos::parallel_for(
         "AscentExtract2D",
-        CreateRangePolicy<Dim::_2D>({ 0, 0 }, { n1, n2 }),
-        Lambda(index_t i1, index_t i2) {
+        CreateRangePolicy<Dim::_2D>({ 0, 0 },
+                                    { static_cast<ncells_t>(n1),
+                                      static_cast<ncells_t>(n2) }),
+        Lambda(cellidx_t i1, cellidx_t i2) {
           buf(i1 + n1 * i2) = static_cast<double>(
             fld(f1 + i1 * s1 + gh, f2 + i2 * s2 + gh, comp));
         });
@@ -536,7 +541,7 @@ namespace out {
       Kokkos::parallel_for(
         "AscentExtract1D",
         n1,
-        Lambda(index_t i1) {
+        Lambda(cellidx_t i1) {
           buf(i1) = static_cast<double>(fld(f1 + i1 * s1 + gh, comp));
         });
     }

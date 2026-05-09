@@ -106,8 +106,8 @@ namespace out {
      * passed to `var.SetSelection()` inside `writeMesh` and `WriteField`.
      * The global shape is preserved (load balancing conserves total cells).
      */
-    void setLocalLayout(const std::vector<std::size_t>& loc_corner,
-                        const std::vector<std::size_t>& loc_shape);
+    void setLocalLayout(const std::vector<ncells_t>& loc_corner,
+                        const std::vector<ncells_t>& loc_shape);
 
     void defineFieldOutputs(const SimEngine&, const std::vector<std::string>&);
     void defineSpectraOutputs(const std::vector<spidx_t>&);

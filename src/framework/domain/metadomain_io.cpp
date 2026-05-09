@@ -569,7 +569,7 @@ namespace ntt {
           Kokkos::parallel_for(
             "GenerateMeshAscent",
             nedges,
-            Lambda(index_t i) {
+            Lambda(cellidx_t i) {
               const std::size_t idx = (i == n_dwn) ? l_size
                                                    : (first + i * s);
               const auto      i_   = static_cast<real_t>(idx);

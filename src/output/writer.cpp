@@ -66,8 +66,8 @@ namespace out {
     m_mode = mode;
   }
 
-  void Writer::setLocalLayout(const std::vector<std::size_t>& loc_corner,
-                              const std::vector<std::size_t>& loc_shape) {
+  void Writer::setLocalLayout(const std::vector<ncells_t>& loc_corner,
+                              const std::vector<ncells_t>& loc_shape) {
     raise::ErrorIf(loc_corner.size() != m_flds_l_corner.size() or
                      loc_shape.size() != m_flds_l_shape.size(),
                    "setLocalLayout dim mismatch with the original layout",

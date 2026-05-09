@@ -373,7 +373,7 @@ namespace ntt {
       Kokkos::parallel_for(
         "RebalanceShiftPrtls",
         sp.rangeActiveParticles(),
-        Lambda(index_t p) {
+        Lambda(prtlidx_t p) {
           if (tag(p) != ParticleTag::alive) {
             return;
           }
