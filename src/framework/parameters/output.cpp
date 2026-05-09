@@ -79,6 +79,20 @@ namespace ntt {
                                         "fields",
                                         "mom_smooth",
                                         defaults::output::mom_smooth);
+      
+      fields_mom_window = toml::find_or(toml_data,
+                                        "output",
+                                        "fields",
+                                        "window",
+                                        defaults::output::mom_window);
+
+      raise::ErrorIf(
+        not fields_mom_window.value() and SHAPE_ORDER < 1,
+        "`output.fields.window = false` requires the build to define "
+        "SHAPE_ORDER >= 1 (rebuild with `-D deposit=esirkepov -D "
+        "shape_order=N`), or set `output.fields.window = true` to use the "
+        "legacy box-smoothing deposition.",
+        HERE);
       fields_downsampling.emplace();
       try {
         auto field_dwn_ = toml::find<std::vector<unsigned int>>(toml_data,
@@ -191,6 +205,7 @@ namespace ntt {
       params->set("output.fields.quantities", fields_quantities.value());
       params->set("output.fields.custom", fields_custom_quantities.value());
       params->set("output.fields.mom_smooth", fields_mom_smooth.value());
+      params->set("output.fields.mom_window", fields_mom_window.value());
       params->set("output.fields.downsampling", fields_downsampling.value());
 
       params->set("output.particles.species", particles_species.value());
