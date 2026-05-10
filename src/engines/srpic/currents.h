@@ -144,22 +144,23 @@ namespace ntt {
       Kokkos::deep_copy(domain.fields.cur, ZERO);
 
 #if defined(TEAM_POLICY)
-      // Tiled path: deposit directly into `domain.fields.cur` via team
-      // scratch + global atomic_add. No scatter view needed; the tiled
-      // kernel handles atomicity itself. Enabled for all shape orders
-      // 0..11 — `SHAPE_ORDER == 0` (zigzag) is included for A/B
-      // benchmarking against the flat scatter-view kernel; its narrow
-      // stencil typically makes scratch alloc/zero/flush overhead a
-      // regression there, so flip the `#if defined(TEAM_POLICY)` to
-      // `#if defined(TEAM_POLICY) && (SHAPE_ORDER > 0)` to revert.
+      // Tiled path (Pattern A): per-tile SLM scratch + atomic_add into
+      // global J at flush. The premise — that flat scatter-view's
+      // `+=` is non-atomic on this device — is **false** on Kokkos SYCL,
+      // where ScatterView defaults to `ScatterNonDuplicated +
+      // ScatterAtomic` and each `J_acc(...) += v` is a global HBM
+      // `atomic_add`. Tiled wins by replacing those HBM atomics with
+      // SLM atomics for everything except the once-per-tile flush. The
+      // initial T_TILE=4 choice did not amortize team launch / scratch
+      // zero+flush across enough particles per tile (only ~4K with
+      // 64 ppc); T_TILE=8 (the current default) gives ~32K
+      // particles/tile and brings the deposit close to the L2-atomic
+      // RMW throughput floor.
       //
       // First-step fallback: if any contributing species has not been
-      // sorted yet (e.g. before the first SortSpatially call), the
-      // tile_layout is empty and the tiled kernel cannot run. We fall
-      // back to the flat scatter-view path for that step. Subsequent
-      // steps see populated layouts and use the tiled kernel as
-      // intended. (Stream 3 will move SortParticles before the pusher
-      // and remove the need for this fallback.)
+      // sorted yet (tile_layout still empty), fall back to the flat
+      // scatter-view path for that step. Subsequent steps see populated
+      // layouts and use the tiled kernel.
       bool any_unsorted = false;
       for (auto& species : domain.species) {
         if ((species.pusher() == ParticlePusher::NONE) or

@@ -508,19 +508,17 @@ namespace kernel {
           const int di_x1 = i1_max - i1_min;
 
           /*
-              Current update
+              Current update — fused over the union cube so the J cell
+              line stays L1-resident across the 3 component atomic_adds
+              (Candidate B in `pattern_a_implementation_progress.md`).
           */
-
-          for (int i = 0; i < di_x1; ++i) {
-            deposit_at(i1_min + i, cur::jx1, jx1[i]);
-          }
-
           for (int i = 0; i <= di_x1; ++i) {
-            deposit_at(i1_min + i, cur::jx2, QVx2 * Wx23[i]);
-          }
-
-          for (int i = 0; i <= di_x1; ++i) {
-            deposit_at(i1_min + i, cur::jx3, QVx3 * Wx23[i]);
+            const int gi = i1_min + i;
+            if (i < di_x1) {
+              deposit_at(gi, cur::jx1, jx1[i]);
+            }
+            deposit_at(gi, cur::jx2, QVx2 * Wx23[i]);
+            deposit_at(gi, cur::jx3, QVx3 * Wx23[i]);
           }
 
         } else if constexpr (D == Dim::_2D) {
@@ -609,24 +607,21 @@ namespace kernel {
           const int di_x2 = i2_max - i2_min;
 
           /*
-              Current update
+              Current update — fused over the union cube so the J cell
+              line stays L1-resident across the 3 component atomic_adds
+              (Candidate B in `pattern_a_implementation_progress.md`).
           */
-
-          for (int i = 0; i < di_x1; ++i) {
-            for (int j = 0; j <= di_x2; ++j) {
-              deposit_at(i1_min + i, i2_min + j, cur::jx1, jx1[i][j]);
-            }
-          }
-
-          for (int i = 0; i <= di_x1; ++i) {
-            for (int j = 0; j < di_x2; ++j) {
-              deposit_at(i1_min + i, i2_min + j, cur::jx2, jx2[i][j]);
-            }
-          }
-
           for (int i = 0; i <= di_x1; ++i) {
             for (int j = 0; j <= di_x2; ++j) {
-              deposit_at(i1_min + i, i2_min + j, cur::jx3, QVx3 * Wx3[i][j]);
+              const int gi = i1_min + i;
+              const int gj = i2_min + j;
+              if (i < di_x1) {
+                deposit_at(gi, gj, cur::jx1, jx1[i][j]);
+              }
+              if (j < di_x2) {
+                deposit_at(gi, gj, cur::jx2, jx2[i][j]);
+              }
+              deposit_at(gi, gj, cur::jx3, QVx3 * Wx3[i][j]);
             }
           }
 
@@ -773,41 +768,29 @@ namespace kernel {
           const int di_x3 = i3_max - i3_min;
 
           /*
-            Current update
+            Current update — fused over the union cube so the J cell
+            line stays L1-resident across the 3 component atomic_adds
+            (Candidate B in `pattern_a_implementation_progress.md`).
+            Per-cell branches on (i<di_x1), (j<di_x2), (k<di_x3) skip
+            the trailing slab where each component's stencil ends one
+            cell short of the union; they predicate cleanly on PVC
+            SIMD-32 since particles within a tile share di_x*.
           */
-
-          for (int i = 0; i < di_x1; ++i) {
-            for (int j = 0; j <= di_x2; ++j) {
-              for (int k = 0; k <= di_x3; ++k) {
-                deposit_at(i1_min + i,
-                           i2_min + j,
-                           i3_min + k,
-                           cur::jx1,
-                           jx1[i][j][k]);
-              }
-            }
-          }
-
-          for (int i = 0; i <= di_x1; ++i) {
-            for (int j = 0; j < di_x2; ++j) {
-              for (int k = 0; k <= di_x3; ++k) {
-                deposit_at(i1_min + i,
-                           i2_min + j,
-                           i3_min + k,
-                           cur::jx2,
-                           jx2[i][j][k]);
-              }
-            }
-          }
-
           for (int i = 0; i <= di_x1; ++i) {
             for (int j = 0; j <= di_x2; ++j) {
-              for (int k = 0; k < di_x3; ++k) {
-                deposit_at(i1_min + i,
-                           i2_min + j,
-                           i3_min + k,
-                           cur::jx3,
-                           jx3[i][j][k]);
+              for (int k = 0; k <= di_x3; ++k) {
+                const int gi = i1_min + i;
+                const int gj = i2_min + j;
+                const int gk = i3_min + k;
+                if (i < di_x1) {
+                  deposit_at(gi, gj, gk, cur::jx1, jx1[i][j][k]);
+                }
+                if (j < di_x2) {
+                  deposit_at(gi, gj, gk, cur::jx2, jx2[i][j][k]);
+                }
+                if (k < di_x3) {
+                  deposit_at(gi, gj, gk, cur::jx3, jx3[i][j][k]);
+                }
               }
             }
           }
