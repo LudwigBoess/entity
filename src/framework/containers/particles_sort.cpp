@@ -322,18 +322,90 @@ namespace ntt {
     }
   #endif // TEAM_POLICY_USE_VENDOR_SORT
 
-    // 5. Populate the size/shape part of m_tile_layout. Per-tile
-    //    `tile_offsets` and `tile_perm` are intentionally left empty —
-    //    they are only consumed by Streams 2/3 (tiled deposit/pusher),
-    //    which haven't landed yet. Computing them now would re-introduce
-    //    an atomic histogram or rely on Kokkos::BinSort internals that
-    //    aren't guaranteed-public API; defer until Streams 2/3 need it.
+    // 5. Compute per-tile prefix-sum `tile_offsets` for Streams 2/3.
+    //    Strategy: recompute `tile_indices` from the now-sorted SoA — same
+    //    formula as the pre-sort key (`lin(min(i, i_prev) / T)`), so the
+    //    result is the pre-sort tile_indices reordered into sorted order
+    //    and is therefore monotonically non-decreasing for alive particles
+    //    (with the dead sentinel `total_tiles + 1` clustered at the end).
+    //    Then transition-detect: the start of each non-empty tile is the
+    //    only place a write happens — atomic-free in the dense branch.
+    //    Empty tiles (no particles) are filled in by a reverse pass on a
+    //    small host mirror (`total_tiles ≈ 176K` at production scale).
+    {
+      // 5a. Recompute tile_indices on the sorted SoA. (vendor path freed
+      //     the original; BinSort path's copy is unsorted — recomputing
+      //     is uniform across both backends and avoids depending on
+      //     vendor-library in-place-sort semantics.)
+      array_t<ncells_t*> ti_sorted { "tile_indices_sorted", npart_local };
+      Kokkos::parallel_for(
+        "RecomputeTileIndices",
+        rangeActiveParticles(),
+        sort::PositionToTileIndex<D, false, true> { i1,
+                                                     i2,
+                                                     i3,
+                                                     tag,
+                                                     ti_sorted,
+                                                     ncells_active,
+                                                     static_cast<ncells_t>(T),
+                                                     array_t<npart_t*> {},
+                                                     i1_prev,
+                                                     i2_prev,
+                                                     i3_prev });
+
+      // 5b. Initialize offsets to npart_local — empty tiles inherit this
+      //     sentinel, then the host reverse-scan in 5d replaces it with
+      //     the next non-empty tile's start.
+      array_t<npart_t*> tile_offsets { "tile_offsets", total_tiles + 1u };
+      Kokkos::deep_copy(tile_offsets, static_cast<npart_t>(npart_local));
+
+      // 5c. Transition detection. ti_sorted is monotonically
+      //     non-decreasing, so each non-empty tile triggers exactly one
+      //     boundary write — no race. The dead-particle boundary uses
+      //     atomic_min defensively.
+      const auto total_tiles_v = total_tiles;
+      Kokkos::parallel_for(
+        "DetectTileBoundaries",
+        rangeActiveParticles(),
+        Lambda(prtlidx_t p) {
+          const auto t_curr   = ti_sorted(p);
+          const bool boundary = (p == 0u) || (ti_sorted(p - 1u) != t_curr);
+          if (!boundary) {
+            return;
+          }
+          if (t_curr < total_tiles_v) {
+            tile_offsets(t_curr) = p;
+          } else {
+            // First dead particle — also marks the alive_count boundary
+            // stored at index total_tiles.
+            Kokkos::atomic_min(&tile_offsets(total_tiles_v), p);
+          }
+        });
+
+      // 5d. Reverse fill-in for empty tiles on a host mirror.
+      //     `total_tiles ≈ 176K` → ~700 KB, scan completes in <1 ms.
+      auto h_offsets = Kokkos::create_mirror_view(tile_offsets);
+      Kokkos::deep_copy(h_offsets, tile_offsets);
+      for (auto t = static_cast<std::size_t>(total_tiles); t-- > 0u;) {
+        if (h_offsets(t) > h_offsets(t + 1u)) {
+          h_offsets(t) = h_offsets(t + 1u);
+        }
+      }
+      Kokkos::deep_copy(tile_offsets, h_offsets);
+
+      m_tile_layout.tile_offsets = tile_offsets;
+    }
+
+    // 6. Populate the size/shape part of m_tile_layout. `tile_perm` is
+    //    not needed in the current design — the SoA arrays are physically
+    //    permuted into tile order by SortSpatially, so consumers iterate
+    //    `[tile_offsets(t), tile_offsets(t+1))` directly without a
+    //    separate permutation indirection.
     m_tile_layout.ntiles_per_axis[0] = ntx[0];
     m_tile_layout.ntiles_per_axis[1] = ntx[1];
     m_tile_layout.ntiles_per_axis[2] = ntx[2];
     m_tile_layout.ntiles_total       = total_tiles;
     m_tile_layout.tile_size          = T;
-    m_tile_layout.tile_offsets       = array_t<npart_t*> {};
     m_tile_layout.tile_perm          = prtl_perm_t {};
     m_is_sorted                      = true;
 

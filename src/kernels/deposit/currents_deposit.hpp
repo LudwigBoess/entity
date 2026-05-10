@@ -1,0 +1,1263 @@
+/**
+ * @file kernels/deposit/currents_deposit.hpp
+ * @brief Covariant algorithms for the current deposition.
+ *
+ * Two kernels share the same per-particle body
+ * (`kernel::deposit::deposit_one_particle`):
+ *   - `kernel::DepositCurrents_kernel<S, M, O>` flat (RangePolicy over particles,
+ *     writes into a `Kokkos::Experimental::ScatterView`). Always available.
+ *   - `kernel::DepositCurrents_kernel_tiled<S, M, O, T_TILE>` team-policy
+ *     (one team per spatial tile, accumulates into team SLM scratch with
+ *     atomic adds, then flushes to global J). Available when `team_policy=ON`
+ *     (`#if defined(TEAM_POLICY)`). Stream 2 of the Pattern A plan.
+ *
+ * @implements
+ *   - kernel::deposit::PrtlPack<>
+ *   - kernel::deposit::deposit_one_particle<>
+ *   - kernel::DepositCurrents_kernel<>
+ *   - kernel::DepositCurrents_kernel_tiled<>   (TEAM_POLICY only)
+ * @namespaces:
+ *   - kernel::
+ *   - kernel::deposit::
+ */
+
+#ifndef KERNELS_CURRENTS_DEPOSIT_HPP
+#define KERNELS_CURRENTS_DEPOSIT_HPP
+
+#include "enums.h"
+#include "global.h"
+
+#include "arch/kokkos_aliases.h"
+#include "traits/metric.h"
+#include "utils/error.h"
+#include "utils/numeric.h"
+
+#include "kernels/particle_shapes.hpp"
+
+#include <Kokkos_Core.hpp>
+#include <Kokkos_ScatterView.hpp>
+
+#define i_di_to_Xi(I, DI) (static_cast<real_t>((I)) + static_cast<real_t>((DI)))
+
+namespace kernel {
+  using namespace ntt;
+
+  namespace deposit {
+
+    /**
+     * @brief Per-particle reference pack consumed by both the flat and tiled
+     *        deposit kernels. The same set of SoA references is captured by
+     *        each kernel; bundling them here keeps the helper's argument
+     *        list manageable and ensures every consumer reads the same
+     *        view aliases.
+     */
+    template <Dimension D>
+    struct PrtlPack {
+      array_t<int*>      i1, i2, i3;
+      array_t<int*>      i1_prev, i2_prev, i3_prev;
+      array_t<prtldx_t*> dx1, dx2, dx3;
+      array_t<prtldx_t*> dx1_prev, dx2_prev, dx3_prev;
+      array_t<real_t*>   ux1, ux2, ux3;
+      array_t<real_t*>   phi;
+      array_t<real_t*>   weight;
+      array_t<short*>    tag;
+    };
+
+    /**
+     * @brief Per-particle deposit body, shared between the flat and tiled
+     *        kernels.
+     *
+     * The caller supplies a `deposit_at(idx..., comp, val)` callback that
+     * applies the contribution `val` to the J component `comp` at the
+     * **global** J cell index `idx...` (already includes the `N_GHOSTS`
+     * offset). The flat kernel's callback simply does
+     * `J_acc(idx..., comp) += val` on its scatter-view accessor; the tiled
+     * kernel's callback translates `idx...` into per-tile scratch
+     * coordinates and uses `Kokkos::atomic_add` on SLM. Either way, this
+     * function is identical numerically and contains the only deposit math
+     * in the codebase.
+     *
+     * Dead particles return early. The callback is invoked once per cell
+     * write, with the dimension-appropriate signature:
+     *   - 1D: `deposit_at(int g_i1, int comp, real_t val)`
+     *   - 2D: `deposit_at(int g_i1, int g_i2, int comp, real_t val)`
+     *   - 3D: `deposit_at(int g_i1, int g_i2, int g_i3, int comp, real_t val)`
+     */
+    template <SimEngine::type S, MetricClass M, unsigned short O,
+              typename DepositFn>
+    Inline void deposit_one_particle(prtlidx_t       p,
+                                     const PrtlPack<M::Dim>& prtls,
+                                     const M&        metric,
+                                     real_t          charge,
+                                     real_t          inv_dt,
+                                     DepositFn       deposit_at) {
+      static_assert(O <= 11u, "Shape function order O must be <= 11");
+      constexpr auto D = M::Dim;
+
+      const auto& i1       = prtls.i1;
+      const auto& i2       = prtls.i2;
+      const auto& i3       = prtls.i3;
+      const auto& i1_prev  = prtls.i1_prev;
+      const auto& i2_prev  = prtls.i2_prev;
+      const auto& i3_prev  = prtls.i3_prev;
+      const auto& dx1      = prtls.dx1;
+      const auto& dx2      = prtls.dx2;
+      const auto& dx3      = prtls.dx3;
+      const auto& dx1_prev = prtls.dx1_prev;
+      const auto& dx2_prev = prtls.dx2_prev;
+      const auto& dx3_prev = prtls.dx3_prev;
+      const auto& ux1      = prtls.ux1;
+      const auto& ux2      = prtls.ux2;
+      const auto& ux3      = prtls.ux3;
+      const auto& phi      = prtls.phi;
+      const auto& weight   = prtls.weight;
+      const auto& tag      = prtls.tag;
+
+      if (tag(p) == ParticleTag::dead) {
+        return;
+      }
+
+      // recover particle velocity to deposit in unsimulated direction
+      vec_t<Dim::_3D> vp { ZERO };
+      {
+        coord_t<M::PrtlDim> xp { ZERO };
+        if constexpr (D == Dim::_1D) {
+          xp[0] = i_di_to_Xi(i1(p), dx1(p));
+        } else if constexpr (D == Dim::_2D) {
+          if constexpr (M::PrtlDim == Dim::_3D) {
+            xp[0] = i_di_to_Xi(i1(p), dx1(p));
+            xp[1] = i_di_to_Xi(i2(p), dx2(p));
+            xp[2] = phi(p);
+          } else {
+            xp[0] = i_di_to_Xi(i1(p), dx1(p));
+            xp[1] = i_di_to_Xi(i2(p), dx2(p));
+          }
+        } else {
+          xp[0] = i_di_to_Xi(i1(p), dx1(p));
+          xp[1] = i_di_to_Xi(i2(p), dx2(p));
+          xp[2] = i_di_to_Xi(i3(p), dx3(p));
+        }
+        auto inv_energy { ZERO };
+        if constexpr (S == SimEngine::SRPIC) {
+          metric.template transform_xyz<Idx::XYZ, Idx::U>(xp,
+                                                          { ux1(p), ux2(p), ux3(p) },
+                                                          vp);
+          inv_energy = ONE / math::sqrt(ONE + NORM_SQR(ux1(p), ux2(p), ux3(p)));
+        } else {
+          coord_t<Dim::_2D> xp_ { ZERO };
+          xp_[0] = xp[0];
+          real_t     theta_Cd { xp[1] };
+          const auto theta_Ph { metric.template convert<2, Crd::Cd, Crd::Ph>(
+            theta_Cd) };
+          const auto small_angle { static_cast<real_t>(constant::SMALL_ANGLE_GR) };
+          const auto large_angle { static_cast<real_t>(
+            constant::PI - constant::SMALL_ANGLE_GR) };
+          if (theta_Ph < small_angle) {
+            theta_Cd = metric.template convert<2, Crd::Ph, Crd::Cd>(small_angle);
+          } else if (theta_Ph >= large_angle) {
+            theta_Cd = metric.template convert<2, Crd::Ph, Crd::Cd>(large_angle);
+          }
+          xp_[1] = theta_Cd;
+          metric.template transform<Idx::D, Idx::U>(xp_,
+                                                    { ux1(p), ux2(p), ux3(p) },
+                                                    vp);
+          inv_energy = metric.alpha(xp_) /
+                       math::sqrt(ONE + ux1(p) * vp[0] + ux2(p) * vp[1] +
+                                  ux3(p) * vp[2]);
+        }
+        if (Kokkos::isnan(vp[2]) || Kokkos::isinf(vp[2])) {
+          vp[2] = ZERO;
+        }
+        vp[0] *= inv_energy;
+        vp[1] *= inv_energy;
+        vp[2] *= inv_energy;
+      }
+
+      const real_t coeff { weight(p) * charge };
+
+      // ToDo: interpolation_order as parameter
+      if constexpr (O == 0u) {
+        /*
+          Zig-zag deposit
+        */
+        const auto dxp_r_1 { static_cast<prtldx_t>(i1(p) == i1_prev(p)) *
+                             (dx1(p) + dx1_prev(p)) *
+                             static_cast<prtldx_t>(INV_2) };
+
+        const real_t Wx1_1 { INV_2 * (dxp_r_1 + dx1_prev(p) +
+                                      static_cast<real_t>(i1(p) > i1_prev(p))) };
+        const real_t Wx1_2 { INV_2 * (dx1(p) + dxp_r_1 +
+                                      static_cast<real_t>(
+                                        static_cast<int>(i1(p) > i1_prev(p)) +
+                                        i1_prev(p) - i1(p))) };
+        const real_t Fx1_1 { (static_cast<real_t>(i1(p) > i1_prev(p)) +
+                              dxp_r_1 - dx1_prev(p)) *
+                             coeff * inv_dt };
+        const real_t Fx1_2 { (static_cast<real_t>(
+                                i1(p) - i1_prev(p) -
+                                static_cast<int>(i1(p) > i1_prev(p))) +
+                              dx1(p) - dxp_r_1) *
+                             coeff * inv_dt };
+
+        if constexpr (D == Dim::_1D) {
+          const real_t Fx2_1 { HALF * vp[1] * coeff };
+          const real_t Fx2_2 { HALF * vp[1] * coeff };
+
+          const real_t Fx3_1 { HALF * vp[2] * coeff };
+          const real_t Fx3_2 { HALF * vp[2] * coeff };
+
+          deposit_at(i1_prev(p) + N_GHOSTS, cur::jx1, Fx1_1);
+          deposit_at(i1(p) + N_GHOSTS, cur::jx1, Fx1_2);
+
+          deposit_at(i1_prev(p) + N_GHOSTS, cur::jx2, Fx2_1 * (ONE - Wx1_1));
+          deposit_at(i1_prev(p) + N_GHOSTS + 1, cur::jx2, Fx2_1 * Wx1_1);
+          deposit_at(i1(p) + N_GHOSTS, cur::jx2, Fx2_2 * (ONE - Wx1_2));
+          deposit_at(i1(p) + N_GHOSTS + 1, cur::jx2, Fx2_2 * Wx1_2);
+
+          deposit_at(i1_prev(p) + N_GHOSTS, cur::jx3, Fx3_1 * (ONE - Wx1_1));
+          deposit_at(i1_prev(p) + N_GHOSTS + 1, cur::jx3, Fx3_1 * Wx1_1);
+          deposit_at(i1(p) + N_GHOSTS, cur::jx3, Fx3_2 * (ONE - Wx1_2));
+          deposit_at(i1(p) + N_GHOSTS + 1, cur::jx3, Fx3_2 * Wx1_2);
+        } else if constexpr (D == Dim::_2D || D == Dim::_3D) {
+          const auto dxp_r_2 { static_cast<prtldx_t>(i2(p) == i2_prev(p)) *
+                               (dx2(p) + dx2_prev(p)) *
+                               static_cast<prtldx_t>(INV_2) };
+
+          const real_t Wx2_1 { INV_2 * (dxp_r_2 + dx2_prev(p) +
+                                        static_cast<real_t>(i2(p) > i2_prev(p))) };
+          const real_t Wx2_2 { INV_2 * (dx2(p) + dxp_r_2 +
+                                        static_cast<real_t>(
+                                          static_cast<int>(i2(p) > i2_prev(p)) +
+                                          i2_prev(p) - i2(p))) };
+          const real_t Fx2_1 { (static_cast<real_t>(i2(p) > i2_prev(p)) +
+                                dxp_r_2 - dx2_prev(p)) *
+                               coeff * inv_dt };
+          const real_t Fx2_2 { (static_cast<real_t>(
+                                  i2(p) - i2_prev(p) -
+                                  static_cast<int>(i2(p) > i2_prev(p))) +
+                                dx2(p) - dxp_r_2) *
+                               coeff * inv_dt };
+
+          if constexpr (D == Dim::_2D) {
+            const real_t Fx3_1 { HALF * vp[2] * coeff };
+            const real_t Fx3_2 { HALF * vp[2] * coeff };
+
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS,
+                       cur::jx1,
+                       Fx1_1 * (ONE - Wx2_1));
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS + 1,
+                       cur::jx1,
+                       Fx1_1 * Wx2_1);
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS,
+                       cur::jx1,
+                       Fx1_2 * (ONE - Wx2_2));
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS + 1,
+                       cur::jx1,
+                       Fx1_2 * Wx2_2);
+
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS,
+                       cur::jx2,
+                       Fx2_1 * (ONE - Wx1_1));
+            deposit_at(i1_prev(p) + N_GHOSTS + 1,
+                       i2_prev(p) + N_GHOSTS,
+                       cur::jx2,
+                       Fx2_1 * Wx1_1);
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS,
+                       cur::jx2,
+                       Fx2_2 * (ONE - Wx1_2));
+            deposit_at(i1(p) + N_GHOSTS + 1,
+                       i2(p) + N_GHOSTS,
+                       cur::jx2,
+                       Fx2_2 * Wx1_2);
+
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_1 * (ONE - Wx1_1) * (ONE - Wx2_1));
+            deposit_at(i1_prev(p) + N_GHOSTS + 1,
+                       i2_prev(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_1 * Wx1_1 * (ONE - Wx2_1));
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS + 1,
+                       cur::jx3,
+                       Fx3_1 * (ONE - Wx1_1) * Wx2_1);
+            deposit_at(i1_prev(p) + N_GHOSTS + 1,
+                       i2_prev(p) + N_GHOSTS + 1,
+                       cur::jx3,
+                       Fx3_1 * Wx1_1 * Wx2_1);
+
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_2 * (ONE - Wx1_2) * (ONE - Wx2_2));
+            deposit_at(i1(p) + N_GHOSTS + 1,
+                       i2(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_2 * Wx1_2 * (ONE - Wx2_2));
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS + 1,
+                       cur::jx3,
+                       Fx3_2 * (ONE - Wx1_2) * Wx2_2);
+            deposit_at(i1(p) + N_GHOSTS + 1,
+                       i2(p) + N_GHOSTS + 1,
+                       cur::jx3,
+                       Fx3_2 * Wx1_2 * Wx2_2);
+          } else {
+            const auto   dxp_r_3 { static_cast<prtldx_t>(i3(p) == i3_prev(p)) *
+                                 (dx3(p) + dx3_prev(p)) *
+                                 static_cast<prtldx_t>(INV_2) };
+            const real_t Wx3_1 { INV_2 * (dxp_r_3 + dx3_prev(p) +
+                                          static_cast<real_t>(i3(p) > i3_prev(p))) };
+            const real_t Wx3_2 { INV_2 * (dx3(p) + dxp_r_3 +
+                                          static_cast<real_t>(
+                                            static_cast<int>(i3(p) > i3_prev(p)) +
+                                            i3_prev(p) - i3(p))) };
+            const real_t Fx3_1 { (static_cast<real_t>(i3(p) > i3_prev(p)) +
+                                  dxp_r_3 - dx3_prev(p)) *
+                                 coeff * inv_dt };
+            const real_t Fx3_2 { (static_cast<real_t>(
+                                    i3(p) - i3_prev(p) -
+                                    static_cast<int>(i3(p) > i3_prev(p))) +
+                                  dx3(p) - dxp_r_3) *
+                                 coeff * inv_dt };
+
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS,
+                       i3_prev(p) + N_GHOSTS,
+                       cur::jx1,
+                       Fx1_1 * (ONE - Wx2_1) * (ONE - Wx3_1));
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS + 1,
+                       i3_prev(p) + N_GHOSTS,
+                       cur::jx1,
+                       Fx1_1 * Wx2_1 * (ONE - Wx3_1));
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS,
+                       i3_prev(p) + N_GHOSTS + 1,
+                       cur::jx1,
+                       Fx1_1 * (ONE - Wx2_1) * Wx3_1);
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS + 1,
+                       i3_prev(p) + N_GHOSTS + 1,
+                       cur::jx1,
+                       Fx1_1 * Wx2_1 * Wx3_1);
+
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS,
+                       i3(p) + N_GHOSTS,
+                       cur::jx1,
+                       Fx1_2 * (ONE - Wx2_2) * (ONE - Wx3_2));
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS + 1,
+                       i3(p) + N_GHOSTS,
+                       cur::jx1,
+                       Fx1_2 * Wx2_2 * (ONE - Wx3_2));
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS,
+                       i3(p) + N_GHOSTS + 1,
+                       cur::jx1,
+                       Fx1_2 * (ONE - Wx2_2) * Wx3_2);
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS + 1,
+                       i3(p) + N_GHOSTS + 1,
+                       cur::jx1,
+                       Fx1_2 * Wx2_2 * Wx3_2);
+
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS,
+                       i3_prev(p) + N_GHOSTS,
+                       cur::jx2,
+                       Fx2_1 * (ONE - Wx1_1) * (ONE - Wx3_1));
+            deposit_at(i1_prev(p) + N_GHOSTS + 1,
+                       i2_prev(p) + N_GHOSTS,
+                       i3_prev(p) + N_GHOSTS,
+                       cur::jx2,
+                       Fx2_1 * Wx1_1 * (ONE - Wx3_1));
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS,
+                       i3_prev(p) + N_GHOSTS + 1,
+                       cur::jx2,
+                       Fx2_1 * (ONE - Wx1_1) * Wx3_1);
+            deposit_at(i1_prev(p) + N_GHOSTS + 1,
+                       i2_prev(p) + N_GHOSTS,
+                       i3_prev(p) + N_GHOSTS + 1,
+                       cur::jx2,
+                       Fx2_1 * Wx1_1 * Wx3_1);
+
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS,
+                       i3(p) + N_GHOSTS,
+                       cur::jx2,
+                       Fx2_2 * (ONE - Wx1_2) * (ONE - Wx3_2));
+            deposit_at(i1(p) + N_GHOSTS + 1,
+                       i2(p) + N_GHOSTS,
+                       i3(p) + N_GHOSTS,
+                       cur::jx2,
+                       Fx2_2 * Wx1_2 * (ONE - Wx3_2));
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS,
+                       i3(p) + N_GHOSTS + 1,
+                       cur::jx2,
+                       Fx2_2 * (ONE - Wx1_2) * Wx3_2);
+            deposit_at(i1(p) + N_GHOSTS + 1,
+                       i2(p) + N_GHOSTS,
+                       i3(p) + N_GHOSTS + 1,
+                       cur::jx2,
+                       Fx2_2 * Wx1_2 * Wx3_2);
+
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS,
+                       i3_prev(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_1 * (ONE - Wx1_1) * (ONE - Wx2_1));
+            deposit_at(i1_prev(p) + N_GHOSTS + 1,
+                       i2_prev(p) + N_GHOSTS,
+                       i3_prev(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_1 * Wx1_1 * (ONE - Wx2_1));
+            deposit_at(i1_prev(p) + N_GHOSTS,
+                       i2_prev(p) + N_GHOSTS + 1,
+                       i3_prev(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_1 * (ONE - Wx1_1) * Wx2_1);
+            deposit_at(i1_prev(p) + N_GHOSTS + 1,
+                       i2_prev(p) + N_GHOSTS + 1,
+                       i3_prev(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_1 * Wx1_1 * Wx2_1);
+
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS,
+                       i3(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_2 * (ONE - Wx1_2) * (ONE - Wx2_2));
+            deposit_at(i1(p) + N_GHOSTS + 1,
+                       i2(p) + N_GHOSTS,
+                       i3(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_2 * Wx1_2 * (ONE - Wx2_2));
+            deposit_at(i1(p) + N_GHOSTS,
+                       i2(p) + N_GHOSTS + 1,
+                       i3(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_2 * (ONE - Wx1_2) * Wx2_2);
+            deposit_at(i1(p) + N_GHOSTS + 1,
+                       i2(p) + N_GHOSTS + 1,
+                       i3(p) + N_GHOSTS,
+                       cur::jx3,
+                       Fx3_2 * Wx1_2 * Wx2_2);
+          }
+        }
+      } else if constexpr ((O >= 1u) and (O <= 11u)) {
+
+        // shape function in dim1 -> always required
+        real_t iS_x1[O + 2], fS_x1[O + 2];
+        // indices of the shape function
+        int    i1_min, i1_max;
+
+        // call shape function
+        prtl_shape::for_deposit<O>(i1_prev(p),
+                                   static_cast<real_t>(dx1_prev(p)),
+                                   i1(p),
+                                   static_cast<real_t>(dx1(p)),
+                                   i1_min,
+                                   i1_max,
+                                   iS_x1,
+                                   fS_x1);
+
+        if constexpr (D == Dim::_1D) {
+          // define weight vectors
+          real_t Wx1[O + 2];
+          real_t Wx23[O + 2];
+
+          // Calculate weight function
+#pragma unroll
+          for (int i = 0; i < O + 2; ++i) {
+            // Esirkepov 2001, Eq. 38 for 1D case
+            Wx1[i]  = fS_x1[i] - iS_x1[i];
+            Wx23[i] = HALF * (fS_x1[i] + iS_x1[i]);
+          }
+
+          // contribution within the shape function stencil
+          real_t jx1[O + 2];
+
+          // prefactors for j update
+          const real_t Qdx1dt = coeff * inv_dt;
+          const real_t QVx2   = coeff * vp[1];
+          const real_t QVx3   = coeff * vp[2];
+
+          // Calculate current contribution
+          jx1[0] = -Qdx1dt * Wx1[0];
+#pragma unroll
+          for (int i = 1; i < O + 2; ++i) {
+            jx1[i] = jx1[i - 1] - Qdx1dt * Wx1[i];
+          }
+
+          // account for ghost cells
+          i1_min += N_GHOSTS;
+          i1_max += N_GHOSTS;
+
+          // get number of update indices for asymmetric movement
+          const int di_x1 = i1_max - i1_min;
+
+          /*
+              Current update
+          */
+
+          for (int i = 0; i < di_x1; ++i) {
+            deposit_at(i1_min + i, cur::jx1, jx1[i]);
+          }
+
+          for (int i = 0; i <= di_x1; ++i) {
+            deposit_at(i1_min + i, cur::jx2, QVx2 * Wx23[i]);
+          }
+
+          for (int i = 0; i <= di_x1; ++i) {
+            deposit_at(i1_min + i, cur::jx3, QVx3 * Wx23[i]);
+          }
+
+        } else if constexpr (D == Dim::_2D) {
+
+          // shape function in dim1 -> always required
+          real_t iS_x2[O + 2], fS_x2[O + 2];
+          // indices of the shape function
+          int    i2_min, i2_max;
+
+          // call shape function
+          prtl_shape::for_deposit<O>(i2_prev(p),
+                                     static_cast<real_t>(dx2_prev(p)),
+                                     i2(p),
+                                     static_cast<real_t>(dx2(p)),
+                                     i2_min,
+                                     i2_max,
+                                     iS_x2,
+                                     fS_x2);
+
+          // define weight tensors
+          real_t Wx1[O + 2][O + 2];
+          real_t Wx2[O + 2][O + 2];
+          real_t Wx3[O + 2][O + 2];
+
+// Calculate weight function
+#pragma unroll
+          for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+            for (int j = 0; j < O + 2; ++j) {
+              // Esirkepov 2001, Eq. 38 (simplified)
+              Wx1[i][j] = HALF * (fS_x1[i] - iS_x1[i]) * (fS_x2[j] + iS_x2[j]);
+
+              Wx2[i][j] = HALF * (fS_x1[i] + iS_x1[i]) * (fS_x2[j] - iS_x2[j]);
+
+              Wx3[i][j] = THIRD * (fS_x2[j] * (HALF * iS_x1[i] + fS_x1[i]) +
+                                   iS_x2[j] * (HALF * fS_x1[i] + iS_x1[i]));
+            }
+          }
+
+          // contribution within the shape function stencil
+          real_t jx1[O + 2][O + 2], jx2[O + 2][O + 2];
+
+          // prefactors for j update
+          const real_t Qdx1dt = coeff * inv_dt;
+          const real_t Qdx2dt = coeff * inv_dt;
+          const real_t QVx3   = coeff * vp[2];
+
+          // Calculate current contribution
+
+          // jx1
+#pragma unroll
+          for (int j = 0; j < O + 2; ++j) {
+            jx1[0][j] = -Qdx1dt * Wx1[0][j];
+          }
+
+#pragma unroll
+          for (int i = 1; i < O + 2; ++i) {
+#pragma unroll
+            for (int j = 0; j < O + 2; ++j) {
+              jx1[i][j] = jx1[i - 1][j] - Qdx1dt * Wx1[i][j];
+            }
+          }
+
+          // jx2
+#pragma unroll
+          for (int i = 0; i < O + 2; ++i) {
+            jx2[i][0] = -Qdx2dt * Wx2[i][0];
+          }
+
+#pragma unroll
+          for (int j = 1; j < O + 2; ++j) {
+#pragma unroll
+            for (int i = 0; i < O + 2; ++i) {
+              jx2[i][j] = jx2[i][j - 1] - Qdx2dt * Wx2[i][j];
+            }
+          }
+
+          // account for ghost cells
+          i1_min += N_GHOSTS;
+          i2_min += N_GHOSTS;
+          i1_max += N_GHOSTS;
+          i2_max += N_GHOSTS;
+
+          // get number of update indices for asymmetric movement
+          const int di_x1 = i1_max - i1_min;
+          const int di_x2 = i2_max - i2_min;
+
+          /*
+              Current update
+          */
+
+          for (int i = 0; i < di_x1; ++i) {
+            for (int j = 0; j <= di_x2; ++j) {
+              deposit_at(i1_min + i, i2_min + j, cur::jx1, jx1[i][j]);
+            }
+          }
+
+          for (int i = 0; i <= di_x1; ++i) {
+            for (int j = 0; j < di_x2; ++j) {
+              deposit_at(i1_min + i, i2_min + j, cur::jx2, jx2[i][j]);
+            }
+          }
+
+          for (int i = 0; i <= di_x1; ++i) {
+            for (int j = 0; j <= di_x2; ++j) {
+              deposit_at(i1_min + i, i2_min + j, cur::jx3, QVx3 * Wx3[i][j]);
+            }
+          }
+
+        } else if constexpr (D == Dim::_3D) {
+          // shape function in dim2
+          real_t iS_x2[O + 2], fS_x2[O + 2];
+          // indices of the shape function
+          int    i2_min, i2_max;
+          // call shape function
+          prtl_shape::for_deposit<O>(i2_prev(p),
+                                     static_cast<real_t>(dx2_prev(p)),
+                                     i2(p),
+                                     static_cast<real_t>(dx2(p)),
+                                     i2_min,
+                                     i2_max,
+                                     iS_x2,
+                                     fS_x2);
+
+          // shape function in dim3
+          real_t iS_x3[O + 2], fS_x3[O + 2];
+          // indices of the shape function
+          int    i3_min, i3_max;
+
+          // call shape function
+          prtl_shape::for_deposit<O>(i3_prev(p),
+                                     static_cast<real_t>(dx3_prev(p)),
+                                     i3(p),
+                                     static_cast<real_t>(dx3(p)),
+                                     i3_min,
+                                     i3_max,
+                                     iS_x3,
+                                     fS_x3);
+
+          // define weight tensors
+          real_t Wx1[O + 2][O + 2][O + 2];
+          real_t Wx2[O + 2][O + 2][O + 2];
+          real_t Wx3[O + 2][O + 2][O + 2];
+
+// Calculate weight function
+#pragma unroll
+          for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+            for (int j = 0; j < O + 2; ++j) {
+#pragma unroll
+              for (int k = 0; k < O + 2; ++k) {
+                // Esirkepov 2001, Eq. 31
+                Wx1[i][j][k] = THIRD * (fS_x1[i] - iS_x1[i]) *
+                               ((iS_x2[j] * iS_x3[k] + fS_x2[j] * fS_x3[k]) +
+                                HALF * (iS_x3[k] * fS_x2[j] + iS_x2[j] * fS_x3[k]));
+
+                Wx2[i][j][k] = THIRD * (fS_x2[j] - iS_x2[j]) *
+                               (iS_x1[i] * iS_x3[k] + fS_x1[i] * fS_x3[k] +
+                                HALF * (iS_x3[k] * fS_x1[i] + iS_x1[i] * fS_x3[k]));
+
+                Wx3[i][j][k] = THIRD * (fS_x3[k] - iS_x3[k]) *
+                               (iS_x1[i] * iS_x2[j] + fS_x1[i] * fS_x2[j] +
+                                HALF * (iS_x1[i] * fS_x2[j] + iS_x2[j] * fS_x1[i]));
+              }
+            }
+          }
+
+          // contribution within the shape function stencil
+          real_t jx1[O + 2][O + 2][O + 2], jx2[O + 2][O + 2][O + 2],
+            jx3[O + 2][O + 2][O + 2];
+
+          // prefactors to j update
+          const real_t Qdxdt = coeff * inv_dt;
+          const real_t Qdydt = coeff * inv_dt;
+          const real_t Qdzdt = coeff * inv_dt;
+
+          // Calculate current contribution
+
+          // jx1
+#pragma unroll
+          for (int j = 0; j < O + 2; ++j) {
+#pragma unroll
+            for (int k = 0; k < O + 2; ++k) {
+              jx1[0][j][k] = -Qdxdt * Wx1[0][j][k];
+            }
+          }
+
+#pragma unroll
+          for (int i = 1; i < O + 2; ++i) {
+#pragma unroll
+            for (int j = 0; j < O + 2; ++j) {
+#pragma unroll
+              for (int k = 0; k < O + 2; ++k) {
+                jx1[i][j][k] = jx1[i - 1][j][k] - Qdxdt * Wx1[i][j][k];
+              }
+            }
+          }
+
+          // jx2
+#pragma unroll
+          for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+            for (int k = 0; k < O + 2; ++k) {
+              jx2[i][0][k] = -Qdydt * Wx2[i][0][k];
+            }
+          }
+
+#pragma unroll
+          for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+            for (int j = 1; j < O + 2; ++j) {
+#pragma unroll
+              for (int k = 0; k < O + 2; ++k) {
+                jx2[i][j][k] = jx2[i][j - 1][k] - Qdydt * Wx2[i][j][k];
+              }
+            }
+          }
+
+          // jx3
+#pragma unroll
+          for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+            for (int j = 0; j < O + 2; ++j) {
+              jx3[i][j][0] = -Qdydt * Wx3[i][j][0];
+            }
+          }
+
+#pragma unroll
+          for (int i = 0; i < O + 2; ++i) {
+#pragma unroll
+            for (int j = 0; j < O + 2; ++j) {
+#pragma unroll
+              for (int k = 1; k < O + 2; ++k) {
+                jx3[i][j][k] = jx3[i][j][k - 1] - Qdzdt * Wx3[i][j][k];
+              }
+            }
+          }
+
+          // account for ghost cells
+          i1_min += N_GHOSTS;
+          i2_min += N_GHOSTS;
+          i3_min += N_GHOSTS;
+          i1_max += N_GHOSTS;
+          i2_max += N_GHOSTS;
+          i3_max += N_GHOSTS;
+
+          // get number of update indices for asymmetric movement
+          const int di_x1 = i1_max - i1_min;
+          const int di_x2 = i2_max - i2_min;
+          const int di_x3 = i3_max - i3_min;
+
+          /*
+            Current update
+          */
+
+          for (int i = 0; i < di_x1; ++i) {
+            for (int j = 0; j <= di_x2; ++j) {
+              for (int k = 0; k <= di_x3; ++k) {
+                deposit_at(i1_min + i,
+                           i2_min + j,
+                           i3_min + k,
+                           cur::jx1,
+                           jx1[i][j][k]);
+              }
+            }
+          }
+
+          for (int i = 0; i <= di_x1; ++i) {
+            for (int j = 0; j < di_x2; ++j) {
+              for (int k = 0; k <= di_x3; ++k) {
+                deposit_at(i1_min + i,
+                           i2_min + j,
+                           i3_min + k,
+                           cur::jx2,
+                           jx2[i][j][k]);
+              }
+            }
+          }
+
+          for (int i = 0; i <= di_x1; ++i) {
+            for (int j = 0; j <= di_x2; ++j) {
+              for (int k = 0; k < di_x3; ++k) {
+                deposit_at(i1_min + i,
+                           i2_min + j,
+                           i3_min + k,
+                           cur::jx3,
+                           jx3[i][j][k]);
+              }
+            }
+          }
+
+        } // dim
+      } else { // order
+        raise::KernelError(
+          HERE,
+          "Unsupported interpolation order. O > 11 not supported. Seriously. "
+          "What are you even doing here? Entity already goes to 11!");
+      }
+    }
+
+  } // namespace deposit
+
+  /**
+   * @brief Flat current-deposition kernel.
+   *
+   * One thread per particle (RangePolicy). Writes are coalesced through a
+   * `Kokkos::Experimental::ScatterView` to avoid per-thread atomics on
+   * global J. Constructor signature is unchanged from prior versions —
+   * `engines/srpic/currents.h` continues to call it identically.
+   */
+  template <SimEngine::type S, MetricClass M, unsigned short O = 1u>
+  class DepositCurrents_kernel {
+    static_assert(O <= 11u, "Shape function order O must be <= 11");
+    static constexpr auto D = M::Dim;
+
+    scatter_ndfield_t<D, 3>     J;
+    deposit::PrtlPack<D>        prtls;
+    const M                     metric;
+    const real_t                charge, inv_dt;
+
+  public:
+    DepositCurrents_kernel(const scatter_ndfield_t<D, 3>& scatter_cur,
+                           const array_t<int*>&           i1,
+                           const array_t<int*>&           i2,
+                           const array_t<int*>&           i3,
+                           const array_t<int*>&           i1_prev,
+                           const array_t<int*>&           i2_prev,
+                           const array_t<int*>&           i3_prev,
+                           const array_t<prtldx_t*>&      dx1,
+                           const array_t<prtldx_t*>&      dx2,
+                           const array_t<prtldx_t*>&      dx3,
+                           const array_t<prtldx_t*>&      dx1_prev,
+                           const array_t<prtldx_t*>&      dx2_prev,
+                           const array_t<prtldx_t*>&      dx3_prev,
+                           const array_t<real_t*>&        ux1,
+                           const array_t<real_t*>&        ux2,
+                           const array_t<real_t*>&        ux3,
+                           const array_t<real_t*>&        phi,
+                           const array_t<real_t*>&        weight,
+                           const array_t<short*>&         tag,
+                           const M&                       metric,
+                           real_t                         charge,
+                           const real_t                   dt)
+      : J { scatter_cur }
+      , prtls { i1,       i2,       i3,       i1_prev,  i2_prev,  i3_prev,
+                dx1,      dx2,      dx3,      dx1_prev, dx2_prev, dx3_prev,
+                ux1,      ux2,      ux3,      phi,      weight,   tag }
+      , metric { metric }
+      , charge { charge }
+      , inv_dt { ONE / dt } {
+      raise::ErrorIf(
+        (O == 2u and N_GHOSTS < 2),
+        "Order of interpolation is 2, but number of ghost cells is < 2",
+        HERE);
+    }
+
+    Inline auto operator()(prtlidx_t p) const -> void {
+      auto J_acc = J.access();
+      if constexpr (D == Dim::_1D) {
+        deposit::deposit_one_particle<S, M, O>(
+          p,
+          prtls,
+          metric,
+          charge,
+          inv_dt,
+          [&](int g_i1, int comp, real_t v) {
+            J_acc(g_i1, comp) += v;
+          });
+      } else if constexpr (D == Dim::_2D) {
+        deposit::deposit_one_particle<S, M, O>(
+          p,
+          prtls,
+          metric,
+          charge,
+          inv_dt,
+          [&](int g_i1, int g_i2, int comp, real_t v) {
+            J_acc(g_i1, g_i2, comp) += v;
+          });
+      } else if constexpr (D == Dim::_3D) {
+        deposit::deposit_one_particle<S, M, O>(
+          p,
+          prtls,
+          metric,
+          charge,
+          inv_dt,
+          [&](int g_i1, int g_i2, int g_i3, int comp, real_t v) {
+            J_acc(g_i1, g_i2, g_i3, comp) += v;
+          });
+      }
+    }
+  };
+
+#if defined(TEAM_POLICY)
+
+  /**
+   * @brief Tiled current-deposition kernel (Pattern A, Stream 2).
+   *
+   * One team per spatial tile (`league_size = ntiles_total`). Each team
+   * accumulates particle contributions into a per-team scratch buffer of
+   * shape `(T_TILE + 2*HALO)^D × 3` real_t, where `HALO = O + 1` cells per
+   * side. Scratch atomics live in SLM (PVC: ~5–10 cycles per
+   * `atomic_add`); the global J is touched only once per scratch cell at
+   * flush time. Compared with the flat scatter-view kernel:
+   *   - global atomic pressure ~ (T_TILE + 2*HALO)^D × 3 per tile
+   *     instead of (stencil writes per particle × particles)
+   *   - per-particle stencil writes are tile-local (SLM) instead of
+   *     scattering through global HBM
+   *
+   * Supports `O ∈ {0, ..., 11}`. `O == 0` (zigzag) is wired for
+   * A/B benchmarking against the flat scatter-view kernel — its narrow
+   * stencil typically makes scratch alloc/zero/flush overhead a
+   * regression there, but it's good to be able to measure the
+   * crossover. To revert and use flat for zigzag-only builds, change
+   * the dispatch in `engines/srpic/currents.h` from
+   * `#if defined(TEAM_POLICY)` to
+   * `#if defined(TEAM_POLICY) && (SHAPE_ORDER > 0)`.
+   *
+   * Particle iteration order is governed by `tile_offsets`: tile `t`
+   * owns particles `[tile_offsets(t), tile_offsets(t+1))`, post-sort.
+   * `SortSpatially` (`particles_sort.cpp`) is responsible for keeping
+   * the SoA arrays consistent with that.
+   */
+  template <SimEngine::type S, MetricClass M, unsigned short O,
+            unsigned short T_TILE>
+  class DepositCurrents_kernel_tiled {
+    static_assert(O <= 11u, "Shape order O must be <= 11");
+    static_assert(T_TILE > 0u, "T_TILE must be positive");
+    static constexpr auto D = M::Dim;
+    // Per-side scratch halo. For Esirkepov (O >= 1) the stencil
+    // half-width + 1-cell drift gives O+1; the zigzag deposit (O==0)
+    // writes at most max(i, i_prev) + 1, which combined with 1-cell
+    // drift since last sort needs at least 2.
+    static constexpr int HALO = (static_cast<int>(O) + 1 > 2)
+                                  ? (static_cast<int>(O) + 1)
+                                  : 2;
+    static constexpr int TE   = static_cast<int>(T_TILE) + 2 * HALO;
+
+    using exec_space   = Kokkos::DefaultExecutionSpace;
+    using team_policy  = Kokkos::TeamPolicy<exec_space>;
+    using member_t     = typename team_policy::member_type;
+    using scratch_mem  = typename exec_space::scratch_memory_space;
+
+    // Scratch view types: trailing extent of 3 (jx1, jx2, jx3 components)
+    // is fixed by a runtime extent so we don't need a separate dimension
+    // template per component count.
+    using scratch_1d_t = Kokkos::View<real_t**,
+                                      scratch_mem,
+                                      Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    using scratch_2d_t = Kokkos::View<real_t***,
+                                      scratch_mem,
+                                      Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    using scratch_3d_t = Kokkos::View<real_t****,
+                                      scratch_mem,
+                                      Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+
+    ndfield_t<D, 3>           J;
+    deposit::PrtlPack<D>      prtls;
+    const M                   metric;
+    const real_t              charge, inv_dt;
+
+    // Tile metadata produced by SortSpatially.
+    array_t<npart_t*>         tile_offsets;
+    ncells_t                  ntx1 { 1u }, ntx2 { 1u }, ntx3 { 1u };
+    ncells_t                  total_tiles { 0u };
+
+    // J's full storage extent including all ghost cells. Used to clip
+    // the cooperative flush so that a partial tile at the high end of
+    // the domain does not over-write past the J view.
+    int                       j_ext1 { 0 }, j_ext2 { 0 }, j_ext3 { 0 };
+
+  public:
+    DepositCurrents_kernel_tiled(const ndfield_t<D, 3>&    cur,
+                                 const array_t<int*>&      i1,
+                                 const array_t<int*>&      i2,
+                                 const array_t<int*>&      i3,
+                                 const array_t<int*>&      i1_prev,
+                                 const array_t<int*>&      i2_prev,
+                                 const array_t<int*>&      i3_prev,
+                                 const array_t<prtldx_t*>& dx1,
+                                 const array_t<prtldx_t*>& dx2,
+                                 const array_t<prtldx_t*>& dx3,
+                                 const array_t<prtldx_t*>& dx1_prev,
+                                 const array_t<prtldx_t*>& dx2_prev,
+                                 const array_t<prtldx_t*>& dx3_prev,
+                                 const array_t<real_t*>&   ux1,
+                                 const array_t<real_t*>&   ux2,
+                                 const array_t<real_t*>&   ux3,
+                                 const array_t<real_t*>&   phi,
+                                 const array_t<real_t*>&   weight,
+                                 const array_t<short*>&    tag,
+                                 const M&                  metric,
+                                 real_t                    charge,
+                                 const real_t              dt,
+                                 const TileLayout<D>&      layout)
+      : J { cur }
+      , prtls { i1,       i2,       i3,       i1_prev,  i2_prev,  i3_prev,
+                dx1,      dx2,      dx3,      dx1_prev, dx2_prev, dx3_prev,
+                ux1,      ux2,      ux3,      phi,      weight,   tag }
+      , metric { metric }
+      , charge { charge }
+      , inv_dt { ONE / dt }
+      , tile_offsets { layout.tile_offsets }
+      , ntx1 { layout.ntiles_per_axis[0] }
+      , ntx2 { layout.ntiles_per_axis[1] }
+      , ntx3 { layout.ntiles_per_axis[2] }
+      , total_tiles { layout.ntiles_total } {
+      raise::ErrorIf(
+        layout.tile_size != T_TILE,
+        "Tiled deposit launched with mismatched T_TILE and runtime tile_size",
+        HERE);
+      raise::ErrorIf(
+        (HALO > static_cast<int>(N_GHOSTS) + 1),
+        "Tile halo exceeds available J ghost storage",
+        HERE);
+      if constexpr (D == Dim::_1D || D == Dim::_2D || D == Dim::_3D) {
+        j_ext1 = static_cast<int>(cur.extent(0));
+      }
+      if constexpr (D == Dim::_2D || D == Dim::_3D) {
+        j_ext2 = static_cast<int>(cur.extent(1));
+      }
+      if constexpr (D == Dim::_3D) {
+        j_ext3 = static_cast<int>(cur.extent(2));
+      }
+    }
+
+    /**
+     * @brief Per-team scratch size in bytes. Used by the launcher to set
+     *        `team_policy.set_scratch_size(0, Kokkos::PerTeam(bytes))`.
+     */
+    static constexpr std::size_t scratch_bytes() {
+      if constexpr (D == Dim::_1D) {
+        return scratch_1d_t::shmem_size(TE, 3);
+      } else if constexpr (D == Dim::_2D) {
+        return scratch_2d_t::shmem_size(TE, TE, 3);
+      } else {
+        return scratch_3d_t::shmem_size(TE, TE, TE, 3);
+      }
+    }
+
+    KOKKOS_INLINE_FUNCTION
+    void operator()(const member_t& team) const {
+      const auto tile_id = static_cast<ncells_t>(team.league_rank());
+      // Tile coordinates (tile-grid indices) → tile origin in **active**
+      // cell coords (no ghost offset). Using ncells_t to match the linearised
+      // tile index produced by SortSpatially.
+      ncells_t tx1 = 0, tx2 = 0, tx3 = 0;
+      if constexpr (D == Dim::_1D) {
+        tx1 = tile_id;
+      } else if constexpr (D == Dim::_2D) {
+        tx1 = tile_id / ntx2;
+        tx2 = tile_id - tx1 * ntx2;
+      } else {
+        const auto plane = ntx2 * ntx3;
+        tx1              = tile_id / plane;
+        const auto rem   = tile_id - tx1 * plane;
+        tx2              = rem / ntx3;
+        tx3              = rem - tx2 * ntx3;
+      }
+      // origin_active = lowest active-cell index in the tile (no ghost).
+      // origin_J      = same value translated into J's storage coordinate
+      //                 (i.e. plus N_GHOSTS).
+      // origin_J_low  = J coordinate of scratch index 0 (i.e. origin_J - HALO).
+      // local index `li` in scratch ↔ global J index `gi = li + origin_J_low`.
+      const int origin_J1_low = static_cast<int>(tx1 * T_TILE)
+                                + static_cast<int>(N_GHOSTS) - HALO;
+      const int origin_J2_low = static_cast<int>(tx2 * T_TILE)
+                                + static_cast<int>(N_GHOSTS) - HALO;
+      const int origin_J3_low = static_cast<int>(tx3 * T_TILE)
+                                + static_cast<int>(N_GHOSTS) - HALO;
+
+      // Allocate scratch and cooperatively zero-fill it.
+      if constexpr (D == Dim::_1D) {
+        scratch_1d_t scr(team.team_scratch(0), TE, 3);
+        Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, TE * 3),
+          [&](const int idx) {
+            const int li = idx / 3;
+            const int c  = idx - li * 3;
+            scr(li, c)   = ZERO;
+          });
+        team.team_barrier();
+
+        const auto p_begin = tile_offsets(tile_id);
+        const auto p_end   = tile_offsets(tile_id + 1u);
+        Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, p_begin, p_end),
+          [&](const npart_t p) {
+            deposit::deposit_one_particle<S, M, O>(
+              p,
+              prtls,
+              metric,
+              charge,
+              inv_dt,
+              [&](int g_i1, int comp, real_t v) {
+                const int li = g_i1 - origin_J1_low;
+                Kokkos::atomic_add(&scr(li, comp), v);
+              });
+          });
+        team.team_barrier();
+
+        // Cooperative flush of scratch to global J. Bounds-clip against
+        // the J view extent in case a partial high-end tile (or non-zero
+        // halo at domain edges) would otherwise write past J.
+        const int e1 = j_ext1;
+        Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, TE * 3),
+          [&](const int idx) {
+            const int li = idx / 3;
+            const int c  = idx - li * 3;
+            const int gi = li + origin_J1_low;
+            if (gi < 0 || gi >= e1) {
+              return;
+            }
+            const real_t v = scr(li, c);
+            if (v != ZERO) {
+              Kokkos::atomic_add(&J(gi, c), v);
+            }
+          });
+      } else if constexpr (D == Dim::_2D) {
+        scratch_2d_t scr(team.team_scratch(0), TE, TE, 3);
+        Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, TE * TE * 3),
+          [&](const int idx) {
+            const int lij  = idx / 3;
+            const int c    = idx - lij * 3;
+            const int li   = lij / TE;
+            const int lj   = lij - li * TE;
+            scr(li, lj, c) = ZERO;
+          });
+        team.team_barrier();
+
+        const auto p_begin = tile_offsets(tile_id);
+        const auto p_end   = tile_offsets(tile_id + 1u);
+        Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, p_begin, p_end),
+          [&](const npart_t p) {
+            deposit::deposit_one_particle<S, M, O>(
+              p,
+              prtls,
+              metric,
+              charge,
+              inv_dt,
+              [&](int g_i1, int g_i2, int comp, real_t v) {
+                const int li = g_i1 - origin_J1_low;
+                const int lj = g_i2 - origin_J2_low;
+                Kokkos::atomic_add(&scr(li, lj, comp), v);
+              });
+          });
+        team.team_barrier();
+
+        const int e1 = j_ext1;
+        const int e2 = j_ext2;
+        Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, TE * TE * 3),
+          [&](const int idx) {
+            const int lij = idx / 3;
+            const int c   = idx - lij * 3;
+            const int li  = lij / TE;
+            const int lj  = lij - li * TE;
+            const int gi  = li + origin_J1_low;
+            const int gj  = lj + origin_J2_low;
+            if (gi < 0 || gi >= e1 || gj < 0 || gj >= e2) {
+              return;
+            }
+            const real_t v = scr(li, lj, c);
+            if (v != ZERO) {
+              Kokkos::atomic_add(&J(gi, gj, c), v);
+            }
+          });
+      } else if constexpr (D == Dim::_3D) {
+        scratch_3d_t scr(team.team_scratch(0), TE, TE, TE, 3);
+        const int    cells = TE * TE * TE;
+        Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, cells * 3),
+          [&](const int idx) {
+            const int lijk     = idx / 3;
+            const int c        = idx - lijk * 3;
+            const int li       = lijk / (TE * TE);
+            const int rem      = lijk - li * TE * TE;
+            const int lj       = rem / TE;
+            const int lk       = rem - lj * TE;
+            scr(li, lj, lk, c) = ZERO;
+          });
+        team.team_barrier();
+
+        const auto p_begin = tile_offsets(tile_id);
+        const auto p_end   = tile_offsets(tile_id + 1u);
+        Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, p_begin, p_end),
+          [&](const npart_t p) {
+            deposit::deposit_one_particle<S, M, O>(
+              p,
+              prtls,
+              metric,
+              charge,
+              inv_dt,
+              [&](int g_i1, int g_i2, int g_i3, int comp, real_t v) {
+                const int li = g_i1 - origin_J1_low;
+                const int lj = g_i2 - origin_J2_low;
+                const int lk = g_i3 - origin_J3_low;
+                Kokkos::atomic_add(&scr(li, lj, lk, comp), v);
+              });
+          });
+        team.team_barrier();
+
+        const int e1 = j_ext1;
+        const int e2 = j_ext2;
+        const int e3 = j_ext3;
+        Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, cells * 3),
+          [&](const int idx) {
+            const int lijk = idx / 3;
+            const int c    = idx - lijk * 3;
+            const int li   = lijk / (TE * TE);
+            const int rem  = lijk - li * TE * TE;
+            const int lj   = rem / TE;
+            const int lk   = rem - lj * TE;
+            const int gi   = li + origin_J1_low;
+            const int gj   = lj + origin_J2_low;
+            const int gk   = lk + origin_J3_low;
+            if (gi < 0 || gi >= e1 || gj < 0 || gj >= e2 || gk < 0 ||
+                gk >= e3) {
+              return;
+            }
+            const real_t v = scr(li, lj, lk, c);
+            if (v != ZERO) {
+              Kokkos::atomic_add(&J(gi, gj, gk, c), v);
+            }
+          });
+      }
+    }
+  };
+
+#endif // TEAM_POLICY
+
+} // namespace kernel
+
+#undef i_di_to_Xi
+
+#endif // KERNELS_CURRENTS_DEPOSIT_HPP

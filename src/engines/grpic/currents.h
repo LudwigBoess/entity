@@ -20,7 +20,7 @@
 #include "framework/domain/domain.h"
 #include "framework/domain/metadomain.h"
 #include "framework/parameters/parameters.h"
-#include "kernels/currents_deposit.hpp"
+#include "kernels/deposit/currents_deposit.hpp"
 #include "kernels/digital_filter.hpp"
 
 namespace ntt {
