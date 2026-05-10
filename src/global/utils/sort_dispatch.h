@@ -68,7 +68,9 @@ namespace ntt::sort_helpers {
       "PermInitIota",
       n,
       KOKKOS_LAMBDA(const npart_t i) { perm_v(i) = i; });
+    Kokkos::fence("sort_by_key_dispatch BinSort: pre-sort");
     sorter.sort(perm);
+    Kokkos::fence("sort_by_key_dispatch BinSort: post-sort");
   }
 
 #if defined(SYCL_ENABLED) && defined(ONEDPL_ENABLED)
@@ -88,9 +90,13 @@ namespace ntt::sort_helpers {
       "PermInitIota",
       n,
       KOKKOS_LAMBDA(const npart_t i) { perm_v(i) = i; });
+    // Drain Kokkos's queue so oneDPL's policy sees the iota'd perm even
+    // if oneDPL submits to a different SYCL queue internally.
+    exec.fence("sort_by_key_dispatch OneDPL: pre-sort");
     auto queue  = exec.sycl_queue();
     auto policy = oneapi::dpl::execution::make_device_policy(queue);
     oneapi::dpl::sort_by_key(policy, keys_ptr, keys_ptr + n, perm_ptr);
+    exec.fence("sort_by_key_dispatch OneDPL: post-sort");
   }
 #endif
 
@@ -103,10 +109,12 @@ namespace ntt::sort_helpers {
     if (n == 0u) {
       return;
     }
+    Kokkos::fence("sort_by_key_dispatch Thrust: pre-sort");
     thrust::device_ptr<ncells_t> kp(keys.data());
     thrust::device_ptr<npart_t>  pp(perm.data());
     thrust::sequence(pp, pp + n);
     thrust::sort_by_key(kp, kp + n, pp);
+    Kokkos::fence("sort_by_key_dispatch Thrust: post-sort");
   }
 #endif
 

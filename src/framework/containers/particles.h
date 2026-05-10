@@ -292,12 +292,17 @@ namespace ntt {
      */
     void SortSpatially(const Grid<D>&);
 
-#if defined(TEAM_POLICY)
+#if defined(TEAM_POLICY) &&                                                    \
+  ((defined(SYCL_ENABLED) && defined(ONEDPL_ENABLED)) ||                       \
+   (defined(CUDA_ENABLED) && defined(THRUST_ENABLED)))
   private:
     /**
-     * @brief Apply a particle-index permutation to every SoA member array.
-     *        After return, particle p's data lives at SoA index p, where
-     *        the new ordering is sorted by `m_tile_layout`.
+     * @brief Apply a particle-index permutation (built by oneDPL/Thrust
+     *        sort_by_key) to every SoA member array. Sequential — one
+     *        transient buffer at a time, fenced before scope exit.
+     *        Only compiled when a vendor sort backend is enabled; the
+     *        BinSort path applies the permutation in place via
+     *        `sorter.sort(view)` instead.
      */
     void apply_permutation_to_soa(const prtl_perm_t& perm);
 

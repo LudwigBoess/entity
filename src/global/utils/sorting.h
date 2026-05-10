@@ -91,6 +91,15 @@ namespace sort {
 
     ncells_t ntx2 { 0u }, ntx3 { 0u };
     ncells_t total_tiles { 0u };
+    // Active-cell extents per axis. Used to clamp the bin key when
+    // UsePrev=true, since `i_prev` can be transiently negative after the
+    // pusher's periodic wrap (`i_prev -= ni`) or out-of-range after an
+    // MPI receive that hasn't translated frames. Without clamping, the
+    // signed-to-unsigned promotion in `int(-1) / uint32_t(T)` produces
+    // ~1.07e9, the linearised `tile_indices(p)` overflows past `n_bins`,
+    // and BinSort's internal `atomic_add(&bin_count[wild_idx], 1)`
+    // faults on an unmapped page.
+    int ncells1 { 1 }, ncells2 { 1 }, ncells3 { 1 };
 
     PositionToTileIndex(const array_t<int*>&         i1_,
                         const array_t<int*>&         i2_,
@@ -120,16 +129,19 @@ namespace sort {
                      "ncells size must match D",
                      HERE);
       if constexpr ((D == Dim::_1D) or (D == Dim::_2D) or (D == Dim::_3D)) {
+        ncells1       = static_cast<int>(ncells[0]);
         npart_t ntx1  = static_cast<ncells_t>(math::ceil(
           static_cast<double>(ncells[0]) / static_cast<double>(tile_size)));
         total_tiles  *= ntx1;
       }
       if constexpr ((D == Dim::_2D) or (D == Dim::_3D)) {
+        ncells2      = static_cast<int>(ncells[1]);
         ntx2         = static_cast<ncells_t>(math::ceil(
           static_cast<double>(ncells[1]) / static_cast<double>(tile_size)));
         total_tiles *= ntx2;
       }
       if constexpr (D == Dim::_3D) {
+        ncells3      = static_cast<int>(ncells[2]);
         ntx3         = static_cast<ncells_t>(math::ceil(
           static_cast<double>(ncells[2]) / static_cast<double>(tile_size)));
         total_tiles *= ntx3;
@@ -165,23 +177,36 @@ namespace sort {
       } else {
         // bin key per-axis: use min(i, i_prev) when UsePrev so that a
         // particle straddling a boundary lands in the lower tile.
+        // Then clamp to [0, ncells_axis - 1] — `i_prev` can be negative
+        // (after the pusher's periodic-wrap path: `i_prev -= ni`) or
+        // out-of-range (after MPI receive without frame translation).
+        // Without the clamp, signed-to-unsigned promotion in
+        // `int(-1) / uint32_t(T)` makes `tile_indices(p)` overflow far
+        // past `n_bins`, and BinSort's `atomic_add(&bin_count[bin],1)`
+        // faults on an unmapped page.
+        const auto clamp_axis = [](int v, int ncells) -> int {
+          return (v < 0) ? 0 : ((v >= ncells) ? (ncells - 1) : v);
+        };
         const auto key1 = [&]() -> int {
           if constexpr (UsePrev) {
-            return (i1(p) < i1_prev(p)) ? i1(p) : i1_prev(p);
+            const int raw = (i1(p) < i1_prev(p)) ? i1(p) : i1_prev(p);
+            return clamp_axis(raw, ncells1);
           } else {
             return i1(p);
           }
         }();
         const auto key2 = [&]() -> int {
           if constexpr (UsePrev) {
-            return (i2(p) < i2_prev(p)) ? i2(p) : i2_prev(p);
+            const int raw = (i2(p) < i2_prev(p)) ? i2(p) : i2_prev(p);
+            return clamp_axis(raw, ncells2);
           } else {
             return i2(p);
           }
         }();
         const auto key3 = [&]() -> int {
           if constexpr (UsePrev) {
-            return (i3(p) < i3_prev(p)) ? i3(p) : i3_prev(p);
+            const int raw = (i3(p) < i3_prev(p)) ? i3(p) : i3_prev(p);
+            return clamp_axis(raw, ncells3);
           } else {
             return i3(p);
           }

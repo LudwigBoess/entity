@@ -77,14 +77,6 @@ set(team_policy_tile_size
 set(team_policy_tile_sizes
   "4;8;12"
   CACHE STRING "team_policy tile-size choices")
-# Optional vendor sort libraries. "auto" enables when the library is
-# available for the selected Kokkos device.
-set(team_policy_onedpl
-  "auto"
-  CACHE STRING "Use oneDPL for sort_by_key on SYCL (auto/ON/OFF)")
-set(team_policy_thrust
-  "auto"
-  CACHE STRING "Use Thrust for sort_by_key on CUDA (auto/ON/OFF)")
 
 # -------------------------- Compilation settings -------------------------- #
 set(CMAKE_CXX_STANDARD 20)
@@ -175,37 +167,28 @@ if(${team_policy})
   add_compile_options("-D TEAM_POLICY")
   add_compile_options("-D TEAM_POLICY_TILE_SIZE=${team_policy_tile_size}")
 
-  # Try to enable oneDPL when SYCL is the active Kokkos device.
+  # Vendor sort: oneDPL on SYCL, Thrust on CUDA. Used automatically
+  # when found; falls back to Kokkos::BinSort otherwise.
   if("${Kokkos_DEVICES}" MATCHES "SYCL")
-    if(NOT team_policy_onedpl STREQUAL "OFF")
-      find_package(oneDPL QUIET)
-      if(oneDPL_FOUND)
-        message(STATUS "team_policy: oneDPL found, enabling SYCL sort_by_key")
-        add_compile_options("-D ONEDPL_ENABLED")
-        set(DEPENDENCIES ${DEPENDENCIES} oneDPL)
-      elseif(team_policy_onedpl STREQUAL "ON")
-        message(FATAL_ERROR
-          "${Red}team_policy_onedpl=ON requested but oneDPL not found.${ColorReset}")
-      else()
-        message(STATUS "team_policy: oneDPL not found; using BinSort fallback "
-                       "for SYCL sort_by_key")
-      endif()
+    find_package(oneDPL QUIET)
+    if(oneDPL_FOUND)
+      message(STATUS "team_policy: oneDPL found, enabling SYCL sort_by_key")
+      add_compile_options("-D ONEDPL_ENABLED")
+      set(DEPENDENCIES ${DEPENDENCIES} oneDPL)
+    else()
+      message(STATUS "team_policy: oneDPL not found; using BinSort fallback "
+                     "for SYCL sort_by_key")
     endif()
   endif()
 
-  # Try to enable Thrust when CUDA is the active Kokkos device. Thrust
-  # ships with the CUDA toolkit and is header-only, so usually no
-  # find_package is required.
   if("${Kokkos_DEVICES}" MATCHES "CUDA")
-    if(NOT team_policy_thrust STREQUAL "OFF")
-      find_package(Thrust QUIET)
-      if(Thrust_FOUND OR team_policy_thrust STREQUAL "ON")
-        message(STATUS "team_policy: Thrust enabled for CUDA sort_by_key")
-        add_compile_options("-D THRUST_ENABLED")
-      else()
-        message(STATUS "team_policy: Thrust not configured; using BinSort "
-                       "fallback for CUDA sort_by_key")
-      endif()
+    find_package(Thrust QUIET)
+    if(Thrust_FOUND)
+      message(STATUS "team_policy: Thrust enabled for CUDA sort_by_key")
+      add_compile_options("-D THRUST_ENABLED")
+    else()
+      message(STATUS "team_policy: Thrust not found; using BinSort fallback "
+                     "for CUDA sort_by_key")
     endif()
   endif()
 endif()
