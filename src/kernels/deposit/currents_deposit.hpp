@@ -925,21 +925,50 @@ namespace kernel {
    * owns particles `[tile_offsets(t), tile_offsets(t+1))`, post-sort.
    * `SortSpatially` (`particles_sort.cpp`) is responsible for keeping
    * the SoA arrays consistent with that.
+   *
+   * **Halo sizing and escape valve.** Sort runs at the end of the
+   * previous step (see `srpic.hpp`), so at deposit time the particle
+   * has already been pushed once — its `min(i, i_prev)` may differ
+   * from the bin key by up to one cell per step elapsed since the
+   * last sort. The scratch HALO is `STENCIL_REACH(O) +
+   * TEAM_POLICY_SORT_INTERVAL`, where `STENCIL_REACH = 2` for zigzag
+   * (writes `{i_prev, i_prev+1, i, i+1}` ⇒ +2 above `min(i, i_prev)`
+   * with `|Δi|=1`) and `O+1` for Esirkepov. If a particle's stencil
+   * still escapes the scratch tile, the deposit lambda silently falls
+   * back to a direct `Kokkos::atomic_add` on the global J view —
+   * correct (charge-conserving) but slower per write.
    */
   template <SimEngine::type S, MetricClass M, unsigned short O,
             unsigned short T_TILE>
   class DepositCurrents_kernel_tiled {
     static_assert(O <= 11u, "Shape order O must be <= 11");
     static_assert(T_TILE > 0u, "T_TILE must be positive");
+    static_assert(TEAM_POLICY_SORT_INTERVAL >= 1,
+                  "TEAM_POLICY_SORT_INTERVAL must be >= 1");
     static constexpr auto D = M::Dim;
-    // Per-side scratch halo. For Esirkepov (O >= 1) the stencil
-    // half-width + 1-cell drift gives O+1; the zigzag deposit (O==0)
-    // writes at most max(i, i_prev) + 1, which combined with 1-cell
-    // drift since last sort needs at least 2.
-    static constexpr int HALO = (static_cast<int>(O) + 1 > 2)
-                                  ? (static_cast<int>(O) + 1)
-                                  : 2;
-    static constexpr int TE   = static_cast<int>(T_TILE) + 2 * HALO;
+
+    // Per-side scratch halo, derived from first principles.
+    //
+    //   total halo = stencil_reach(O) + drift_between_sort_and_deposit
+    //
+    // stencil_reach(O) — maximum cells the deposit writes ABOVE
+    // min(i, i_prev) under CFL |v·dt/dx| ≤ 1/2:
+    //   - O == 0 (zigzag):  writes {i_prev, i_prev+1, i, i+1}  ⇒ +2
+    //   - O >= 1 Esirkepov: stencil width (O+2), worst case    ⇒ O+1
+    //
+    // drift — sort runs at end-of-step (see srpic.hpp), so a particle
+    // sees one pusher step before the *next* step's deposit even at
+    // `spatial_sorting_interval = 1`. Each additional skipped sort adds
+    // another cell of drift. `TEAM_POLICY_SORT_INTERVAL` is the
+    // compile-time upper bound on a species' runtime
+    // `spatial_sorting_interval`; `CallDepositKernelTiled` rejects
+    // species that exceed it.
+    static constexpr int STENCIL_REACH = (O == 0u)
+                                           ? 2
+                                           : (static_cast<int>(O) + 1);
+    static constexpr int DRIFT = static_cast<int>(TEAM_POLICY_SORT_INTERVAL);
+    static constexpr int HALO  = STENCIL_REACH + DRIFT;
+    static constexpr int TE    = static_cast<int>(T_TILE) + 2 * HALO;
 
     using exec_space   = Kokkos::DefaultExecutionSpace;
     using team_policy  = Kokkos::TeamPolicy<exec_space>;
@@ -1014,10 +1043,12 @@ namespace kernel {
         layout.tile_size != T_TILE,
         "Tiled deposit launched with mismatched T_TILE and runtime tile_size",
         HERE);
-      raise::ErrorIf(
-        (HALO > static_cast<int>(N_GHOSTS) + 1),
-        "Tile halo exceeds available J ghost storage",
-        HERE);
+      // Note: HALO is allowed to exceed N_GHOSTS. The cooperative
+      // scratch→J flush and the per-particle escape valve both bounds-clip
+      // their writes against `j_ext*` so writes that would land past J's
+      // ghost stripe are silently dropped (they only ever come from a
+      // particle whose stencil reaches into the domain ghost region, where
+      // CommunicateFields will re-supply the contribution).
       if constexpr (D == Dim::_1D || D == Dim::_2D || D == Dim::_3D) {
         j_ext1 = static_cast<int>(cur.extent(0));
       }
@@ -1088,6 +1119,7 @@ namespace kernel {
 
         const auto p_begin = tile_offsets(tile_id);
         const auto p_end   = tile_offsets(tile_id + 1u);
+        const int  e1_d    = j_ext1;
         Kokkos::parallel_for(
           Kokkos::TeamThreadRange(team, p_begin, p_end),
           [&](const npart_t p) {
@@ -1097,9 +1129,20 @@ namespace kernel {
               metric,
               charge,
               inv_dt,
+              // Escape valve: a particle whose stencil reaches past the
+              // tile's scratch (e.g. exceeded the compile-time
+              // STENCIL_REACH + DRIFT budget) falls back to a direct
+              // atomic_add on the global J view. Bounds-clipped against
+              // J's storage extent so writes past the domain ghost stripe
+              // are dropped (matches the cooperative flush below; those
+              // contributions are re-supplied by SynchronizeFields(J)).
               [&](int g_i1, int comp, real_t v) {
                 const int li = g_i1 - origin_J1_low;
-                Kokkos::atomic_add(&scr(li, comp), v);
+                if (li >= 0 && li < TE) {
+                  Kokkos::atomic_add(&scr(li, comp), v);
+                } else if (g_i1 >= 0 && g_i1 < e1_d) {
+                  Kokkos::atomic_add(&J(g_i1, comp), v);
+                }
               });
           });
         team.team_barrier();
@@ -1137,6 +1180,8 @@ namespace kernel {
 
         const auto p_begin = tile_offsets(tile_id);
         const auto p_end   = tile_offsets(tile_id + 1u);
+        const int  e1_d    = j_ext1;
+        const int  e2_d    = j_ext2;
         Kokkos::parallel_for(
           Kokkos::TeamThreadRange(team, p_begin, p_end),
           [&](const npart_t p) {
@@ -1146,10 +1191,16 @@ namespace kernel {
               metric,
               charge,
               inv_dt,
+              // See 1D branch for rationale.
               [&](int g_i1, int g_i2, int comp, real_t v) {
                 const int li = g_i1 - origin_J1_low;
                 const int lj = g_i2 - origin_J2_low;
-                Kokkos::atomic_add(&scr(li, lj, comp), v);
+                if (li >= 0 && li < TE && lj >= 0 && lj < TE) {
+                  Kokkos::atomic_add(&scr(li, lj, comp), v);
+                } else if (g_i1 >= 0 && g_i1 < e1_d && g_i2 >= 0 &&
+                           g_i2 < e2_d) {
+                  Kokkos::atomic_add(&J(g_i1, g_i2, comp), v);
+                }
               });
           });
         team.team_barrier();
@@ -1191,6 +1242,9 @@ namespace kernel {
 
         const auto p_begin = tile_offsets(tile_id);
         const auto p_end   = tile_offsets(tile_id + 1u);
+        const int  e1_d    = j_ext1;
+        const int  e2_d    = j_ext2;
+        const int  e3_d    = j_ext3;
         Kokkos::parallel_for(
           Kokkos::TeamThreadRange(team, p_begin, p_end),
           [&](const npart_t p) {
@@ -1200,11 +1254,18 @@ namespace kernel {
               metric,
               charge,
               inv_dt,
+              // See 1D branch for rationale.
               [&](int g_i1, int g_i2, int g_i3, int comp, real_t v) {
                 const int li = g_i1 - origin_J1_low;
                 const int lj = g_i2 - origin_J2_low;
                 const int lk = g_i3 - origin_J3_low;
-                Kokkos::atomic_add(&scr(li, lj, lk, comp), v);
+                if (li >= 0 && li < TE && lj >= 0 && lj < TE && lk >= 0 &&
+                    lk < TE) {
+                  Kokkos::atomic_add(&scr(li, lj, lk, comp), v);
+                } else if (g_i1 >= 0 && g_i1 < e1_d && g_i2 >= 0 &&
+                           g_i2 < e2_d && g_i3 >= 0 && g_i3 < e3_d) {
+                  Kokkos::atomic_add(&J(g_i1, g_i2, g_i3, comp), v);
+                }
               });
           });
         team.team_barrier();

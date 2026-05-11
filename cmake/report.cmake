@@ -150,6 +150,8 @@ if(${team_policy})
     "${Blue}"
     TEAM_POLICY_TILE_SIZE_REPORT
     46)
+  set(_tps_sort_interval_label
+      "  - Sort-interval [team_policy_sort_interval]: ${team_policy_sort_interval}")
 endif()
 printchoices(
   "Debug mode"
@@ -232,6 +234,7 @@ endif()
 string(APPEND REPORT_TEXT "  " ${TEAM_POLICY_REPORT} "\n")
 if(${team_policy})
   string(APPEND REPORT_TEXT "  " ${TEAM_POLICY_TILE_SIZE_REPORT} "\n")
+  string(APPEND REPORT_TEXT "${_tps_sort_interval_label}" "\n")
 endif()
 
 string(
