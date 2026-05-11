@@ -11,7 +11,7 @@
 #include "metrics/qspherical.h"
 #include "metrics/spherical.h"
 
-#include "kernels/currents_deposit.hpp"
+#include "kernels/deposit/currents_deposit.hpp"
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_ScatterView.hpp>

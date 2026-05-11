@@ -2,7 +2,8 @@
  * @file engines/srpic/currents.h
  * @brief Current deposition and filtering routines for the SRPIC engine
  * @implements
- *   - ntt::srpic::CallDepositKernel<> -> void
+ *   - ntt::srpic::CallDepositKernel<> -> void                 (flat path)
+ *   - ntt::srpic::CallDepositKernelTiled<> -> void            (TEAM_POLICY)
  *   - ntt::srpic::CurrentsDeposit<> -> void
  *   - ntt::srpic::CurrentsFilter<> -> void
  * @namespaces:
@@ -23,12 +24,18 @@
 #include "engines/srpic/utils.h"
 #include "framework/domain/domain.h"
 #include "framework/domain/metadomain.h"
-#include "kernels/currents_deposit.hpp"
+#include "kernels/deposit/currents_deposit.hpp"
 #include "kernels/digital_filter.hpp"
 
 namespace ntt {
   namespace srpic {
 
+    /**
+     * @brief Flat deposit launcher (RangePolicy + ScatterView). Always
+     *        compiled; used as the production path when `team_policy=OFF`
+     *        and as the `O==0` (zigzag) carve-out path when
+     *        `team_policy=ON`.
+     */
     template <SRMetricClass M, unsigned short O>
     void CallDepositKernel(const Particles<M::Dim, M::CoordType>& species,
                            const M&                               local_metric,
@@ -61,11 +68,165 @@ namespace ntt {
                              dt));
     }
 
+#if defined(TEAM_POLICY)
+    /**
+     * @brief Tiled deposit launcher (TeamPolicy + per-team scratch).
+     *
+     * Iterates over `tile_layout.ntiles_total` teams; each team accumulates
+     * its tile's particle contributions in SLM scratch and atomically
+     * flushes to the global J. Requires the species to have been sorted
+     * with `team_policy` enabled (`tile_layout` populated by
+     * `SortSpatially`).
+     *
+     * Falls back to the flat kernel if `tile_offsets` is empty — this
+     * happens on the first step before the first sort, or for very small
+     * species that exited early in `SortSpatially`. The fallback uses the
+     * passed-in `scatter_cur` so the caller still composes correctly.
+     */
+    template <SRMetricClass M, unsigned short O>
+    void CallDepositKernelTiled(
+      const Particles<M::Dim, M::CoordType>& species,
+      const M&                               local_metric,
+      const ndfield_t<M::Dim, 3>&            cur,
+      real_t                                 dt) {
+      static_assert(O <= 11u, "Shape order must be <= 11");
+      constexpr unsigned short T = static_cast<unsigned short>(
+        TEAM_POLICY_TILE_SIZE);
+      const auto& layout = species.tile_layout();
+      raise::ErrorIf(layout.ntiles_total == 0u,
+                     "CallDepositKernelTiled: tile_layout has 0 tiles — call "
+                     "SortSpatially before CurrentsDeposit",
+                     HERE);
+      raise::ErrorIf(layout.tile_offsets.extent(0) != layout.ntiles_total + 1u,
+                     "CallDepositKernelTiled: tile_offsets size inconsistent "
+                     "with ntiles_total",
+                     HERE);
+      // HALO is sized at compile time for a sort cadence of at most
+      // TEAM_POLICY_SORT_INTERVAL steps. A species sorted less often
+      // would routinely escape the scratch tile and pay the fallback
+      // J-atomic on every other particle — bump the CMake knob instead.
+      raise::ErrorIf(
+        species.spatial_sorting_interval() >
+          static_cast<timestep_t>(TEAM_POLICY_SORT_INTERVAL),
+        "CallDepositKernelTiled: species spatial_sorting_interval exceeds "
+        "the build-time team_policy_sort_interval; rebuild with a larger "
+        "-D team_policy_sort_interval=<N>",
+        HERE);
+
+      using kernel_t = kernel::DepositCurrents_kernel_tiled<SimEngine::SRPIC,
+                                                            M,
+                                                            O,
+                                                            T>;
+      kernel_t kern { cur,
+                      species.i1,
+                      species.i2,
+                      species.i3,
+                      species.i1_prev,
+                      species.i2_prev,
+                      species.i3_prev,
+                      species.dx1,
+                      species.dx2,
+                      species.dx3,
+                      species.dx1_prev,
+                      species.dx2_prev,
+                      species.dx3_prev,
+                      species.ux1,
+                      species.ux2,
+                      species.ux3,
+                      species.phi,
+                      species.weight,
+                      species.tag,
+                      local_metric,
+                      (real_t)(species.charge()),
+                      dt,
+                      layout };
+
+      Kokkos::TeamPolicy<> policy(static_cast<int>(layout.ntiles_total),
+                                  Kokkos::AUTO);
+      policy.set_scratch_size(0, Kokkos::PerTeam(kernel_t::scratch_bytes()));
+      Kokkos::parallel_for("CurrentsDepositTiled", policy, kern);
+    }
+#endif // TEAM_POLICY
+
     template <SRMetricClass M>
     void CurrentsDeposit(Domain<SimEngine::SRPIC, M>& domain,
                          const prm::Parameters&       engine_params) {
       const auto dt = engine_params.get<real_t>("dt");
       Kokkos::deep_copy(domain.fields.cur, ZERO);
+
+#if defined(TEAM_POLICY)
+      // Tiled path (Pattern A): per-tile SLM scratch + atomic_add into
+      // global J at flush. The premise — that flat scatter-view's
+      // `+=` is non-atomic on this device — is **false** on Kokkos SYCL,
+      // where ScatterView defaults to `ScatterNonDuplicated +
+      // ScatterAtomic` and each `J_acc(...) += v` is a global HBM
+      // `atomic_add`. Tiled wins by replacing those HBM atomics with
+      // SLM atomics for everything except the once-per-tile flush. The
+      // initial T_TILE=4 choice did not amortize team launch / scratch
+      // zero+flush across enough particles per tile (only ~4K with
+      // 64 ppc); T_TILE=8 (the current default) gives ~32K
+      // particles/tile and brings the deposit close to the L2-atomic
+      // RMW throughput floor.
+      //
+      // First-step fallback: if any contributing species has not been
+      // sorted yet (tile_layout still empty), fall back to the flat
+      // scatter-view path for that step. Subsequent steps see populated
+      // layouts and use the tiled kernel.
+      bool any_unsorted = false;
+      for (auto& species : domain.species) {
+        if ((species.pusher() == ParticlePusher::NONE) or
+            (species.npart() == 0) or cmp::AlmostZero_host(species.charge())) {
+          continue;
+        }
+        if (species.tile_layout().ntiles_total == 0u or
+            species.tile_layout().tile_offsets.extent(0) == 0u) {
+          any_unsorted = true;
+          break;
+        }
+      }
+      if (any_unsorted) {
+        auto scatter_cur = Kokkos::Experimental::create_scatter_view(
+          domain.fields.cur);
+        for (auto& species : domain.species) {
+          if ((species.pusher() == ParticlePusher::NONE) or
+              (species.npart() == 0) or cmp::AlmostZero_host(species.charge())) {
+            continue;
+          }
+          logger::Checkpoint(
+            fmt::format("Launching currents deposit (flat fallback, no sort yet) "
+                        "for %d [%s] : %lu %f",
+                        species.index(),
+                        species.label().c_str(),
+                        species.npart(),
+                        (double)species.charge()),
+            HERE);
+          CallDepositKernel<M, SHAPE_ORDER>(species,
+                                             domain.mesh.metric,
+                                             scatter_cur,
+                                             dt);
+        }
+        Kokkos::Experimental::contribute(domain.fields.cur, scatter_cur);
+      } else {
+        for (auto& species : domain.species) {
+          if ((species.pusher() == ParticlePusher::NONE) or
+              (species.npart() == 0) or cmp::AlmostZero_host(species.charge())) {
+            continue;
+          }
+          logger::Checkpoint(
+            fmt::format("Launching tiled currents deposit for %d [%s] : %lu %f",
+                        species.index(),
+                        species.label().c_str(),
+                        species.npart(),
+                        (double)species.charge()),
+            HERE);
+
+          CallDepositKernelTiled<M, SHAPE_ORDER>(species,
+                                                  domain.mesh.metric,
+                                                  domain.fields.cur,
+                                                  dt);
+        }
+      }
+#else
       auto scatter_cur = Kokkos::Experimental::create_scatter_view(
         domain.fields.cur);
       for (auto& species : domain.species) {
@@ -84,6 +245,7 @@ namespace ntt {
         CallDepositKernel<M, SHAPE_ORDER>(species, domain.mesh.metric, scatter_cur, dt);
       }
       Kokkos::Experimental::contribute(domain.fields.cur, scatter_cur);
+#endif
     }
 
     template <SRMetricClass M>

@@ -61,6 +61,27 @@ set(gpu_aware_mpi
   ${default_gpu_aware_mpi}
   CACHE BOOL "Enable GPU-aware MPI")
 
+# ----------------------------- team_policy -------------------------------- #
+# Pattern A: tile-blocked deposit + pusher running under Kokkos::TeamPolicy
+# with per-team scratch. Compile-time toggle (per design D-5). When ON,
+# SortSpatially also produces TileLayout metadata consumed by the tiled
+# kernels; the sort_by_key backend (oneDPL on SYCL, Thrust on CUDA,
+# Kokkos::BinSort otherwise) is selected at compile time from the active
+# Kokkos device.
+set(team_policy
+  ${default_team_policy}
+  CACHE BOOL "Enable team_policy tile-blocked deposit/pusher kernels")
+set(team_policy_tile_size
+  ${default_team_policy_tile_size}
+  CACHE STRING "team_policy tile edge length in cells")
+set(team_policy_tile_sizes
+  "4;8;12"
+  CACHE STRING "team_policy tile-size choices")
+set(team_policy_sort_interval
+  ${default_team_policy_sort_interval}
+  CACHE STRING
+  "Max spatial_sorting_interval (steps) the tiled deposit's HALO is sized for")
+
 # -------------------------- Compilation settings -------------------------- #
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -137,6 +158,49 @@ if(("${Kokkos_DEVICES}" MATCHES "CUDA")
   set(DEVICE_ENABLED ON)
 else()
   set(DEVICE_ENABLED OFF)
+endif()
+
+# ------------------------------ team_policy wiring ------------------------ #
+if(${team_policy})
+  list(FIND team_policy_tile_sizes "${team_policy_tile_size}" _tps_idx)
+  if(_tps_idx EQUAL -1)
+    message(FATAL_ERROR
+      "${Red}team_policy_tile_size must be one of ${team_policy_tile_sizes}, "
+      "got '${team_policy_tile_size}'${ColorReset}")
+  endif()
+  if(NOT team_policy_sort_interval MATCHES "^[1-9][0-9]*$")
+    message(FATAL_ERROR
+      "${Red}team_policy_sort_interval must be a positive integer, "
+      "got '${team_policy_sort_interval}'${ColorReset}")
+  endif()
+  add_compile_options("-D TEAM_POLICY")
+  add_compile_options("-D TEAM_POLICY_TILE_SIZE=${team_policy_tile_size}")
+  add_compile_options("-D TEAM_POLICY_SORT_INTERVAL=${team_policy_sort_interval}")
+
+  # Vendor sort: oneDPL on SYCL, Thrust on CUDA. Used automatically
+  # when found; falls back to Kokkos::BinSort otherwise.
+  if("${Kokkos_DEVICES}" MATCHES "SYCL")
+    find_package(oneDPL QUIET)
+    if(oneDPL_FOUND)
+      message(STATUS "team_policy: oneDPL found, enabling SYCL sort_by_key")
+      add_compile_options("-D ONEDPL_ENABLED")
+      set(DEPENDENCIES ${DEPENDENCIES} oneDPL)
+    else()
+      message(STATUS "team_policy: oneDPL not found; using BinSort fallback "
+                     "for SYCL sort_by_key")
+    endif()
+  endif()
+
+  if("${Kokkos_DEVICES}" MATCHES "CUDA")
+    find_package(Thrust QUIET)
+    if(Thrust_FOUND)
+      message(STATUS "team_policy: Thrust enabled for CUDA sort_by_key")
+      add_compile_options("-D THRUST_ENABLED")
+    else()
+      message(STATUS "team_policy: Thrust not found; using BinSort fallback "
+                     "for CUDA sort_by_key")
+    endif()
+  endif()
 endif()
 
 # MPI
