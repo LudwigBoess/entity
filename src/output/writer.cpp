@@ -330,6 +330,9 @@ namespace out {
     }
     auto output_field_h = Kokkos::create_mirror_view(output_field);
     Kokkos::deep_copy(output_field_h, output_field);
+    // Pin Host: see writers.cpp pin_host() — Aurora SYCL `Detect` mis-labels
+    // host VAs as GPU and BP5 dispatches stats kernels onto unmapped pages.
+    var.SetMemorySpace(adios2::MemorySpace::Host);
     writer.Put(var, output_field_h, adios2::Mode::Sync);
   }
 
@@ -362,6 +365,7 @@ namespace out {
                                      npart_t                 loc_offset,
                                      const std::string&      varname) {
     auto var = m_io.InquireVariable<real_t>(varname);
+    var.SetMemorySpace(adios2::MemorySpace::Host);
     var.SetShape({ glob_total });
     var.SetSelection(
       adios2::Box<adios2::Dims>({ loc_offset }, { array.extent(0) }));
@@ -373,6 +377,7 @@ namespace out {
   void Writer::writeSpectrum(const array_t<real_t*>& counts,
                              const std::string&      varname) {
     auto var      = m_io.InquireVariable<real_t>(varname);
+    var.SetMemorySpace(adios2::MemorySpace::Host);
     auto counts_h = Kokkos::create_mirror_view(counts);
     Kokkos::deep_copy(counts_h, counts);
 #if defined(MPI_ENABLED)
@@ -404,6 +409,7 @@ namespace out {
   void Writer::writeSpectrumBins(const array_t<real_t*>& e_bins,
                                  const std::string&      varname) {
     auto var      = m_io.InquireVariable<real_t>(varname);
+    var.SetMemorySpace(adios2::MemorySpace::Host);
     auto e_bins_h = Kokkos::create_mirror_view(e_bins);
     Kokkos::deep_copy(e_bins_h, e_bins);
 #if defined(MPI_ENABLED)
@@ -430,6 +436,8 @@ namespace out {
     // rebalanced) layout cached by setLocalLayout().
     auto varc = m_io.InquireVariable<real_t>("X" + std::to_string(dim + 1));
     auto vare = m_io.InquireVariable<real_t>("X" + std::to_string(dim + 1) + "e");
+    varc.SetMemorySpace(adios2::MemorySpace::Host);
+    vare.SetMemorySpace(adios2::MemorySpace::Host);
     // m_flds_l_corner_dwn / m_flds_l_shape_dwn are reversed for non-LayoutRight
     // (see defineMeshLayout / setLocalLayout); m_flds_l_corner / m_flds_l_shape
     // / m_flds_g_shape are not. Map the dim-order index to the dwn-array index.
@@ -456,6 +464,7 @@ namespace out {
     m_writer.Put(vare, xe_h, adios2::Mode::Sync);
     auto vard = m_io.InquireVariable<std::size_t>(
       "N" + std::to_string(dim + 1) + "l");
+    vard.SetMemorySpace(adios2::MemorySpace::Host);
     m_writer.Put(vard, loc_off_sz.data(), adios2::Mode::Sync);
   }
 
@@ -500,8 +509,16 @@ namespace out {
       m_mode   = adios2::Mode::Write;
       m_writer = m_io.Open(filename, m_mode);
       m_writer.BeginStep();
-      m_writer.Put(m_io.InquireVariable<timestep_t>("Step"), &tstep);
-      m_writer.Put(m_io.InquireVariable<simtime_t>("Time"), &time);
+      // Sync mode: tstep/time are local parameters that disappear when this
+      // function returns; a deferred Put would dangle until EndStep().
+      // Pin Host: see writers.cpp pin_host() — Aurora SYCL `Detect` mis-labels
+      // host scalar addresses as GPU.
+      auto step_var = m_io.InquireVariable<timestep_t>("Step");
+      auto time_var = m_io.InquireVariable<simtime_t>("Time");
+      step_var.SetMemorySpace(adios2::MemorySpace::Host);
+      time_var.SetMemorySpace(adios2::MemorySpace::Host);
+      m_writer.Put(step_var, &tstep, adios2::Mode::Sync);
+      m_writer.Put(time_var, &time, adios2::Mode::Sync);
       m_active_mode = write_mode;
     } catch (std::exception& e) {
       raise::Fatal(e.what(), HERE);

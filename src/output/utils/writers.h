@@ -50,6 +50,10 @@ namespace out {
                        std::size_t        global_size,
                        std::size_t        local_offset) {
     auto var = io.InquireVariable<T>(name);
+    // Pin to Host: see writers.cpp pin_host() comment — Aurora SYCL Detect
+    // mis-classifies host pointers as GPU and BP5 dispatches its stats
+    // kernel onto an unmapped page.
+    var.SetMemorySpace(adios2::MemorySpace::Host);
     var.SetShape({ global_size });
     var.SetSelection(adios2::Box<adios2::Dims>({ local_offset }, { local_size }));
 
