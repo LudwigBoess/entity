@@ -219,7 +219,7 @@ namespace ntt {
           shifts_in_x1, shifts_in_x2, shifts_in_x3,
           outgoing_indices,
           npart(), npart_alive, npart_dead, ntags(),
-          i1, i1_prev, 
+          i1, i1_prev,
           i2, i2_prev,
           i3, i3_prev,
           tag, tag_offsets)
@@ -252,8 +252,10 @@ namespace ntt {
                                             npart_recv * NPLDS_I };
     }
 
-    auto iteration        = 0;
-    auto current_received = 0;
+    // tag_offsets host mirror is invariant across directions; hoist once.
+    auto    tag_offsets_h    = Kokkos::create_mirror_view(tag_offsets);
+    Kokkos::deep_copy(tag_offsets_h, tag_offsets);
+    npart_t current_received = 0;
 
     for (const auto& direction : dirs_to_comm) {
       const auto send_rank     = send_ranks.at(direction);
@@ -280,9 +282,6 @@ namespace ntt {
                                               npart_send_in * NPLDS_I };
       }
 
-      auto tag_offsets_h = Kokkos::create_mirror_view(tag_offsets);
-      Kokkos::deep_copy(tag_offsets_h, tag_offsets);
-
       npart_t idx_offset = npart_dead;
       if (tag_send > 2) {
         idx_offset += tag_offsets_h(tag_send - 3);
@@ -304,11 +303,10 @@ namespace ntt {
       // clang-format on
 
 #if defined(DEVICE_ENABLED)
-      // One fence per direction covers all per-type prtls::communicate MPI ops
-      // below (int/real/prtldx/pld_r/pld_i) because they all read buffers
-      // written by the single PopulatePrtlSendBuffer kernel above, and no
-      // intervening kernel writes to them. Required on Intel PVC: GPU-aware
-      // MPI must observe a drained device queue before reading device buffers.
+      // Required on Intel PVC: GPU-aware MPI must observe completed kernels
+      // before reading device buffers. One fence per direction covers all
+      // per-type prtls::communicate calls below (they read the same set of
+      // buffers written by the kernel above, with no intervening kernel).
       Kokkos::fence();
 #endif
 
@@ -358,8 +356,6 @@ namespace ntt {
                                     recv_offset_pld_i);
       }
       current_received += npart_recv_in;
-      iteration++;
-
     } // end direction loop
 
     // clang-format off
