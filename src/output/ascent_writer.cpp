@@ -159,6 +159,21 @@ namespace out {
               look_at[0] += dx;
               writeVec3(child["look_at"], look_at);
             }
+            // 2D camera window-bounds [x0, x1, y0, y1]: translate the
+            // x-pair only, leaving y bounds untouched.
+            if (child.has_child("2d") &&
+                child["2d"].dtype().number_of_elements() == 4) {
+              auto& w = child["2d"];
+              if (w.dtype().is_float64()) {
+                auto a = w.as_float64_array();
+                a[0] += dx;
+                a[1] += dx;
+              } else if (w.dtype().is_float32()) {
+                auto a = w.as_float32_array();
+                a[0] = static_cast<conduit::float32>(a[0] + dx);
+                a[1] = static_cast<conduit::float32>(a[1] + dx);
+              }
+            }
           }
         }
         applyCameraTransforms(child, dx, theta);
