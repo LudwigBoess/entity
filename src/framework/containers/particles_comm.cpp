@@ -28,11 +28,8 @@ namespace ntt {
                    npart_t      nsend,
                    npart_t      nrecv,
                    npart_t      offset) {
-#if defined(DEVICE_ENABLED)
-      // guard for Intel GPUs.
-      // Should be a null-operation for other architectures.
-      Kokkos::fence();
-#endif
+      // Caller (Particles::Communicate) issues one Kokkos::fence per direction
+      // after PopulatePrtlSendBuffer. Required on Intel PVC for GPU-aware MPI.
 #if !defined(DEVICE_ENABLED) || defined(GPU_AWARE_MPI)
       MPI_Sendrecv(send_arr.data(),
                    nsend,
@@ -103,11 +100,7 @@ namespace ntt {
 
     template <typename T>
     void send(array_t<T*>& send_arr, int send_rank, npart_t nsend) {
-#if defined(DEVICE_ENABLED)
-      // guard for Intel GPUs.
-      // Should be a null-operation for other architectures.
-      Kokkos::fence();
-#endif
+      // Caller fences once per direction. Required on Intel PVC.
 #if !defined(DEVICE_ENABLED) || defined(GPU_AWARE_MPI)
       MPI_Send(send_arr.data(), nsend, mpi::get_type<T>(), send_rank, 0, MPI_COMM_WORLD);
 #else
@@ -119,11 +112,7 @@ namespace ntt {
 
     template <typename T>
     void recv(array_t<T*>& recv_arr, int recv_rank, npart_t nrecv, npart_t offset) {
-#if defined(DEVICE_ENABLED)
-      // guard for Intel GPUs.
-      // Should be a null-operation for other architectures.
-      Kokkos::fence();
-#endif
+      // Caller fences once per direction. Required on Intel PVC.
 #if !defined(DEVICE_ENABLED) || defined(GPU_AWARE_MPI)
       MPI_Recv(recv_arr.data() + offset,
                nrecv,
@@ -308,11 +297,20 @@ namespace ntt {
           i1, i1_prev, dx1, dx1_prev,
           i2, i2_prev, dx2, dx2_prev,
           i3, i3_prev, dx3, dx3_prev,
-          ux1, ux2, ux3, 
+          ux1, ux2, ux3,
           weight, phi, pld_r, pld_i, tag,
           outgoing_indices)
       );
       // clang-format on
+
+#if defined(DEVICE_ENABLED)
+      // One fence per direction covers all per-type prtls::communicate MPI ops
+      // below (int/real/prtldx/pld_r/pld_i) because they all read buffers
+      // written by the single PopulatePrtlSendBuffer kernel above, and no
+      // intervening kernel writes to them. Required on Intel PVC: GPU-aware
+      // MPI must observe a drained device queue before reading device buffers.
+      Kokkos::fence();
+#endif
 
       const auto recv_offset_int    = current_received * NINTS;
       const auto recv_offset_real   = current_received * NREALS;
