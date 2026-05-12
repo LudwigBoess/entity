@@ -262,6 +262,7 @@ namespace ntt {
       Nppc    = 13,
       V       = 14,
       Custom  = 15,
+      Shock   = 16,
     };
     using enum type;
     type val;
@@ -274,11 +275,12 @@ namespace ntt {
     static constexpr const char* label      = "out_flds";
     static constexpr type        variants[] = { E,      divE, D,    divD, B,
                                                 H,      J,    A,    T,    Rho,
-                                                Charge, N,    Nppc, V,    Custom };
+                                                Charge, N,    Nppc, V,    Custom,
+                                                Shock };
     static constexpr const char* lookup[] = { "e",    "dive", "d",      "divd",
                                               "b",    "h",    "j",      "a",
                                               "t",    "rho",  "charge", "n",
-                                              "nppc", "v",    "custom" };
+                                              "nppc", "v",    "custom", "shock" };
     static constexpr std::size_t total = sizeof(variants) / sizeof(variants[0]);
   };
 

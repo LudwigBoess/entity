@@ -15,7 +15,10 @@
 #include "framework/specialization_registry.h"
 #include "kernels/divergences.hpp"
 #include "kernels/fields_to_phys.hpp"
+#include "kernels/moment_filter.hpp"
 #include "kernels/particle_moments.hpp"
+#include "kernels/shock_finder.hpp"
+#include "kernels/shock_thin.hpp"
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_ScatterView.hpp>
@@ -28,11 +31,32 @@
 #endif // MPI_ENABLED
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <iterator>
 #include <string>
 #include <vector>
+
+namespace {
+  // Wall-clock accumulator (microseconds) for the shock-finder dispatch
+  // inside Metadomain::Write. The engine reads it via
+  // `ntt::takeShockFinderTimeUs()` after each Write call and feeds it
+  // into the timers map. Lives in an anonymous namespace because only
+  // the dispatch in this TU writes it; the public read-and-reset is
+  // exposed below.
+  duration_t g_shock_finder_us = 0.0;
+} // namespace
+
+namespace ntt {
+
+  auto takeShockFinderTimeUs() -> duration_t {
+    const auto v       = g_shock_finder_us;
+    g_shock_finder_us  = 0.0;
+    return v;
+  }
+
+}  // namespace ntt
 
 namespace ntt {
 
@@ -82,6 +106,24 @@ namespace ntt {
                custom_fields_to_write.begin(),
                custom_fields_to_write.end(),
                std::back_inserter(all_fields_to_write));
+    // Auto-register the shock detector pseudo-field whenever the user
+    // toggled the dedicated [output.shocks] block on. This avoids a
+    // redundant entry in `output.fields.quantities`.
+    if (params.template get<bool>("output.shocks.enable")) {
+      raise::ErrorIf(S != SimEngine::SRPIC,
+                     "output.shocks.enable currently requires SRPIC",
+                     HERE);
+      raise::ErrorIf(M::CoordType != Coord::Cartesian,
+                     "output.shocks.enable currently requires Cartesian metric",
+                     HERE);
+      const auto already = std::find(all_fields_to_write.begin(),
+                                     all_fields_to_write.end(),
+                                     std::string("shock")) !=
+                           all_fields_to_write.end();
+      if (not already) {
+        all_fields_to_write.emplace_back("shock");
+      }
+    }
     const auto species_to_write = params.template get<std::vector<spidx_t>>(
       "output.particles.species");
     g_writer.defineFieldOutputs(S, all_fields_to_write);
@@ -804,6 +846,339 @@ namespace ntt {
                                      fld.interp_flag | fld.prepare_flag,
                                      local_domain->mesh.metric));
             }
+          }
+        } else if (fld.is_shock() && fld.comp.size() == 5) {
+          // Shock detector --------------------------------------------------
+          // bckp is overwritten in stages: it serves as a scratch buffer for
+          // moment deposition / B interpolation / final shock-kernel output.
+          if constexpr (S != SimEngine::SRPIC) {
+            raise::Error("Shock detector currently requires SRPIC", HERE);
+          } else if constexpr (M::CoordType != Coord::Cartesian) {
+            raise::Error(
+              "Shock detector currently requires a Cartesian metric",
+              HERE);
+          } else {
+            // Wall-clock time inside Write that gets attributed to the
+            // ShockFinder timer in the engine's diagnostics. Output
+            // (which encloses Write) keeps overlapping coverage; this
+            // is reported separately under the ShockFinder line below
+            // Ascent. Kokkos::fence() before stamping the end time so
+            // the duration covers actual device work, not just kernel
+            // launches.
+            const auto t_sf_start = std::chrono::system_clock::now();
+            for (auto i = 0; i < 5; ++i) {
+              names.push_back(fld.name(i));
+              addresses.push_back(i);
+            }
+            const auto& mesh = local_domain->mesh;
+            // 1) deposit rho, V1, V2, V3, and trace T^ii into bckp[0..4]
+            ComputeMoments<S, M, FldsID::Rho>(params,
+                                              mesh,
+                                              local_domain->species,
+                                              fld.species,
+                                              {},
+                                              local_domain->fields.bckp,
+                                              0u);
+            for (auto c : { 1u, 2u, 3u }) {
+              ComputeMoments<S, M, FldsID::V>(
+                params,
+                mesh,
+                local_domain->species,
+                fld.species,
+                { static_cast<unsigned short>(c) },
+                local_domain->fields.bckp,
+                static_cast<idx_t>(c));
+            }
+            for (auto c : { 1u, 2u, 3u }) {
+              ComputeMoments<S, M, FldsID::T>(
+                params,
+                mesh,
+                local_domain->species,
+                fld.species,
+                { static_cast<unsigned short>(c),
+                  static_cast<unsigned short>(c) },
+                local_domain->fields.bckp,
+                4u);
+            }
+            SynchronizeFields(*local_domain, Comm::Bckp, { 0, 5 });
+
+            // 2) normalize V by rho; convert trace -> pressure
+            Kokkos::parallel_for(
+              "NormalizeVByRho",
+              mesh.rangeActiveCells(),
+              kernel::NormalizeVectorByRho_kernel<M::Dim, 6>(
+                local_domain->fields.bckp,
+                local_domain->fields.bckp,
+                0,
+                1,
+                2,
+                3));
+            {
+              auto bckp_v = local_domain->fields.bckp;
+              if constexpr (M::Dim == Dim::_1D) {
+                Kokkos::parallel_for(
+                  "ShockTraceToPressure",
+                  mesh.rangeActiveCells(),
+                  Lambda(index_t i1) {
+                    const real_t rho = bckp_v(i1, 0);
+                    const real_t v1  = bckp_v(i1, 1);
+                    const real_t v2  = bckp_v(i1, 2);
+                    const real_t v3  = bckp_v(i1, 3);
+                    const real_t tr  = bckp_v(i1, 4);
+                    bckp_v(i1, 4)    = THIRD *
+                                    (tr -
+                                     rho * (v1 * v1 + v2 * v2 + v3 * v3));
+                  });
+              } else if constexpr (M::Dim == Dim::_2D) {
+                Kokkos::parallel_for(
+                  "ShockTraceToPressure",
+                  mesh.rangeActiveCells(),
+                  Lambda(index_t i1, index_t i2) {
+                    const real_t rho = bckp_v(i1, i2, 0);
+                    const real_t v1  = bckp_v(i1, i2, 1);
+                    const real_t v2  = bckp_v(i1, i2, 2);
+                    const real_t v3  = bckp_v(i1, i2, 3);
+                    const real_t tr  = bckp_v(i1, i2, 4);
+                    bckp_v(i1, i2, 4) = THIRD *
+                                        (tr -
+                                         rho * (v1 * v1 + v2 * v2 + v3 * v3));
+                  });
+              } else if constexpr (M::Dim == Dim::_3D) {
+                Kokkos::parallel_for(
+                  "ShockTraceToPressure",
+                  mesh.rangeActiveCells(),
+                  Lambda(index_t i1, index_t i2, index_t i3) {
+                    const real_t rho = bckp_v(i1, i2, i3, 0);
+                    const real_t v1  = bckp_v(i1, i2, i3, 1);
+                    const real_t v2  = bckp_v(i1, i2, i3, 2);
+                    const real_t v3  = bckp_v(i1, i2, i3, 3);
+                    const real_t tr  = bckp_v(i1, i2, i3, 4);
+                    bckp_v(i1, i2, i3,
+                           4)        = THIRD *
+                                  (tr -
+                                   rho * (v1 * v1 + v2 * v2 + v3 * v3));
+                  });
+              }
+            }
+
+            // The deposit + SynchronizeFields step accumulates neighbour
+            // halo deposits into our active cells but leaves our ghost
+            // zones holding only local-particle fragments. The
+            // NormalizeVectorByRho + ShockTraceToPressure passes above
+            // ran on `rangeActiveCells()`, so our active cells now hold
+            // (rho, V_normalized, p) but the ghost cells still carry
+            // raw partial moments. Overwrite the ghosts with the
+            // neighbour's active edge values so any subsequent stencil
+            // that reads `bckp` over `[active ± stencil]` sees
+            // consistent data across rank boundaries.
+            CommunicateBckp(*local_domain, { 0, 5 });
+
+            // 3) optional binomial smoothing on bckp[0..4]
+            const auto smooth_passes = params.template get<unsigned short>(
+              "output.shocks.smooth_passes");
+            if (smooth_passes > 0) {
+              ndfield_t<M::Dim, 6> shock_filter_buf;
+              if constexpr (M::Dim == Dim::_1D) {
+                shock_filter_buf = ndfield_t<M::Dim, 6> {
+                  "shock_filter_buf",
+                  local_domain->fields.bckp.extent(0)
+                };
+              } else if constexpr (M::Dim == Dim::_2D) {
+                shock_filter_buf = ndfield_t<M::Dim, 6> {
+                  "shock_filter_buf",
+                  local_domain->fields.bckp.extent(0),
+                  local_domain->fields.bckp.extent(1)
+                };
+              } else if constexpr (M::Dim == Dim::_3D) {
+                shock_filter_buf = ndfield_t<M::Dim, 6> {
+                  "shock_filter_buf",
+                  local_domain->fields.bckp.extent(0),
+                  local_domain->fields.bckp.extent(1),
+                  local_domain->fields.bckp.extent(2)
+                };
+              }
+              for (auto pass = 0u; pass < smooth_passes; ++pass) {
+                DeepCopyFields<M::Dim, 6, 6>(local_domain->fields.bckp,
+                                             shock_filter_buf,
+                                             { 0, 5 },
+                                             { 0, 5 });
+                Kokkos::parallel_for(
+                  "ShockMomentFilter",
+                  mesh.rangeActiveCells(),
+                  kernel::MomentFilter_kernel<M::Dim, 6>(
+                    local_domain->fields.bckp,
+                    shock_filter_buf,
+                    0u,
+                    5u));
+                // Refresh ghosts with the freshly-smoothed neighbour
+                // active values before the next pass (or before the
+                // snapshot below).
+                CommunicateBckp(*local_domain, { 0, 5 });
+              }
+            }
+
+            // 4) snapshot moments into a separate buffer
+            ndfield_t<M::Dim, 5> moments_buf;
+            ndfield_t<M::Dim, 3> bcc_buf;
+            if constexpr (M::Dim == Dim::_1D) {
+              moments_buf = ndfield_t<M::Dim, 5> {
+                "shock_moments",
+                local_domain->fields.bckp.extent(0)
+              };
+              bcc_buf = ndfield_t<M::Dim, 3> {
+                "shock_bcc",
+                local_domain->fields.bckp.extent(0)
+              };
+            } else if constexpr (M::Dim == Dim::_2D) {
+              moments_buf = ndfield_t<M::Dim, 5> {
+                "shock_moments",
+                local_domain->fields.bckp.extent(0),
+                local_domain->fields.bckp.extent(1)
+              };
+              bcc_buf = ndfield_t<M::Dim, 3> {
+                "shock_bcc",
+                local_domain->fields.bckp.extent(0),
+                local_domain->fields.bckp.extent(1)
+              };
+            } else if constexpr (M::Dim == Dim::_3D) {
+              moments_buf = ndfield_t<M::Dim, 5> {
+                "shock_moments",
+                local_domain->fields.bckp.extent(0),
+                local_domain->fields.bckp.extent(1),
+                local_domain->fields.bckp.extent(2)
+              };
+              bcc_buf = ndfield_t<M::Dim, 3> {
+                "shock_bcc",
+                local_domain->fields.bckp.extent(0),
+                local_domain->fields.bckp.extent(1),
+                local_domain->fields.bckp.extent(2)
+              };
+            }
+            DeepCopyFields<M::Dim, 6, 5>(local_domain->fields.bckp,
+                                         moments_buf,
+                                         { 0, 5 },
+                                         { 0, 5 });
+
+            // 5) interpolate B from staggered faces to cell centers via bckp
+            Kokkos::deep_copy(local_domain->fields.bckp, ZERO);
+            list_t<idx_t, 3> b_from = { em::bx1, em::bx2, em::bx3 };
+            list_t<idx_t, 3> b_to   = { 0, 1, 2 };
+            Kokkos::parallel_for(
+              "ShockInterpB",
+              mesh.rangeActiveCells(),
+              kernel::FieldsToPhys_kernel<M, 6, 6>(
+                local_domain->fields.em,
+                local_domain->fields.bckp,
+                b_from,
+                b_to,
+                PrepareOutput::InterpToCellCenterFromFaces,
+                mesh.metric));
+            // FieldsToPhys writes the cell-centered B only into active
+            // cells, leaving ghost cells at zero. Use the active->ghost
+            // copy (NOT SynchronizeFields, which would accumulate) so
+            // the boundary stencil reads of `bcc_buf` agree with the
+            // neighbour's active B values.
+            CommunicateBckp(*local_domain, { 0, 3 });
+            DeepCopyFields<M::Dim, 6, 3>(local_domain->fields.bckp,
+                                         bcc_buf,
+                                         { 0, 3 },
+                                         { 0, 3 });
+
+            // 6) run the shock detector kernel into bckp[0..4]
+            Kokkos::deep_copy(local_domain->fields.bckp, ZERO);
+            const auto m_min = params.template get<real_t>(
+              "output.shocks.m_min");
+            const auto r_min = params.template get<real_t>(
+              "output.shocks.r_min");
+            const auto stencil = static_cast<int>(
+              params.template get<unsigned short>("output.shocks.stencil"));
+            const auto gamma = params.template get<real_t>(
+              "output.shocks.gamma");
+            const auto inv_b0_sq = params.template get<real_t>(
+              "output.shocks.inv_b0_sq");
+            const auto v_a_floor = params.template get<real_t>(
+              "output.shocks.v_a_floor");
+            const auto grad_p_floor = params.template get<real_t>(
+              "output.shocks.grad_p_floor");
+            const auto relativistic = params.template get<bool>(
+              "output.shocks.relativistic");
+            if (relativistic) {
+              Kokkos::parallel_for(
+                "ShockFinder",
+                mesh.rangeActiveCells(),
+                kernel::ShockFinder_kernel<M, true>(moments_buf,
+                                                    bcc_buf,
+                                                    local_domain->fields.bckp,
+                                                    m_min,
+                                                    r_min,
+                                                    stencil,
+                                                    gamma,
+                                                    inv_b0_sq,
+                                                    v_a_floor,
+                                                    grad_p_floor));
+            } else {
+              Kokkos::parallel_for(
+                "ShockFinder",
+                mesh.rangeActiveCells(),
+                kernel::ShockFinder_kernel<M, false>(moments_buf,
+                                                     bcc_buf,
+                                                     local_domain->fields.bckp,
+                                                     m_min,
+                                                     r_min,
+                                                     stencil,
+                                                     gamma,
+                                                     inv_b0_sq,
+                                                     v_a_floor,
+                                                     grad_p_floor));
+            }
+            // Make ghosts reflect the freshly-written shock outputs so
+            // the optional thinning pass can read neighbour `Ms` and
+            // `n̂` without seeing stale data.
+            CommunicateBckp(*local_domain, { 0, 5 });
+
+            // 7) optional Schaal-Springel surface thinning
+            if (params.template get<bool>("output.shocks.thin_surfaces")) {
+              ndfield_t<M::Dim, 6> shock_thin_buf;
+              if constexpr (M::Dim == Dim::_1D) {
+                shock_thin_buf = ndfield_t<M::Dim, 6> {
+                  "shock_thin_buf",
+                  local_domain->fields.bckp.extent(0)
+                };
+              } else if constexpr (M::Dim == Dim::_2D) {
+                shock_thin_buf = ndfield_t<M::Dim, 6> {
+                  "shock_thin_buf",
+                  local_domain->fields.bckp.extent(0),
+                  local_domain->fields.bckp.extent(1)
+                };
+              } else if constexpr (M::Dim == Dim::_3D) {
+                shock_thin_buf = ndfield_t<M::Dim, 6> {
+                  "shock_thin_buf",
+                  local_domain->fields.bckp.extent(0),
+                  local_domain->fields.bckp.extent(1),
+                  local_domain->fields.bckp.extent(2)
+                };
+              }
+              DeepCopyFields<M::Dim, 6, 6>(local_domain->fields.bckp,
+                                           shock_thin_buf,
+                                           { 0, 5 },
+                                           { 0, 5 });
+              Kokkos::parallel_for(
+                "ShockThinSurfaces",
+                mesh.rangeActiveCells(),
+                kernel::ShockThinSurfaces_kernel<M>(moments_buf,
+                                                    shock_thin_buf,
+                                                    local_domain->fields.bckp));
+              // writeField only emits active cells, but keep ghosts in
+              // sync for any downstream debug dump that does include
+              // them.
+              CommunicateBckp(*local_domain, { 0, 5 });
+            }
+            Kokkos::fence();
+            const auto t_sf_end = std::chrono::system_clock::now();
+            g_shock_finder_us += static_cast<duration_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                t_sf_end - t_sf_start)
+                .count());
           }
         } else if (fld.comp.size() == 6) { // tensor
           raise::ErrorIf(not fld.is_moment() or fld.id() != FldsID::T,

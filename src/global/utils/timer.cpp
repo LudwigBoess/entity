@@ -139,6 +139,7 @@ namespace timer {
     const std::vector<std::string> extras { "ParticleSort",
                                              "Output",
                                              "Ascent",
+                                             "ShockFinder",
                                              "Checkpoint" };
     const auto stats = gather(extras, npart, ncells);
     if (stats.empty()) {
@@ -266,6 +267,7 @@ namespace timer {
     const std::vector<TimerFlags> extras_f { Timer::PrintParticleSort,
                                              Timer::PrintOutput,
                                              Timer::PrintAscent,
+                                             Timer::PrintShockFinder,
                                              Timer::PrintCheckpoint };
     for (auto i { 0u }; i < extras.size(); ++i) {
       const auto& name    = extras[i];

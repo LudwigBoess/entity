@@ -90,6 +90,7 @@ namespace diag {
                         bool                            print_prtl_clear,
                         bool                            print_output,
                         bool                            print_ascent,
+                        bool                            print_shock_finder,
                         bool                            print_checkpoint,
                         bool                            print_colors) {
     DiagFlags  diag_flags  = Diag::Default;
@@ -108,6 +109,9 @@ namespace diag {
     }
     if (print_ascent) {
       timer_flags |= Timer::PrintAscent;
+    }
+    if (print_shock_finder) {
+      timer_flags |= Timer::PrintShockFinder;
     }
     if (print_checkpoint) {
       timer_flags |= Timer::PrintCheckpoint;

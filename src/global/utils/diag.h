@@ -37,6 +37,7 @@ namespace diag {
    * @param particlesort (if true, dead particles were removed)
    * @param output (if true, output was written)
    * @param ascent (if true, an Ascent frame was rendered)
+   * @param shock_finder (if true, the shock-finder dispatch ran this cycle)
    * @param checkpoint (if true, checkpoint was written)
    * @param colorful_print (if true, print with colors)
    */
@@ -50,6 +51,7 @@ namespace diag {
                         const std::vector<std::string>&,
                         const std::vector<npart_t>&,
                         const std::vector<npart_t>&,
+                        bool,
                         bool,
                         bool,
                         bool,

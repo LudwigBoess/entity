@@ -615,6 +615,81 @@
     #   @note: When specified, overrides `output.interval_time`
     interval_time = ""
 
+  [output.shocks]
+    # Toggle for the fluid shock-detector pseudo-field. When enabled, every
+    # field-output cycle deposits (rho, V_i, p) moments and computes a per-cell
+    # (Ms, MA, n1, n2, n3) tuple via a Schaal-Springel-style RH jump test. The
+    # five outputs are written under literal names `fMs`, `fMA`, `fSn1`,
+    # `fSn2`, `fSn3`. Non-shock cells are flagged by `fMs == 0` (and a zero
+    # normal); pure-hydrodynamic shocks are flagged by `fMA == 0 && fMs > 0`.
+    #   @type: bool
+    #   @default: false
+    #   @note: SRPIC + Cartesian only in the first iteration
+    enable = ""
+    # Sonic Mach threshold used to gate output. Cells with `Ms < m_min` are
+    # zeroed out.
+    #   @type: float
+    #   @default: 1.3
+    m_min = ""
+    # Density-jump threshold rho_post / rho_pre. Cells below this ratio are
+    # zeroed out (avoids tagging weak compressive features as shocks).
+    #   @type: float
+    #   @default: 1.5
+    r_min = ""
+    # Pre/post sampling stencil along the shock normal, in cells. The
+    # bilinear/trilinear interpolation may read up to `stencil + 1` cells
+    # beyond the active cell, so this must satisfy `stencil < N_GHOSTS`.
+    # Recall N_GHOSTS = (SHAPE_ORDER + 1) / 2 + 1, so a SHAPE_ORDER=2
+    # build (the typical default) gives N_GHOSTS = 2 and only allows
+    # `stencil = 1`. To use the original 2-cell stencil from the plan,
+    # rebuild with `-D shape_order >= 3`. Parameter validation fails fast
+    # at startup if the value is incompatible with the build.
+    #   @type: ushort
+    #   @default: 1
+    stencil = ""
+    # Extra binomial-filter passes applied to the deposited moments
+    # (rho, V_i, p) before the shock kernel runs. Each pass is a tensor-
+    # product (1, 2, 1)/4 binomial along each axis with a halo sync after
+    # every pass. Independent of `output.fields.mom_smooth`.
+    #   @type: ushort
+    #   @default: 2
+    smooth_passes = ""
+    # Schaal-Springel "shock surface" thinning: keep only the cell with the
+    # largest |grad p| along its normal direction. Useful to thin out the
+    # 2-cell-thick discontinuity that the centered-difference detector
+    # produces by default.
+    #   @type: bool
+    #   @default: false
+    thin_surfaces = ""
+    # When true, derive the sonic Mach number from the upstream shock-frame
+    # flow speed and the relativistic sound speed
+    #   c_s^2 = gamma * p / (rho + (gamma/(gamma-1)) * p)   (c = 1 code units)
+    # When false, use the classical pressure-ratio Rankine-Hugoniot form.
+    # The two forms agree in the v << c limit; the relativistic form is
+    # numerically better-behaved when p ~ rho c^2.
+    #   @type: bool
+    #   @default: false
+    relativistic = ""
+    # Below this Alfven speed (in code units) `MA` is set to 0 to flag
+    # pure-hydrodynamic shocks downstream (`fMA == 0 && fMs > 0`).
+    #   @type: float
+    #   @default: 1e-6
+    v_a_floor = ""
+    # |grad p| floor below which the cell is treated as not having a
+    # well-defined shock normal.
+    #   @type: float
+    #   @default: 1e-12
+    grad_p_floor = ""
+    # Adiabatic index used in the RH jump relation.
+    #   @type: float
+    #   @default: 5/3
+    gamma = ""
+    # 1/(mu_0 * B0^2) factor in the user's normalization. Multiplied into
+    # the upstream Alfven speed `v_A = sqrt(B^2 * inv_b0_sq / rho)`.
+    #   @type: float
+    #   @default: 1.0
+    inv_b0_sq = ""
+
   [output.debug]
     # Output fields "as is" without conversions
     #   @type: bool

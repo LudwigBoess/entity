@@ -56,12 +56,15 @@ namespace out {
     } else if (id() == FldsID::V) {
       // energy-momentum tensor
       comp = InterpretComponents({ name.substr(1, 1) });
+    } else if (is_shock()) {
+      // five named outputs: Ms, MA, Sn1, Sn2, Sn3 (see name(ci) override)
+      comp = { { 0 }, { 1 }, { 2 }, { 3 }, { 4 } };
     } else {
       // scalar (Rho, divE, Custom, etc.)
       comp = {};
     }
     // data preparation flags
-    if (not(is_moment() or is_custom() or is_divergence())) {
+    if (not(is_moment() or is_custom() or is_divergence() or is_shock())) {
       if (S == SimEngine::SRPIC) {
         prepare_flag = PrepareOutput::ConvertToHat;
       } else {
@@ -75,7 +78,8 @@ namespace out {
     } else if (is_field() || is_gr_aux_field()) {
       interp_flag = PrepareOutput::InterpToCellCenterFromFaces;
     } else if (
-      not(is_moment() || is_vpotential() || is_divergence() || is_custom())) {
+      not(is_moment() || is_vpotential() || is_divergence() || is_custom() ||
+          is_shock())) {
       raise::Error("Unrecognized field type for output", HERE);
     }
   }

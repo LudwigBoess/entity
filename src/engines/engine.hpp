@@ -249,7 +249,7 @@ namespace ntt {
        "ParticleBoundaries", "Communications",
        "Injector", "Custom",
        "ParticleSort", "Output",
-       "Ascent", "Checkpoint" },
+       "Ascent", "ShockFinder", "Checkpoint" },
       []() {
         Kokkos::fence();
        },
@@ -287,6 +287,7 @@ namespace ntt {
       auto print_output     = false;
       auto print_ascent     = false;
       auto print_checkpoint = false;
+      auto print_shock_finder = false;
 #if defined(OUTPUT_ENABLED)
       timers.start("Output");
       if constexpr (
@@ -330,6 +331,13 @@ namespace ntt {
                                                 time - dt);
       }
       timers.stop("Output");
+      // Drain the in-Write shock-finder accumulator into a dedicated
+      // ShockFinder timer slot. The time is also (still) part of Output,
+      // so the two overlap by design — this just reports the shock-
+      // finder contribution separately below the Ascent line.
+      const auto sf_us = takeShockFinderTimeUs();
+      timers.add("ShockFinder", sf_us);
+      print_shock_finder = sf_us > 0.0;
 
 #if defined(ASCENT_ENABLED)
       timers.start("Ascent");
@@ -364,6 +372,7 @@ namespace ntt {
           print_prtl_clear,
           print_output,
           print_ascent,
+          print_shock_finder,
           print_checkpoint,
           m_params.get<bool>("diagnostics.colored_stdout"));
       }

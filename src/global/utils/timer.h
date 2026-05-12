@@ -99,6 +99,17 @@ namespace timer {
       m_timers[name].second = 0.0;
     }
 
+    // Inject an externally-measured duration (in microseconds) into a
+    // named accumulator. Useful when the work being timed lives behind
+    // a coarser-grained timer — e.g. the shock-finder dispatch inside
+    // Metadomain::Write, which the engine cannot wrap directly.
+    void add(const std::string& name, duration_t microseconds) {
+      raise::ErrorIf(m_timers.find(name) == m_timers.end(),
+                     "Timer not found",
+                     HERE);
+      m_timers[name].second += microseconds;
+    }
+
     void resetAll() {
       for (auto& [name, _] : m_timers) {
         reset(name);

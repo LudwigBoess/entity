@@ -47,6 +47,18 @@ namespace ntt {
       std::optional<bool>                      fields_mom_window;
       std::optional<std::vector<unsigned int>> fields_downsampling;
 
+      std::optional<bool>           shocks_enable;
+      std::optional<real_t>         shocks_m_min;
+      std::optional<real_t>         shocks_r_min;
+      std::optional<unsigned short> shocks_stencil;
+      std::optional<unsigned short> shocks_smooth_passes;
+      std::optional<bool>           shocks_thin_surfaces;
+      std::optional<bool>           shocks_relativistic;
+      std::optional<real_t>         shocks_v_a_floor;
+      std::optional<real_t>         shocks_grad_p_floor;
+      std::optional<real_t>         shocks_gamma;
+      std::optional<real_t>         shocks_inv_b0_sq;
+
       std::optional<std::vector<spidx_t>> particles_species;
       std::optional<npart_t>              particles_stride;
 

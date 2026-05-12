@@ -83,6 +83,11 @@ namespace out {
     }
 
     [[nodiscard]]
+    auto is_shock() const -> bool {
+      return (id() == FldsID::Shock);
+    }
+
+    [[nodiscard]]
     auto name() const -> std::string {
       // generate the name
       std::string tmp;
@@ -129,6 +134,19 @@ namespace out {
         comp[ci].empty(),
         "OutputField::name(ci) called but no components were available",
         HERE);
+      // shock outputs use literal names rather than indexed components
+      if (is_shock()) {
+        static constexpr const char* shock_labels[] = { "fMs",
+                                                        "fMA",
+                                                        "fSn1",
+                                                        "fSn2",
+                                                        "fSn3" };
+        raise::ErrorIf(
+          ci >= sizeof(shock_labels) / sizeof(shock_labels[0]),
+          "OutputField::name(ci) called with invalid shock component index",
+          HERE);
+        return shock_labels[ci];
+      }
       // generate the name
       auto tmp = std::string(id().to_string());
       for (auto& c : comp[ci]) {

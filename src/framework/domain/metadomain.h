@@ -58,6 +58,15 @@
 
 namespace ntt {
 
+  // Drain the shock-finder elapsed-time accumulator. The shock-finder
+  // dispatch lives inside `Metadomain::Write` and timestamps its work
+  // into a TU-local accumulator; the engine queries this after the
+  // Output timer stops and feeds the value into a dedicated
+  // `ShockFinder` timer slot. Returns 0 when no shock-finder dispatch
+  // ran since the last call (e.g. on cycles without a field-output
+  // write, or when `output.shocks.enable = false`).
+  auto takeShockFinderTimeUs() -> duration_t;
+
   template <SimEngine::type S, MetricClass M>
   struct Metadomain {
     static constexpr Dimension D { M::Dim };
@@ -100,6 +109,24 @@ namespace ntt {
     void SynchronizeFields(Domain<S, M>&,
                            CommTags,
                            const range_tuple_t& = { 0, 0 }) const;
+    /**
+     * @brief Fill the local ghost zones of `Domain::fields::bckp` from the
+     *        neighbouring ranks' active edge cells (active -> ghost copy).
+     *
+     * `SynchronizeFields(Comm::Bckp, …)` is an *accumulating* exchange used
+     * when aggregating particle deposits across MPI boundaries; it leaves
+     * the local ghost zones holding only this rank's local-particle
+     * fragments (or whatever scratch state the dispatch left behind). This
+     * routine instead overwrites the local ghosts with the neighbour's
+     * active edge values, so a downstream stencil that reads `bckp` over
+     * `[active ± stencil]` sees consistent data across rank boundaries.
+     *
+     * @param domain      target subdomain
+     * @param components  half-open slice of the last dimension of `bckp`
+     *                    to copy (e.g. `{0, 5}` for the shock-finder
+     *                    moments).
+     */
+    void CommunicateBckp(Domain<S, M>&, const range_tuple_t&) const;
 #if defined(MPI_ENABLED) && defined(OUTPUT_ENABLED)
     void CommunicateVectorPotential(unsigned short);
 #endif

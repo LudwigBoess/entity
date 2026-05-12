@@ -117,6 +117,81 @@ namespace ntt {
           }
         }
       }
+      /* Shocks --------------------------------------------------------------- */
+      shocks_enable        = toml::find_or(toml_data,
+                                    "output",
+                                    "shocks",
+                                    "enable",
+                                    false);
+      shocks_m_min         = toml::find_or<real_t>(toml_data,
+                                           "output",
+                                           "shocks",
+                                           "m_min",
+                                           static_cast<real_t>(1.3));
+      shocks_r_min         = toml::find_or<real_t>(toml_data,
+                                           "output",
+                                           "shocks",
+                                           "r_min",
+                                           static_cast<real_t>(1.5));
+      shocks_stencil       = toml::find_or<unsigned short>(toml_data,
+                                                     "output",
+                                                     "shocks",
+                                                     "stencil",
+                                                     1u);
+      // The shock-finder kernel reads cells in [-stencil-1, +stencil+1]
+      // around each active cell during bilinear/trilinear sampling. That
+      // footprint must fit inside the synchronized halo, i.e.
+      // `stencil < N_GHOSTS` where
+      //   N_GHOSTS = (SHAPE_ORDER + 1) / 2 + 1.
+      // A typical SHAPE_ORDER=2 build gives N_GHOSTS=2 and thus only
+      // permits stencil = 1. Rebuild with `-D shape_order >= 3` if you
+      // want the original 2-cell stencil from the plan.
+      if (shocks_enable.value()) {
+        raise::ErrorIf(
+          shocks_stencil.value() >= static_cast<unsigned short>(ntt::N_GHOSTS),
+          "output.shocks.stencil (=" +
+            std::to_string(shocks_stencil.value()) +
+            ") must be < N_GHOSTS (=" + std::to_string(ntt::N_GHOSTS) +
+            "); lower output.shocks.stencil or rebuild entity with a "
+            "larger -D shape_order",
+          HERE);
+      }
+      shocks_smooth_passes = toml::find_or<unsigned short>(toml_data,
+                                                           "output",
+                                                           "shocks",
+                                                           "smooth_passes",
+                                                           2u);
+      shocks_thin_surfaces = toml::find_or(toml_data,
+                                           "output",
+                                           "shocks",
+                                           "thin_surfaces",
+                                           false);
+      shocks_relativistic  = toml::find_or(toml_data,
+                                          "output",
+                                          "shocks",
+                                          "relativistic",
+                                          false);
+      shocks_v_a_floor     = toml::find_or<real_t>(toml_data,
+                                               "output",
+                                               "shocks",
+                                               "v_a_floor",
+                                               static_cast<real_t>(1.0e-6));
+      shocks_grad_p_floor  = toml::find_or<real_t>(toml_data,
+                                                  "output",
+                                                  "shocks",
+                                                  "grad_p_floor",
+                                                  static_cast<real_t>(1.0e-12));
+      shocks_gamma         = toml::find_or<real_t>(toml_data,
+                                           "output",
+                                           "shocks",
+                                           "gamma",
+                                           static_cast<real_t>(5.0 / 3.0));
+      shocks_inv_b0_sq     = toml::find_or<real_t>(toml_data,
+                                               "output",
+                                               "shocks",
+                                               "inv_b0_sq",
+                                               static_cast<real_t>(1.0));
+
       raise::ErrorIf(fields_downsampling->size() > 3,
                      "invalid `output.fields.downsampling`",
                      HERE);
@@ -207,6 +282,18 @@ namespace ntt {
       params->set("output.fields.mom_smooth", fields_mom_smooth.value());
       params->set("output.fields.mom_window", fields_mom_window.value());
       params->set("output.fields.downsampling", fields_downsampling.value());
+
+      params->set("output.shocks.enable", shocks_enable.value());
+      params->set("output.shocks.m_min", shocks_m_min.value());
+      params->set("output.shocks.r_min", shocks_r_min.value());
+      params->set("output.shocks.stencil", shocks_stencil.value());
+      params->set("output.shocks.smooth_passes", shocks_smooth_passes.value());
+      params->set("output.shocks.thin_surfaces", shocks_thin_surfaces.value());
+      params->set("output.shocks.relativistic", shocks_relativistic.value());
+      params->set("output.shocks.v_a_floor", shocks_v_a_floor.value());
+      params->set("output.shocks.grad_p_floor", shocks_grad_p_floor.value());
+      params->set("output.shocks.gamma", shocks_gamma.value());
+      params->set("output.shocks.inv_b0_sq", shocks_inv_b0_sq.value());
 
       params->set("output.particles.species", particles_species.value());
       params->set("output.particles.stride", particles_stride.value());

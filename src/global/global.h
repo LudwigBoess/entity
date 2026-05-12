@@ -231,7 +231,7 @@ namespace PrepareOutput {
 using PrepareOutputFlags = uint8_t;
 
 namespace Timer {
-  enum TimerFlags_ : uint8_t {
+  enum TimerFlags_ : uint16_t {
     None              = 0,
     PrintTotal        = 1 << 0,
     PrintTitle        = 1 << 1,
@@ -241,11 +241,12 @@ namespace Timer {
     PrintCheckpoint   = 1 << 5,
     PrintNormed       = 1 << 6,
     PrintAscent       = 1 << 7,
+    PrintShockFinder  = 1 << 8,
     Default           = PrintNormed | PrintTotal | PrintTitle | AutoConvert,
   };
 } // namespace Timer
 
-using TimerFlags = uint8_t;
+using TimerFlags = uint16_t;
 
 namespace Diag {
   enum DiagFlags_ : uint8_t {
