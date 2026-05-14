@@ -100,6 +100,12 @@ namespace ntt {
     void SynchronizeFields(Domain<S, M>&,
                            CommTags,
                            const cell_range_t& = { 0, 0 }) const;
+    // active->ghost copy on `fields.bckp`. SynchronizeFields(Comm::Bckp,...)
+    // is additive (deposit aggregation) and leaves bckp ghost cells in an
+    // undefined state. Visualization paths that publish a halo need the
+    // ghost layer to reflect the neighbor's active value; call this after
+    // the bckp content for the requested components has been finalized.
+    void CommunicateBckp(Domain<S, M>&, const cell_range_t&) const;
 #if defined(MPI_ENABLED) && defined(OUTPUT_ENABLED)
     void CommunicateVectorPotential(unsigned short);
 #endif

@@ -175,7 +175,6 @@ namespace kernel {
 
       const real_t coeff { weight(p) * charge };
 
-      // ToDo: interpolation_order as parameter
       if constexpr (O == 0u) {
         /*
           Zig-zag deposit

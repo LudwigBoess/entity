@@ -35,6 +35,7 @@
     #include <mpi.h>
   #endif
 
+  #include <cstdint>
   #include <string>
   #include <vector>
 
@@ -79,6 +80,19 @@ namespace out {
     std::vector<std::size_t> m_l_corner;
     std::vector<std::size_t> m_l_first_cell;
     std::vector<std::size_t> m_downsample;
+    // When > 0, switch the publish path from cell-centered values over
+    // `n^D` cells to vertex-centered values over `(n+1)^D` vertices.
+    // Each boundary vertex is the average of the 8 (3D) / 4 (2D) / 2
+    // (1D) surrounding cells; that stencil reaches one cell into each
+    // neighbor's active region, so the caller must populate the field's
+    // ghost layer of width 1 via `Metadomain::CommunicateBckp` before
+    // publish. Both ranks sharing a face see the same 8 cells and
+    // therefore compute identical values at the shared vertex —
+    // VTK-m's per-cell linear interpolation is then C0 continuous
+    // across rank seams and the inter-rank seam disappears from the
+    // volume render. The numeric value carries no further meaning;
+    // 1 is the only width supported and is treated as a boolean flag.
+    std::size_t              m_halo_cells { 0u };
     std::string              m_root;
     std::string              m_actions_file;
     std::vector<std::string> m_fields;
@@ -143,12 +157,22 @@ namespace out {
      *        published cell within the local domain. Empty defaults to zeros.
      * @param downsample Per-axis stride applied when sampling the original
      *        full-resolution field. Empty defaults to ones (no downsampling).
+     * @param halo_cells When non-zero, switches the publish path to
+     *        vertex association (`(n+1)^D` vertex values; coordinates
+     *        provided by the caller must have length `l_shape[d] + 1`
+     *        per axis). The boundary vertex stencil reaches one cell
+     *        into the neighbor, so the caller must ensure the field's
+     *        ghost layer of width 1 holds the neighbor's first active
+     *        cell (use `Metadomain::CommunicateBckp`). Must be 0 unless
+     *        `downsample` is all-ones — the numeric value is treated as
+     *        a boolean flag and only 1 is supported.
      */
     void defineMesh(Dimension                       dim,
                     const std::vector<std::size_t>& l_corner,
                     const std::vector<std::size_t>& l_shape,
                     const std::vector<std::size_t>& l_first_cell = {},
-                    const std::vector<std::size_t>& downsample   = {});
+                    const std::vector<std::size_t>& downsample   = {},
+                    std::size_t                     halo_cells   = 0u);
 
     /**
      * @brief Set the cell-edge coordinate arrays for one dimension.
@@ -165,6 +189,25 @@ namespace out {
     void publishField(const std::string&     name,
                       const ndfield_t<D, N>& fld,
                       std::size_t            comp);
+
+    /**
+     * @brief Publish a synthetic per-vertex `x + y + z` scalar field
+     *        named `smooth_xyz`, computed from the coordinates already
+     *        registered via `setMeshCoords`.
+     *
+     * Diagnostic for inter-rank seam debugging: this field is
+     * continuous by construction (same physical position → same value
+     * on every rank that shares a vertex), bypassing the entire
+     * physics + bckp + halo pipeline. If a volume render of
+     * `smooth_xyz` still shows the rank-decomposition lattice, the
+     * issue is in the renderer's multi-domain compositing, not in the
+     * publish path.
+     *
+     * No-op outside of vertex-association mode (`halo_cells > 0`),
+     * since the diagnostic is only meaningful when the publish path
+     * is supposed to be continuous across rank boundaries.
+     */
+    void publishSmoothXyzDiagnostic();
 
     /**
      * @brief Trigger the Ascent pipeline for the current step.

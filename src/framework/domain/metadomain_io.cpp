@@ -165,7 +165,29 @@ namespace ntt {
         first_cell[d] = first;
         shape[d]      = (n - first + s - 1) / s;
       }
-      g_ascent_writer.defineMesh(M::Dim, corner, shape, first_cell, downsample);
+      // Switch to vertex-association publishing when no downsampling is
+      // requested. The writer then publishes (n+1)^D vertex values per
+      // rank, with each boundary vertex averaged over the 8/4/2 cells
+      // straddling it (one cell of each pulled from the neighbor via
+      // `CommunicateBckp`). Shared vertices between ranks carry
+      // identical values, killing the inter-rank seam in VTK-m volume
+      // renders. With downsample > 1 we fall back to plain cell-
+      // centered publish — seams reappear but downsampling already
+      // reduces their visual impact.
+      bool all_dwn_one = true;
+      for (auto s : downsample) {
+        if (s != 1u) {
+          all_dwn_one = false;
+          break;
+        }
+      }
+      const std::size_t halo_cells = all_dwn_one ? 1u : 0u;
+      g_ascent_writer.defineMesh(M::Dim,
+                                 corner,
+                                 shape,
+                                 first_cell,
+                                 downsample,
+                                 halo_cells);
     }
 #endif
   }
@@ -546,8 +568,12 @@ namespace ntt {
         }
 
 #if defined(ASCENT_ENABLED)
-        // Ascent edge coordinates: must match the per-axis downsampling
-        // applied in publishField (defineMesh stored the same factors).
+        // Ascent coordinates: vertex-association mode publishes (n+1)
+        // vertex positions per axis (cell-edge indices [0, l_size]) and
+        // the writer averages 8/4/2 cells around each vertex to a
+        // vertex value. Cell-association mode (with downsample > 1)
+        // publishes n_dwn cell positions — one cell-centered value per
+        // edge pair.
         if (render_ascent && g_ascent_writer.initialized()) {
           const auto a_dwn = params.template get<std::vector<unsigned int>>(
             "output.ascent.downsample");
@@ -559,19 +585,33 @@ namespace ntt {
           const std::size_t n_dwn = (l_size > first)
                                       ? (l_size - first + s - 1) / s
                                       : 0u;
-          const std::size_t nedges = n_dwn + 1;
+          const bool        vertex_mode = (s == 1u);
+          const std::size_t nedges      = vertex_mode ? (l_size + 1u)
+                                                      : (n_dwn + 1u);
           const array_t<real_t*> xe_full { "Xe_ascent", nedges };
           const auto&            metric_a = local_domain->mesh.metric;
-          // i in [0, n_dwn) maps to local cell-edge index `first + i*s`;
-          // the final edge (i == n_dwn) is clamped to the rank's right
-          // boundary (`l_size`) so neighboring ranks share an edge at the
-          // domain interface even when (l_size - first) % s != 0.
+          // Vertex mode: edge i is at local cell-edge index `i`
+          // (i.e. vertex `i` for i in [0, l_size]).
+          // Cell mode: edge i (i in [0, n_dwn]) is at local cell-edge
+          // index `first + i * s`, clamped to `l_size` for i == n_dwn
+          // so neighboring ranks share an edge at the domain interface.
+          const long int first_l  = static_cast<long int>(first);
+          const long int s_l      = static_cast<long int>(s);
+          const long int n_dwn_l  = static_cast<long int>(n_dwn);
+          const long int l_size_l = static_cast<long int>(l_size);
           Kokkos::parallel_for(
             "GenerateMeshAscent",
             nedges,
             Lambda(cellidx_t i) {
-              const std::size_t idx = (i == n_dwn) ? l_size
-                                                   : (first + i * s);
+              const long int il = static_cast<long int>(i);
+              long int       idx;
+              if (vertex_mode) {
+                idx = il;
+              } else if (il == n_dwn_l) {
+                idx = l_size_l;
+              } else {
+                idx = first_l + il * s_l;
+              }
               const auto      i_   = static_cast<real_t>(idx);
               coord_t<M::Dim> x_Cd { ZERO }, x_Ph { ZERO };
               x_Cd[dim] = i_;
@@ -583,6 +623,16 @@ namespace ntt {
         }
 #endif
       }
+#if defined(ASCENT_ENABLED)
+      // Diagnostic: publish a per-vertex `x + y + z` scalar that is
+      // continuous by construction across rank boundaries. Lets us
+      // tell whether residual lattice artefacts in physics renders
+      // come from our publish path or from the renderer itself.
+      // No-op when vertex-mode is off.
+      if (render_ascent && g_ascent_writer.initialized()) {
+        g_ascent_writer.publishSmoothXyzDiagnostic();
+      }
+#endif
       const auto output_asis = params.template get<bool>("output.debug.as_is");
       // !TODO: this can probably be optimized to dump things at once
       for (auto& fld : g_writer.fieldWriters()) {
@@ -853,6 +903,30 @@ namespace ntt {
 #if defined(ASCENT_ENABLED)
         if (render_ascent && g_ascent_writer.initialized()) {
           const auto& asked = g_ascent_writer.fields();
+          // Vertex-mode publish reads bckp's first ghost cell on each
+          // face to compute boundary vertex averages.
+          // `SynchronizeFields(Comm::Bckp, ...)` above is additive and
+          // leaves the ghost layer in an undefined state, so we do an
+          // active->ghost copy here on whichever component range was
+          // populated for this field group. The range is contiguous in
+          // every case currently supported (scalar / 3-vector /
+          // 6-tensor).
+          if (!addresses.empty()) {
+            auto a_lo = addresses.front();
+            auto a_hi = addresses.front();
+            for (auto a : addresses) {
+              if (a < a_lo) {
+                a_lo = a;
+              }
+              if (a > a_hi) {
+                a_hi = a;
+              }
+            }
+            this->CommunicateBckp(
+              *local_domain,
+              cell_range_t { static_cast<ncells_t>(a_lo),
+                             static_cast<ncells_t>(a_hi + 1u) });
+          }
           for (auto k = 0u; k < names.size(); ++k) {
             // names[k] carries the leading "f" prefix from out::OutputField;
             // the user-facing name in toml/Ascent is the same name without it.

@@ -277,6 +277,11 @@ namespace out {
     m_options["default_dir"] = plots_dir.string();
     m_options["exceptions"]  = "forward";
     m_options["messages"]    = "quiet";
+    // Vertex-association publish (see defineMesh / publishField) carries
+    // no halo or ghost mask, so the `ascent_ghosts` field is never
+    // published. Ascent v0.9.x's auto-inserted `vtkh_ghost_stripper`
+    // becomes a no-op against a missing field, which is the behavior
+    // we want — no `ghost_field_name(s)` open option is set.
 
     // Pre-parse the user's actions file so we can demote int64 leaves to
     // int32 (Conduit YAML defaults to int64 but many Ascent filters call
@@ -326,6 +331,20 @@ namespace out {
           HERE);
         m_options["actions_file"] = m_actions_file;
       }
+    }
+
+    // Dump the exact runtime options handed to `m_ascent.open(...)`
+    // alongside the actions/about yamls. The actions file is the
+    // pipeline tree (m_actions) and the about file is build-time
+    // info; neither carries open-time options like
+    // `default_dir`, `actions_file`, `ghost_field_name(s)`, or the
+    // MPI communicator. Without this dump there is no easy way to
+    // confirm an option actually reached Ascent.
+    try {
+      const auto opts_path = plots_dir / "ascent_options.yaml";
+      conduit::relay::io::save(m_options, opts_path.string(), "yaml");
+    } catch (...) {
+      // best-effort debug dump; don't crash if it fails
     }
 
     m_ascent.open(m_options);
@@ -418,7 +437,8 @@ namespace out {
                                 const std::vector<std::size_t>& l_corner,
                                 const std::vector<std::size_t>& l_shape,
                                 const std::vector<std::size_t>& l_first_cell,
-                                const std::vector<std::size_t>& downsample) {
+                                const std::vector<std::size_t>& downsample,
+                                std::size_t                     halo_cells) {
     raise::ErrorIf(!m_initialized, "AscentWriter not initialized", HERE);
     raise::ErrorIf(l_corner.size() != static_cast<std::size_t>(dim) ||
                      l_shape.size() != static_cast<std::size_t>(dim),
@@ -447,6 +467,22 @@ namespace out {
         raise::ErrorIf(s == 0u, "downsample factor must be nonzero", HERE);
       }
     }
+    m_halo_cells = halo_cells;
+    if (m_halo_cells > 0u) {
+      // Vertex-association publish: each boundary vertex averages 8/4/2
+      // cells reaching one into the neighbor, so it requires
+      // - downsample == 1 (mixing with strided sampling would put
+      //   vertices at non-physical positions),
+      // - N_GHOSTS >= 1 in the source field for the boundary stencil.
+      for (auto s : m_downsample) {
+        raise::ErrorIf(s != 1u,
+                       "AscentWriter halo cells require downsample == 1",
+                       HERE);
+      }
+      raise::ErrorIf(static_cast<std::size_t>(ntt::N_GHOSTS) < 1u,
+                     "AscentWriter halo path requires N_GHOSTS >= 1",
+                     HERE);
+    }
     // Mesh structure is being (re)defined; force a fresh blueprint
     // verification on the next render.
     m_verified = false;
@@ -458,12 +494,15 @@ namespace out {
     m_mesh["topologies/mesh/coordset"] = "coords";
     m_mesh_defined                     = true;
 
-    // Allocate the per-field staging buffers once. Reused across every
+    // Allocate the per-field staging buffer once. Reused across every
     // publishField() call (and across renders) to avoid the per-call
     // device + host + std::vector allocation seen in earlier revisions.
+    // Vertex-association mode (m_halo_cells > 0) publishes (n+1) values
+    // per axis; cell-association mode publishes n values per axis.
+    const std::size_t per_axis_extra = (m_halo_cells > 0u) ? 1u : 0u;
     std::size_t nelem = 1;
     for (auto n : m_l_shape) {
-      nelem *= n;
+      nelem *= (n + per_axis_extra);
     }
     m_buf_nelem   = nelem;
     m_field_buf_d = array_t<double*>("ascent_field_buf", nelem);
@@ -498,67 +537,144 @@ namespace out {
                    "AscentWriter staging buffer not allocated",
                    HERE);
 
-    const std::size_t gh  = ntt::N_GHOSTS;
-    auto              buf = m_field_buf_d;
+    const std::size_t gh         = ntt::N_GHOSTS;
+    const bool        vertex_mode = (m_halo_cells > 0u);
+    auto              buf        = m_field_buf_d;
 
-    // Extract the (possibly downsampled) active region of the requested
-    // component into the persistent flat buffer in i-fastest order
-    // (Conduit/Blueprint layout). Conduit's `set(...)` below copies out,
-    // so the buffer can be reused across fields and across renders.
+    // Two publish modes:
     //
-    // Source index for downsampled cell `i_dwn` along axis d is
-    //   i_src = m_l_first_cell[d] + i_dwn * m_downsample[d] + N_GHOSTS
-    // which matches how `output.fields.downsampling` strides through the
-    // ADIOS path.
+    //   * Cell-centered (m_halo_cells == 0, the original path). Extract
+    //     the (possibly downsampled) active region of the requested
+    //     component into the persistent flat buffer in i-fastest order
+    //     (Conduit/Blueprint layout). Published as
+    //     `association="element"` over n^D cells.
+    //
+    //   * Vertex-centered (m_halo_cells > 0). Each vertex value is the
+    //     average of the 8/4/2 surrounding cells; the boundary stencil
+    //     reaches one cell into the neighbor, drawing from the field's
+    //     ghost layer of width 1 (caller's responsibility to populate
+    //     via `Metadomain::CommunicateBckp`). Both ranks at a shared
+    //     face see the same 8 cells, so the shared-vertex value is
+    //     bit-identical → VTK-m's per-cell linear interpolation is
+    //     C0 continuous across rank seams and the lattice artefact
+    //     from cell-centered multi-domain rendering disappears.
+    //     Published as `association="vertex"` over (n+1)^D vertices.
+    //
+    //     Source array index for vertex iv (iv in [0, n_d]) along axis d:
+    //         cell array index = N_GHOSTS + iv - 1 + a, a in {0, 1}
+    //     i.e. the two cells whose shared face the vertex sits on.
+    //     defineMesh() guarantees downsample == 1 and N_GHOSTS >= 1
+    //     in this mode.
     if constexpr (D == Dim::_3D) {
-      const std::size_t n1 = m_l_shape[0];
-      const std::size_t n2 = m_l_shape[1];
-      const std::size_t n3 = m_l_shape[2];
-      const std::size_t f1 = m_l_first_cell[0];
-      const std::size_t f2 = m_l_first_cell[1];
-      const std::size_t f3 = m_l_first_cell[2];
-      const std::size_t s1 = m_downsample[0];
-      const std::size_t s2 = m_downsample[1];
-      const std::size_t s3 = m_downsample[2];
-      Kokkos::parallel_for(
-        "AscentExtract3D",
-        CreateRangePolicy<Dim::_3D>({ 0, 0, 0 },
-                                    { static_cast<ncells_t>(n1),
-                                      static_cast<ncells_t>(n2),
-                                      static_cast<ncells_t>(n3) }),
-        Lambda(cellidx_t i1, cellidx_t i2, cellidx_t i3) {
-          buf(i1 + n1 * (i2 + n2 * i3)) = static_cast<double>(
-            fld(f1 + i1 * s1 + gh,
-                f2 + i2 * s2 + gh,
-                f3 + i3 * s3 + gh,
-                comp));
-        });
+      if (vertex_mode) {
+        const std::size_t nv1 = m_l_shape[0] + 1u;
+        const std::size_t nv2 = m_l_shape[1] + 1u;
+        const std::size_t nv3 = m_l_shape[2] + 1u;
+        Kokkos::parallel_for(
+          "AscentVertexAvg3D",
+          CreateRangePolicy<Dim::_3D>({ 0, 0, 0 },
+                                      { static_cast<ncells_t>(nv1),
+                                        static_cast<ncells_t>(nv2),
+                                        static_cast<ncells_t>(nv3) }),
+          Lambda(cellidx_t i1, cellidx_t i2, cellidx_t i3) {
+            const auto b1 = gh + static_cast<std::size_t>(i1) - 1u;
+            const auto b2 = gh + static_cast<std::size_t>(i2) - 1u;
+            const auto b3 = gh + static_cast<std::size_t>(i3) - 1u;
+            double acc = 0.0;
+            for (int a3 = 0; a3 < 2; ++a3) {
+              for (int a2 = 0; a2 < 2; ++a2) {
+                for (int a1 = 0; a1 < 2; ++a1) {
+                  acc += static_cast<double>(
+                    fld(b1 + a1, b2 + a2, b3 + a3, comp));
+                }
+              }
+            }
+            buf(i1 + nv1 * (i2 + nv2 * i3)) = acc * 0.125;
+          });
+      } else {
+        const std::size_t n1 = m_l_shape[0];
+        const std::size_t n2 = m_l_shape[1];
+        const std::size_t n3 = m_l_shape[2];
+        const std::size_t f1 = m_l_first_cell[0];
+        const std::size_t f2 = m_l_first_cell[1];
+        const std::size_t f3 = m_l_first_cell[2];
+        const std::size_t s1 = m_downsample[0];
+        const std::size_t s2 = m_downsample[1];
+        const std::size_t s3 = m_downsample[2];
+        Kokkos::parallel_for(
+          "AscentExtract3D",
+          CreateRangePolicy<Dim::_3D>({ 0, 0, 0 },
+                                      { static_cast<ncells_t>(n1),
+                                        static_cast<ncells_t>(n2),
+                                        static_cast<ncells_t>(n3) }),
+          Lambda(cellidx_t i1, cellidx_t i2, cellidx_t i3) {
+            buf(i1 + n1 * (i2 + n2 * i3)) = static_cast<double>(
+              fld(f1 + i1 * s1 + gh,
+                  f2 + i2 * s2 + gh,
+                  f3 + i3 * s3 + gh,
+                  comp));
+          });
+      }
     } else if constexpr (D == Dim::_2D) {
-      const std::size_t n1 = m_l_shape[0];
-      const std::size_t n2 = m_l_shape[1];
-      const std::size_t f1 = m_l_first_cell[0];
-      const std::size_t f2 = m_l_first_cell[1];
-      const std::size_t s1 = m_downsample[0];
-      const std::size_t s2 = m_downsample[1];
-      Kokkos::parallel_for(
-        "AscentExtract2D",
-        CreateRangePolicy<Dim::_2D>({ 0, 0 },
-                                    { static_cast<ncells_t>(n1),
-                                      static_cast<ncells_t>(n2) }),
-        Lambda(cellidx_t i1, cellidx_t i2) {
-          buf(i1 + n1 * i2) = static_cast<double>(
-            fld(f1 + i1 * s1 + gh, f2 + i2 * s2 + gh, comp));
-        });
+      if (vertex_mode) {
+        const std::size_t nv1 = m_l_shape[0] + 1u;
+        const std::size_t nv2 = m_l_shape[1] + 1u;
+        Kokkos::parallel_for(
+          "AscentVertexAvg2D",
+          CreateRangePolicy<Dim::_2D>({ 0, 0 },
+                                      { static_cast<ncells_t>(nv1),
+                                        static_cast<ncells_t>(nv2) }),
+          Lambda(cellidx_t i1, cellidx_t i2) {
+            const auto b1 = gh + static_cast<std::size_t>(i1) - 1u;
+            const auto b2 = gh + static_cast<std::size_t>(i2) - 1u;
+            double acc = 0.0;
+            for (int a2 = 0; a2 < 2; ++a2) {
+              for (int a1 = 0; a1 < 2; ++a1) {
+                acc += static_cast<double>(fld(b1 + a1, b2 + a2, comp));
+              }
+            }
+            buf(i1 + nv1 * i2) = acc * 0.25;
+          });
+      } else {
+        const std::size_t n1 = m_l_shape[0];
+        const std::size_t n2 = m_l_shape[1];
+        const std::size_t f1 = m_l_first_cell[0];
+        const std::size_t f2 = m_l_first_cell[1];
+        const std::size_t s1 = m_downsample[0];
+        const std::size_t s2 = m_downsample[1];
+        Kokkos::parallel_for(
+          "AscentExtract2D",
+          CreateRangePolicy<Dim::_2D>({ 0, 0 },
+                                      { static_cast<ncells_t>(n1),
+                                        static_cast<ncells_t>(n2) }),
+          Lambda(cellidx_t i1, cellidx_t i2) {
+            buf(i1 + n1 * i2) = static_cast<double>(
+              fld(f1 + i1 * s1 + gh, f2 + i2 * s2 + gh, comp));
+          });
+      }
     } else { // Dim::_1D
-      const std::size_t n1 = m_l_shape[0];
-      const std::size_t f1 = m_l_first_cell[0];
-      const std::size_t s1 = m_downsample[0];
-      Kokkos::parallel_for(
-        "AscentExtract1D",
-        n1,
-        Lambda(cellidx_t i1) {
-          buf(i1) = static_cast<double>(fld(f1 + i1 * s1 + gh, comp));
-        });
+      if (vertex_mode) {
+        const std::size_t nv1 = m_l_shape[0] + 1u;
+        Kokkos::parallel_for(
+          "AscentVertexAvg1D",
+          nv1,
+          Lambda(cellidx_t i1) {
+            const auto b1 = gh + static_cast<std::size_t>(i1) - 1u;
+            const double acc = static_cast<double>(fld(b1, comp)) +
+                               static_cast<double>(fld(b1 + 1u, comp));
+            buf(i1) = acc * 0.5;
+          });
+      } else {
+        const std::size_t n1 = m_l_shape[0];
+        const std::size_t f1 = m_l_first_cell[0];
+        const std::size_t s1 = m_downsample[0];
+        Kokkos::parallel_for(
+          "AscentExtract1D",
+          n1,
+          Lambda(cellidx_t i1) {
+            buf(i1) = static_cast<double>(fld(f1 + i1 * s1 + gh, comp));
+          });
+      }
     }
     Kokkos::deep_copy(m_field_buf_h, m_field_buf_d);
 
@@ -569,7 +685,7 @@ namespace out {
                                      : name;
     const std::string base = "fields/" + short_name;
     m_mesh[base + "/topology"]    = "mesh";
-    m_mesh[base + "/association"] = "element";
+    m_mesh[base + "/association"] = vertex_mode ? "vertex" : "element";
     m_mesh[base + "/values"].set(m_field_buf_h.data(), m_buf_nelem);
 
     // Vector-field bonus path (gated by m_vector_aliases): when the
@@ -592,13 +708,78 @@ namespace out {
           static const char* const sub[] = { "u", "v", "w" };
           const std::string vec_base = "fields/" + prefix;
           m_mesh[vec_base + "/topology"]    = "mesh";
-          m_mesh[vec_base + "/association"] = "element";
+          m_mesh[vec_base + "/association"] = vertex_mode ? "vertex" : "element";
           m_mesh[vec_base + "/values/" + sub[idx - '1']].set(
             m_field_buf_h.data(),
             m_buf_nelem);
         }
       }
     }
+    m_pending_render = true;
+  }
+
+  void AscentWriter::publishSmoothXyzDiagnostic() {
+    raise::ErrorIf(!m_mesh_defined, "AscentWriter mesh not defined", HERE);
+    if (m_halo_cells == 0u) {
+      return; // only meaningful in vertex-association mode
+    }
+    // Per-axis vertex coordinates were copied into m_mesh by
+    // setMeshCoords() — pull them back as Conduit float64 arrays.
+    // Conduit stores them tightly packed, length (m_l_shape[d] + 1).
+    const char* const axes[3] = { "x", "y", "z" };
+    std::vector<std::vector<double>> coords(static_cast<std::size_t>(m_dim));
+    for (std::size_t d = 0; d < static_cast<std::size_t>(m_dim); ++d) {
+      const std::string key = std::string("coordsets/coords/values/") +
+                              axes[d];
+      raise::ErrorIf(!m_mesh.has_path(key),
+                     "AscentWriter smooth_xyz: missing " + key,
+                     HERE);
+      const auto& node = m_mesh[key];
+      raise::ErrorIf(!node.dtype().is_float64(),
+                     "AscentWriter smooth_xyz: expected float64 coords",
+                     HERE);
+      const auto       arr   = node.as_float64_array();
+      const std::size_t nedges = static_cast<std::size_t>(
+        node.dtype().number_of_elements());
+      raise::ErrorIf(nedges != m_l_shape[d] + 1u,
+                     "AscentWriter smooth_xyz: edge count mismatch on axis " +
+                       std::to_string(d),
+                     HERE);
+      coords[d].assign(nedges, 0.0);
+      for (std::size_t i = 0; i < nedges; ++i) {
+        coords[d][i] = arr[static_cast<conduit::index_t>(i)];
+      }
+    }
+    std::vector<double> values(m_buf_nelem, 0.0);
+    if (m_dim == Dim::_3D) {
+      const std::size_t nv1 = m_l_shape[0] + 1u;
+      const std::size_t nv2 = m_l_shape[1] + 1u;
+      const std::size_t nv3 = m_l_shape[2] + 1u;
+      for (std::size_t i3 = 0; i3 < nv3; ++i3) {
+        for (std::size_t i2 = 0; i2 < nv2; ++i2) {
+          for (std::size_t i1 = 0; i1 < nv1; ++i1) {
+            values[i1 + nv1 * (i2 + nv2 * i3)] =
+              coords[0][i1] + coords[1][i2] + coords[2][i3];
+          }
+        }
+      }
+    } else if (m_dim == Dim::_2D) {
+      const std::size_t nv1 = m_l_shape[0] + 1u;
+      const std::size_t nv2 = m_l_shape[1] + 1u;
+      for (std::size_t i2 = 0; i2 < nv2; ++i2) {
+        for (std::size_t i1 = 0; i1 < nv1; ++i1) {
+          values[i1 + nv1 * i2] = coords[0][i1] + coords[1][i2];
+        }
+      }
+    } else { // Dim::_1D
+      const std::size_t nv1 = m_l_shape[0] + 1u;
+      for (std::size_t i1 = 0; i1 < nv1; ++i1) {
+        values[i1] = coords[0][i1];
+      }
+    }
+    m_mesh["fields/smooth_xyz/topology"]    = "mesh";
+    m_mesh["fields/smooth_xyz/association"] = "vertex";
+    m_mesh["fields/smooth_xyz/values"].set(values.data(), values.size());
     m_pending_render = true;
   }
 

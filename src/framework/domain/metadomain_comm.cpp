@@ -562,6 +562,34 @@ namespace ntt {
   }
 
   template <SimEngine::type S, MetricClass M>
+  void Metadomain<S, M>::CommunicateBckp(Domain<S, M>&       domain,
+                                         const cell_range_t& components) const {
+    logger::Checkpoint("Communicating Bckp\n", HERE);
+    for (auto& direction : dir::Directions<M::Dim>::all) {
+      const auto [send_params,
+                  recv_params] = GetSendRecvParams(this, domain, direction, false);
+      const auto [send_indrank, send_slice] = send_params;
+      const auto [recv_indrank, recv_slice] = recv_params;
+      const auto [send_ind, send_rank]      = send_indrank;
+      const auto [recv_ind, recv_rank]      = recv_indrank;
+      if (send_rank < 0 and recv_rank < 0) {
+        continue;
+      }
+      comm::CommunicateField<M::Dim, 6>(domain.index(),
+                                        domain.fields.bckp,
+                                        domain.fields.bckp,
+                                        send_ind,
+                                        recv_ind,
+                                        send_rank,
+                                        recv_rank,
+                                        send_slice,
+                                        recv_slice,
+                                        components,
+                                        false);
+    }
+  }
+
+  template <SimEngine::type S, MetricClass M>
   void Metadomain<S, M>::CommunicateParticles(Domain<S, M>& domain) const {
 #if defined(MPI_ENABLED)
     logger::Checkpoint("Communicating particles\n", HERE);
@@ -659,6 +687,8 @@ namespace ntt {
   template void Metadomain<S, M<D>>::SynchronizeFields(Domain<S, M<D>>&,           \
                                                        CommTags,                   \
                                                        const cell_range_t&) const; \
+  template void Metadomain<S, M<D>>::CommunicateBckp(Domain<S, M<D>>&,             \
+                                                     const cell_range_t&) const;   \
   template void Metadomain<S, M<D>>::CommunicateParticles(Domain<S, M<D>>&) const;
 
   NTT_FOREACH_SPECIALIZATION(METADOMAIN_COMM)
