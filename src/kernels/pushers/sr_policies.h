@@ -27,6 +27,78 @@
 
 namespace kernel::sr {
 
+  // Concept-constrained overloads used by MakePusherPolicy to dispatch on
+  // optional problem-generator methods. NVCC fails to discard the false
+  // branch of `if constexpr` when the condition is a C++20 concept, so we
+  // route the choice through overload resolution instead.
+  namespace detail {
+    template <class PG, class DOM, class Next>
+      requires ::traits::pgen::HasEmissionPolicy<PG, DOM>
+    void invokeEmissionPolicy(const PG&  pgen,
+                              simtime_t  time,
+                              spidx_t    sp,
+                              DOM&       domain,
+                              Next&&     next) {
+      next(pgen.EmissionPolicy(time, sp, domain));
+    }
+
+    template <class PG, class DOM, class Next>
+      requires(not ::traits::pgen::HasEmissionPolicy<PG, DOM>)
+    void invokeEmissionPolicy(const PG&, simtime_t, spidx_t, DOM&, Next&&) {
+      raise::Error("Custom emission policy flag is set but problem "
+                   "generator does not define an emission policy",
+                   HERE);
+    }
+
+    template <class PG, class DOM, class Next>
+      requires ::traits::pgen::HasCustomPrtlUpdate<PG, DOM>
+    void invokeCustomPrtlUpdate(const PG& pgen,
+                                simtime_t time,
+                                spidx_t   sp,
+                                DOM&      domain,
+                                Next&&    next) {
+      next(pgen.CustomParticleUpdate(time, sp, domain));
+    }
+
+    template <class PG, class DOM, class Next>
+      requires(not ::traits::pgen::HasCustomPrtlUpdate<PG, DOM>)
+    void invokeCustomPrtlUpdate(const PG&,
+                                simtime_t,
+                                spidx_t,
+                                DOM&,
+                                Next&& next) {
+      next(::traits::custom_prtl_update::NoPolicy_t {});
+    }
+
+    template <class PG, class DOM, class Next>
+      requires ::traits::pgen::HasExternalFields<PG, DOM>
+    void invokeExternalFields(const PG& pgen,
+                              simtime_t time,
+                              spidx_t   sp,
+                              DOM&      domain,
+                              Next&&    next) {
+      const auto [apply_extfields, external_fields] = pgen.ExternalFields(
+        time,
+        sp,
+        domain);
+      if (apply_extfields) {
+        next(external_fields);
+      } else {
+        next(::traits::extfields::NoPolicy_t {});
+      }
+    }
+
+    template <class PG, class DOM, class Next>
+      requires(not ::traits::pgen::HasExternalFields<PG, DOM>)
+    void invokeExternalFields(const PG&,
+                              simtime_t,
+                              spidx_t,
+                              DOM&,
+                              Next&& next) {
+      next(::traits::extfields::NoPolicy_t {});
+    }
+  } // namespace detail
+
   template <MetricClass            M,
             EmissionPolicyClass<M> E = ::traits::emission::NoPolicy_t,
             CustomParticleUpdatePolicyClass<M> CPU = ::traits::custom_prtl_update::NoPolicy_t,
@@ -124,15 +196,11 @@ namespace kernel::sr {
             pusher_ctx));
           break;
         case ntt::EmissionType::CUSTOM:
-          if constexpr (::traits::pgen::HasEmissionPolicy<PGen, decltype(domain)>) {
-            next(pgen.EmissionPolicy(pusher_ctx.time,
-                                     pusher_ctx.species_index,
-                                     domain));
-          } else {
-            raise::Error("Custom emission policy flag is set but problem "
-                         "generator does not define an emission policy",
-                         HERE);
-          }
+          detail::invokeEmissionPolicy(pgen,
+                                       pusher_ctx.time,
+                                       pusher_ctx.species_index,
+                                       domain,
+                                       next);
           break;
         case ntt::EmissionType::NONE:
         default:
@@ -142,29 +210,19 @@ namespace kernel::sr {
     };
 
     auto with_custom_prtl_upd = [&](auto next) {
-      if constexpr (::traits::pgen::HasCustomPrtlUpdate<PGen, DOM>) {
-        next(pgen.CustomParticleUpdate(pusher_ctx.time,
-                                       pusher_ctx.species_index,
-                                       domain));
-      } else {
-        next(::traits::custom_prtl_update::NoPolicy_t {});
-      }
+      detail::invokeCustomPrtlUpdate(pgen,
+                                     pusher_ctx.time,
+                                     pusher_ctx.species_index,
+                                     domain,
+                                     next);
     };
 
     auto with_ext_fields = [&](auto next) {
-      if constexpr (::traits::pgen::HasExternalFields<PGen, DOM>) {
-        const auto [apply_extfields, external_fields] = pgen.ExternalFields(
-          pusher_ctx.time,
-          pusher_ctx.species_index,
-          domain);
-        if (apply_extfields) {
-          next(external_fields);
-        } else {
-          next(::traits::extfields::NoPolicy_t {});
-        }
-      } else {
-        next(::traits::extfields::NoPolicy_t {});
-      }
+      detail::invokeExternalFields(pgen,
+                                   pusher_ctx.time,
+                                   pusher_ctx.species_index,
+                                   domain,
+                                   next);
     };
 
     with_emission([&](auto ep) {
