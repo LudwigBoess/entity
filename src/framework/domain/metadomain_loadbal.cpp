@@ -374,6 +374,14 @@ namespace ntt {
         "RebalanceShiftPrtls",
         sp.rangeActiveParticles(),
         Lambda(prtlidx_t p) {
+          // NVCC bug workaround: extended __host__ __device__ lambdas
+          // cannot first-capture a variable inside an if-constexpr branch.
+          // Reference every dimension-conditional capture here so they are
+          // added to the closure outside the if-constexpr blocks below.
+          (void)i1;  (void)i2;  (void)i3;
+          (void)i1p; (void)i2p; (void)i3p;
+          (void)dx1; (void)dx2; (void)dx3;
+          (void)new_n1; (void)new_n2; (void)new_n3;
           if (tag(p) != ParticleTag::alive) {
             return;
           }
