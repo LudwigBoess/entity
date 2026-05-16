@@ -134,8 +134,7 @@ namespace ntt {
     ~Metadomain() = default;
 
     /* domain update-related ------------------------------------------------ */
-    void ShiftByCells(int, in = in::x1)
-      requires(CartesianMetricClass<M>);
+    void ShiftByCells(int, in = in::x1);
 
     /**
      * @brief Rebalance the load (active particles) across MPI domains by
