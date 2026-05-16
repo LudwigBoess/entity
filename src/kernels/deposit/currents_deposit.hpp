@@ -954,7 +954,13 @@ namespace kernel {
     // stencil_reach(O) — maximum cells the deposit writes ABOVE
     // min(i, i_prev) under CFL |v·dt/dx| ≤ 1/2:
     //   - O == 0 (zigzag):  writes {i_prev, i_prev+1, i, i+1}  ⇒ +2
-    //   - O >= 1 Esirkepov: stencil width (O+2), worst case    ⇒ O+1
+    //   - O >= 1 Esirkepov: `for_deposit` returns an (O+2)-wide
+    //     array but only O+1 entries are non-zero, and the union
+    //     window satisfies `i_max - i_min <= O+1` (see
+    //     particle_shapes.hpp::for_deposit). The genuine one-sided
+    //     reach above min(i, i_prev) is therefore O, not O+1 — the
+    //     old `O+1` carried one extra cell of conservative padding
+    //     on top of the already-conservative drift term below.
     //
     // drift — sort runs at end-of-step (see srpic.hpp), so a particle
     // sees one pusher step before the *next* step's deposit even at
@@ -963,9 +969,20 @@ namespace kernel {
     // compile-time upper bound on a species' runtime
     // `spatial_sorting_interval`; `CallDepositKernelTiled` rejects
     // species that exceed it.
+    //
+    // Tightened O+1 -> O for Esirkepov (perf P1): for O=2 this is
+    // HALO 4 -> 3, shrinking the per-team LDS scratch
+    // (TE = T_TILE + 2*HALO) from 16^3 to 14^3 and roughly doubling
+    // resident teams/CU on gfx90a (48 KiB -> 33 KiB, 1 -> 2 teams/CU).
+    // SAFETY: under-sizing HALO is a *performance* concern only, never
+    // correctness — any particle whose stencil escapes the scratch
+    // tile falls back to the bounds-clipped global-J `atomic_add`
+    // escape valve in the per-particle deposit lambda below. The next
+    // sweep point is O-1 (HALO 2 for O=2); validate charge/energy
+    // conservation against the O+1 reference before adopting it.
     static constexpr int STENCIL_REACH = (O == 0u)
                                            ? 2
-                                           : (static_cast<int>(O) + 1);
+                                           : static_cast<int>(O);
     static constexpr int DRIFT = static_cast<int>(TEAM_POLICY_SORT_INTERVAL);
     static constexpr int HALO  = STENCIL_REACH + DRIFT;
     static constexpr int TE    = static_cast<int>(T_TILE) + 2 * HALO;
