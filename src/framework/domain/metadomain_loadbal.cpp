@@ -111,7 +111,6 @@ namespace ntt {
   void Metadomain<S, M>::Rebalance(unsigned int dim_mask,
                                    real_t       tolerance,
                                    ncells_t     max_shift_cells)
-    requires(MetricClass<M>)
   {
 #if !defined(MPI_ENABLED)
     (void)dim_mask;
