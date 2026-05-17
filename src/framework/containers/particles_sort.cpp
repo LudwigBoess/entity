@@ -10,7 +10,8 @@
 
 #if defined(TEAM_POLICY)
   #if (defined(SYCL_ENABLED) && defined(ONEDPL_ENABLED)) ||                    \
-      (defined(CUDA_ENABLED) && defined(THRUST_ENABLED))
+      (defined(CUDA_ENABLED) && defined(THRUST_ENABLED)) ||                    \
+      (defined(HIP_ENABLED) && defined(ROCTHRUST_ENABLED))
     #define TEAM_POLICY_USE_VENDOR_SORT
     #include "utils/sort_dispatch.h"
   #endif
@@ -21,6 +22,8 @@
 #include <Kokkos_Sort.hpp>
 #include <Kokkos_StdAlgorithms.hpp>
 
+#include <algorithm>
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -289,6 +292,11 @@ namespace ntt {
                                        perm,
                                        n_bins,
                                        sort::backend::OneDPL {});
+    #elif defined(HIP_ENABLED) && defined(ROCTHRUST_ENABLED)
+    sort_helpers::sort_by_key_dispatch(tile_indices,
+                                       perm,
+                                       n_bins,
+                                       sort::backend::Rocthrust {});
     #else
     sort_helpers::sort_by_key_dispatch(tile_indices,
                                        perm,
@@ -467,20 +475,28 @@ namespace ntt {
 #if defined(TEAM_POLICY_USE_VENDOR_SORT)
   namespace permute_helpers {
 
-    // Permute a 1D SoA member array `arr` in place by `perm`, using a
-    // single transient buffer of size `n`. Buffer is freed at scope
-    // exit; explicit fence right before that drains queued GPU work
-    // referencing it.
+    // Permute a 1D SoA member array `arr` in place by `perm`, gathering
+    // through `scratch` — a persistent byte buffer reused by every
+    // member and every timestep (no per-call allocation). An unmanaged
+    // typed view aliases the scratch bytes; the caller guarantees
+    // `scratch` is large enough and that Kokkos' device over-alignment
+    // covers the element type.
     template <typename V>
-    inline void permute_1d_inplace(V&                 arr,
-                                   const prtl_perm_t& perm,
-                                   npart_t            n) {
+    inline void permute_1d_inplace(V&                    arr,
+                                   const prtl_perm_t&    perm,
+                                   npart_t               n,
+                                   const array_t<char*>& scratch) {
       if (n == 0u) {
         return;
       }
-      V    buf(std::string(arr.label()) + "_perm_buf", n);
-      auto perm_v = perm;
-      auto arr_v  = arr;
+      using value_t = typename V::non_const_value_type;
+      using buf_t   = Kokkos::View<value_t*,
+                                 typename V::array_layout,
+                                 typename V::memory_space,
+                                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+      buf_t buf(reinterpret_cast<value_t*>(scratch.data()), n);
+      auto  perm_v = perm;
+      auto  arr_v  = arr;
       Kokkos::parallel_for(
         "Permute1D",
         n,
@@ -491,16 +507,22 @@ namespace ntt {
 
     // 2D analogue for `pld_r` / `pld_i`.
     template <typename V>
-    inline void permute_2d_inplace(V&                 arr,
-                                   const prtl_perm_t& perm,
-                                   npart_t            n,
-                                   npart_t            ncols) {
+    inline void permute_2d_inplace(V&                    arr,
+                                   const prtl_perm_t&    perm,
+                                   npart_t               n,
+                                   npart_t               ncols,
+                                   const array_t<char*>& scratch) {
       if (n == 0u or ncols == 0u) {
         return;
       }
-      V    buf(std::string(arr.label()) + "_perm_buf", n, ncols);
-      auto perm_v = perm;
-      auto arr_v  = arr;
+      using value_t = typename V::non_const_value_type;
+      using buf_t   = Kokkos::View<value_t**,
+                                 typename V::array_layout,
+                                 typename V::memory_space,
+                                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+      buf_t buf(reinterpret_cast<value_t*>(scratch.data()), n, ncols);
+      auto  perm_v = perm;
+      auto  arr_v  = arr;
       Kokkos::parallel_for(
         "Permute2D",
         CreateParticleRangePolicy<Dim::_2D>({ 0u, 0u }, { n, ncols }),
@@ -521,40 +543,61 @@ namespace ntt {
       return;
     }
 
+    // Size the persistent scratch once to the largest gather any member
+    // needs this call: 1D members need n * sizeof(real_t) bytes (the
+    // widest element); the 2D payloads need n * ncols * elem bytes.
+    // Grown monotonically, never shrunk — so after warmup this incurs
+    // no allocation at all.
+    std::size_t need = static_cast<std::size_t>(n) * sizeof(real_t);
+    if (npld_r() > 0) {
+      need = std::max(need,
+                      static_cast<std::size_t>(n) *
+                        static_cast<std::size_t>(npld_r()) * sizeof(real_t));
+    }
+    if (npld_i() > 0) {
+      need = std::max(need,
+                      static_cast<std::size_t>(n) *
+                        static_cast<std::size_t>(npld_i()) * sizeof(npart_t));
+    }
+    if (m_perm_scratch.extent(0) < need) {
+      m_perm_scratch = array_t<char*> { "perm_scratch", need };
+    }
+    const auto& scratch = m_perm_scratch;
+
     using permute_helpers::permute_1d_inplace;
     using permute_helpers::permute_2d_inplace;
 
     if constexpr (D == Dim::_1D or D == Dim::_2D or D == Dim::_3D) {
-      permute_1d_inplace(i1, perm, n);
-      permute_1d_inplace(dx1, perm, n);
-      permute_1d_inplace(i1_prev, perm, n);
-      permute_1d_inplace(dx1_prev, perm, n);
+      permute_1d_inplace(i1, perm, n, scratch);
+      permute_1d_inplace(dx1, perm, n, scratch);
+      permute_1d_inplace(i1_prev, perm, n, scratch);
+      permute_1d_inplace(dx1_prev, perm, n, scratch);
     }
     if constexpr (D == Dim::_2D or D == Dim::_3D) {
-      permute_1d_inplace(i2, perm, n);
-      permute_1d_inplace(dx2, perm, n);
-      permute_1d_inplace(i2_prev, perm, n);
-      permute_1d_inplace(dx2_prev, perm, n);
+      permute_1d_inplace(i2, perm, n, scratch);
+      permute_1d_inplace(dx2, perm, n, scratch);
+      permute_1d_inplace(i2_prev, perm, n, scratch);
+      permute_1d_inplace(dx2_prev, perm, n, scratch);
     }
     if constexpr (D == Dim::_3D) {
-      permute_1d_inplace(i3, perm, n);
-      permute_1d_inplace(dx3, perm, n);
-      permute_1d_inplace(i3_prev, perm, n);
-      permute_1d_inplace(dx3_prev, perm, n);
+      permute_1d_inplace(i3, perm, n, scratch);
+      permute_1d_inplace(dx3, perm, n, scratch);
+      permute_1d_inplace(i3_prev, perm, n, scratch);
+      permute_1d_inplace(dx3_prev, perm, n, scratch);
     }
-    permute_1d_inplace(ux1, perm, n);
-    permute_1d_inplace(ux2, perm, n);
-    permute_1d_inplace(ux3, perm, n);
-    permute_1d_inplace(weight, perm, n);
-    permute_1d_inplace(tag, perm, n);
+    permute_1d_inplace(ux1, perm, n, scratch);
+    permute_1d_inplace(ux2, perm, n, scratch);
+    permute_1d_inplace(ux3, perm, n, scratch);
+    permute_1d_inplace(weight, perm, n, scratch);
+    permute_1d_inplace(tag, perm, n, scratch);
     if constexpr (D == Dim::_2D and C != Coord::Cartesian) {
-      permute_1d_inplace(phi, perm, n);
+      permute_1d_inplace(phi, perm, n, scratch);
     }
     if (npld_r() > 0) {
-      permute_2d_inplace(pld_r, perm, n, static_cast<npart_t>(npld_r()));
+      permute_2d_inplace(pld_r, perm, n, static_cast<npart_t>(npld_r()), scratch);
     }
     if (npld_i() > 0) {
-      permute_2d_inplace(pld_i, perm, n, static_cast<npart_t>(npld_i()));
+      permute_2d_inplace(pld_i, perm, n, static_cast<npart_t>(npld_i()), scratch);
     }
   }
 #endif // TEAM_POLICY_USE_VENDOR_SORT

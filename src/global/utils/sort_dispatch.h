@@ -42,6 +42,12 @@
   #include <thrust/sequence.h>
   #include <thrust/sort.h>
 #endif
+#if defined(HIP_ENABLED) && defined(ROCTHRUST_ENABLED)
+  #include <thrust/device_ptr.h>
+  #include <thrust/execution_policy.h>
+  #include <thrust/sequence.h>
+  #include <thrust/sort.h>
+#endif
 
 #include <algorithm>
 #include <numeric>
@@ -115,6 +121,27 @@ namespace ntt::sort_helpers {
     thrust::sequence(pp, pp + n);
     thrust::sort_by_key(kp, kp + n, pp);
     Kokkos::fence("sort_by_key_dispatch Thrust: post-sort");
+  }
+#endif
+
+#if defined(HIP_ENABLED) && defined(ROCTHRUST_ENABLED)
+  // rocThrust exposes the same thrust:: API as CUDA Thrust; with hipcc
+  // device_ptr-based algorithms dispatch to the HIP backend. Mirrors
+  // the CUDA Thrust overload.
+  inline void sort_by_key_dispatch(const array_t<ncells_t*>& keys,
+                                   prtl_perm_t&              perm,
+                                   ncells_t /*n_bins*/,
+                                   ::sort::backend::Rocthrust) {
+    const auto n = static_cast<npart_t>(keys.extent(0));
+    if (n == 0u) {
+      return;
+    }
+    Kokkos::fence("sort_by_key_dispatch Rocthrust: pre-sort");
+    thrust::device_ptr<ncells_t> kp(keys.data());
+    thrust::device_ptr<npart_t>  pp(perm.data());
+    thrust::sequence(pp, pp + n);
+    thrust::sort_by_key(kp, kp + n, pp);
+    Kokkos::fence("sort_by_key_dispatch Rocthrust: post-sort");
   }
 #endif
 

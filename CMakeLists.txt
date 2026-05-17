@@ -197,6 +197,25 @@ if(${team_policy})
                      "for CUDA sort_by_key")
     endif()
   endif()
+
+  if("${Kokkos_DEVICES}" MATCHES "HIP")
+    # rocThrust ships with ROCm and exposes the same thrust:: API. Using
+    # it lets the HIP backend build a single permutation via
+    # sort_by_key and gather all SoA members through one reused buffer,
+    # instead of the legacy per-member Kokkos::BinSort path which
+    # allocates a fresh `sorted_values` buffer for every member every
+    # step (the dominant source of allocator churn / fragmentation on
+    # ROCm).
+    find_package(rocthrust QUIET)
+    if(rocthrust_FOUND)
+      message(STATUS "team_policy: rocThrust enabled for HIP sort_by_key")
+      add_compile_options("-D ROCTHRUST_ENABLED")
+      set(DEPENDENCIES ${DEPENDENCIES} roc::rocthrust)
+    else()
+      message(STATUS "team_policy: rocThrust not found; using BinSort "
+                     "fallback for HIP sort_by_key")
+    endif()
+  endif()
 endif()
 
 # MPI
