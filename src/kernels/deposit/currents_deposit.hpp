@@ -118,8 +118,13 @@ namespace kernel {
       }
 
       // recover particle velocity to deposit in unsimulated direction
-      vec_t<Dim::_3D> vp { ZERO };
-      {
+      [[maybe_unused]] vec_t<Dim::_3D> vp { ZERO };
+      // P5: `vp` only feeds the unsimulated-direction current in the 1D
+      // (jx2, jx3) and 2D (jx3) branches. In 3D every J component comes
+      // from the Esirkepov/zigzag charge motion and `vp` is never read,
+      // so the metric transform + 1/sqrt + NaN/Inf guard below is pure
+      // dead work there — skip it (also frees xp/inv_energy registers).
+      if constexpr (D != Dim::_3D) {
         coord_t<M::PrtlDim> xp { ZERO };
         if constexpr (D == Dim::_1D) {
           xp[0] = i_di_to_Xi(i1(p), dx1(p));
@@ -473,32 +478,15 @@ namespace kernel {
                                    fS_x1);
 
         if constexpr (D == Dim::_1D) {
-          // define weight vectors
-          real_t Wx1[O + 2];
-          real_t Wx23[O + 2];
-
-          // Calculate weight function
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-            // Esirkepov 2001, Eq. 38 for 1D case
-            Wx1[i]  = fS_x1[i] - iS_x1[i];
-            Wx23[i] = HALF * (fS_x1[i] + iS_x1[i]);
-          }
-
-          // contribution within the shape function stencil
-          real_t jx1[O + 2];
-
-          // prefactors for j update
+          // P7 (1D): fused Esirkepov, no [O+2] temporaries.
+          //   jx1[i] = -Qdx1dt * sum_{i'=0}^{i} (fS_x1[i'] - iS_x1[i'])
+          //          = -Qdx1dt * P1[i]                  (Eq. 38, 1D)
+          //   Wx23[i] = HALF * (fS_x1[i] + iS_x1[i])     (computed inline)
+          // P1 is carried as a running scalar in the deposit loop, so
+          // the only per-thread state is the existing 1D shape arrays.
           const real_t Qdx1dt = coeff * inv_dt;
           const real_t QVx2   = coeff * vp[1];
           const real_t QVx3   = coeff * vp[2];
-
-          // Calculate current contribution
-          jx1[0] = -Qdx1dt * Wx1[0];
-#pragma unroll
-          for (int i = 1; i < O + 2; ++i) {
-            jx1[i] = jx1[i - 1] - Qdx1dt * Wx1[i];
-          }
 
           // account for ghost cells
           i1_min += N_GHOSTS;
@@ -507,18 +495,18 @@ namespace kernel {
           // get number of update indices for asymmetric movement
           const int di_x1 = i1_max - i1_min;
 
-          /*
-              Current update — fused over the union cube so the J cell
-              line stays L1-resident across the 3 component atomic_adds
-              (Candidate B in `pattern_a_implementation_progress.md`).
-          */
+          // Current update — fused over the union line so the J cell
+          // stays L1-resident across the 3 component atomic_adds.
+          real_t P1 = ZERO;
           for (int i = 0; i <= di_x1; ++i) {
-            const int gi = i1_min + i;
+            P1 += fS_x1[i] - iS_x1[i];
+            const int    gi   = i1_min + i;
+            const real_t Wx23 = HALF * (fS_x1[i] + iS_x1[i]);
             if (i < di_x1) {
-              deposit_at(gi, cur::jx1, jx1[i]);
+              deposit_at(gi, cur::jx1, -Qdx1dt * P1);
             }
-            deposit_at(gi, cur::jx2, QVx2 * Wx23[i]);
-            deposit_at(gi, cur::jx3, QVx3 * Wx23[i]);
+            deposit_at(gi, cur::jx2, QVx2 * Wx23);
+            deposit_at(gi, cur::jx3, QVx3 * Wx23);
           }
 
         } else if constexpr (D == Dim::_2D) {
@@ -538,63 +526,23 @@ namespace kernel {
                                      iS_x2,
                                      fS_x2);
 
-          // define weight tensors
-          real_t Wx1[O + 2][O + 2];
-          real_t Wx2[O + 2][O + 2];
-          real_t Wx3[O + 2][O + 2];
-
-// Calculate weight function
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-              // Esirkepov 2001, Eq. 38 (simplified)
-              Wx1[i][j] = HALF * (fS_x1[i] - iS_x1[i]) * (fS_x2[j] + iS_x2[j]);
-
-              Wx2[i][j] = HALF * (fS_x1[i] + iS_x1[i]) * (fS_x2[j] - iS_x2[j]);
-
-              Wx3[i][j] = THIRD * (fS_x2[j] * (HALF * iS_x1[i] + fS_x1[i]) +
-                                   iS_x2[j] * (HALF * fS_x1[i] + iS_x1[i]));
-            }
-          }
-
-          // contribution within the shape function stencil
-          real_t jx1[O + 2][O + 2], jx2[O + 2][O + 2];
-
-          // prefactors for j update
-          const real_t Qdx1dt = coeff * inv_dt;
-          const real_t Qdx2dt = coeff * inv_dt;
-          const real_t QVx3   = coeff * vp[2];
-
-          // Calculate current contribution
-
-          // jx1
-#pragma unroll
-          for (int j = 0; j < O + 2; ++j) {
-            jx1[0][j] = -Qdx1dt * Wx1[0][j];
-          }
-
-#pragma unroll
-          for (int i = 1; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-              jx1[i][j] = jx1[i - 1][j] - Qdx1dt * Wx1[i][j];
-            }
-          }
-
-          // jx2
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-            jx2[i][0] = -Qdx2dt * Wx2[i][0];
-          }
-
-#pragma unroll
-          for (int j = 1; j < O + 2; ++j) {
-#pragma unroll
-            for (int i = 0; i < O + 2; ++i) {
-              jx2[i][j] = jx2[i][j - 1] - Qdx2dt * Wx2[i][j];
-            }
-          }
+          // P7 (2D): fused Esirkepov, no [O+2]^2 temporaries.
+          //
+          // Esirkepov 2001 Eq. 38 (simplified) is separable: with
+          // P1[i] = sum_{i'=0}^{i} (fS_x1[i'] - iS_x1[i']) and
+          // P2[j] = sum_{j'=0}^{j} (fS_x2[j'] - iS_x2[j']),
+          //   jx1[i][j] = -Q*HALF * P1[i] * (fS_x2[j] + iS_x2[j])
+          //   jx2[i][j] = -Q*HALF * P2[j] * (fS_x1[i] + iS_x1[i])
+          //   Wx3[i][j] = THIRD*( fS_x2[j]*(HALF*iS_x1[i]+fS_x1[i])
+          //                     + iS_x2[j]*(HALF*fS_x1[i]+iS_x1[i]) )
+          // with Q = coeff*inv_dt (Qdx1dt == Qdx2dt). Same value as the
+          // old explicit Wx/jx tensors up to FP reassociation;
+          // charge-conserving by construction. Prefix sums carried as
+          // running scalars (P1 across i; P2 reset per i, across j), so
+          // the only per-thread state is the existing 1D shape arrays.
+          const real_t QVx3 = coeff * vp[2];
+          // -Q*HALF prefactor (Qdx1dt == Qdx2dt == coeff*inv_dt)
+          const real_t cf = -(coeff * inv_dt) * HALF;
 
           // account for ghost cells
           i1_min += N_GHOSTS;
@@ -606,22 +554,30 @@ namespace kernel {
           const int di_x1 = i1_max - i1_min;
           const int di_x2 = i2_max - i2_min;
 
-          /*
-              Current update — fused over the union cube so the J cell
-              line stays L1-resident across the 3 component atomic_adds
-              (Candidate B in `pattern_a_implementation_progress.md`).
-          */
+          // Current update — fused over the union plane so the J cell
+          // line stays L1-resident across the 3 component atomic_adds.
+          real_t P1 = ZERO;
           for (int i = 0; i <= di_x1; ++i) {
+            P1 += fS_x1[i] - iS_x1[i];
+            const int    gi   = i1_min + i;
+            const real_t iSx1 = iS_x1[i];
+            const real_t fSx1 = fS_x1[i];
+            const real_t A1   = fSx1 + iSx1;     // jx2 cross-factor
+            real_t       P2   = ZERO;
             for (int j = 0; j <= di_x2; ++j) {
-              const int gi = i1_min + i;
-              const int gj = i2_min + j;
+              P2 += fS_x2[j] - iS_x2[j];
+              const int    gj   = i2_min + j;
+              const real_t iSx2 = iS_x2[j];
+              const real_t fSx2 = fS_x2[j];
               if (i < di_x1) {
-                deposit_at(gi, gj, cur::jx1, jx1[i][j]);
+                deposit_at(gi, gj, cur::jx1, cf * P1 * (fSx2 + iSx2));
               }
               if (j < di_x2) {
-                deposit_at(gi, gj, cur::jx2, jx2[i][j]);
+                deposit_at(gi, gj, cur::jx2, cf * P2 * A1);
               }
-              deposit_at(gi, gj, cur::jx3, QVx3 * Wx3[i][j]);
+              const real_t Wx3 = THIRD * (fSx2 * (HALF * iSx1 + fSx1) +
+                                          iSx2 * (HALF * fSx1 + iSx1));
+              deposit_at(gi, gj, cur::jx3, QVx3 * Wx3);
             }
           }
 
@@ -655,104 +611,33 @@ namespace kernel {
                                      iS_x3,
                                      fS_x3);
 
-          // define weight tensors
-          real_t Wx1[O + 2][O + 2][O + 2];
-          real_t Wx2[O + 2][O + 2][O + 2];
-          real_t Wx3[O + 2][O + 2][O + 2];
-
-// Calculate weight function
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-#pragma unroll
-              for (int k = 0; k < O + 2; ++k) {
-                // Esirkepov 2001, Eq. 31
-                Wx1[i][j][k] = THIRD * (fS_x1[i] - iS_x1[i]) *
-                               ((iS_x2[j] * iS_x3[k] + fS_x2[j] * fS_x3[k]) +
-                                HALF * (iS_x3[k] * fS_x2[j] + iS_x2[j] * fS_x3[k]));
-
-                Wx2[i][j][k] = THIRD * (fS_x2[j] - iS_x2[j]) *
-                               (iS_x1[i] * iS_x3[k] + fS_x1[i] * fS_x3[k] +
-                                HALF * (iS_x3[k] * fS_x1[i] + iS_x1[i] * fS_x3[k]));
-
-                Wx3[i][j][k] = THIRD * (fS_x3[k] - iS_x3[k]) *
-                               (iS_x1[i] * iS_x2[j] + fS_x1[i] * fS_x2[j] +
-                                HALF * (iS_x1[i] * fS_x2[j] + iS_x2[j] * fS_x1[i]));
-              }
-            }
-          }
-
-          // contribution within the shape function stencil
-          real_t jx1[O + 2][O + 2][O + 2], jx2[O + 2][O + 2][O + 2],
-            jx3[O + 2][O + 2][O + 2];
-
-          // prefactors to j update
-          const real_t Qdxdt = coeff * inv_dt;
-          const real_t Qdydt = coeff * inv_dt;
-          const real_t Qdzdt = coeff * inv_dt;
-
-          // Calculate current contribution
-
-          // jx1
-#pragma unroll
-          for (int j = 0; j < O + 2; ++j) {
-#pragma unroll
-            for (int k = 0; k < O + 2; ++k) {
-              jx1[0][j][k] = -Qdxdt * Wx1[0][j][k];
-            }
-          }
-
-#pragma unroll
-          for (int i = 1; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-#pragma unroll
-              for (int k = 0; k < O + 2; ++k) {
-                jx1[i][j][k] = jx1[i - 1][j][k] - Qdxdt * Wx1[i][j][k];
-              }
-            }
-          }
-
-          // jx2
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int k = 0; k < O + 2; ++k) {
-              jx2[i][0][k] = -Qdydt * Wx2[i][0][k];
-            }
-          }
-
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 1; j < O + 2; ++j) {
-#pragma unroll
-              for (int k = 0; k < O + 2; ++k) {
-                jx2[i][j][k] = jx2[i][j - 1][k] - Qdydt * Wx2[i][j][k];
-              }
-            }
-          }
-
-          // jx3
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-              jx3[i][j][0] = -Qdydt * Wx3[i][j][0];
-            }
-          }
-
-#pragma unroll
-          for (int i = 0; i < O + 2; ++i) {
-#pragma unroll
-            for (int j = 0; j < O + 2; ++j) {
-#pragma unroll
-              for (int k = 1; k < O + 2; ++k) {
-                jx3[i][j][k] = jx3[i][j][k - 1] - Qdzdt * Wx3[i][j][k];
-              }
-            }
-          }
+          // P7: fused Esirkepov, no (O+2)^3 temporaries.
+          //
+          // The Esirkepov 3D current (2001, Eq. 31) is separable: with
+          // P1[i] = sum_{i'=0}^{i} (fS_x1[i'] - iS_x1[i']) (and likewise
+          // P2[j], P3[k]) the cumulative-sum currents collapse to
+          //
+          //   jx1[i][j][k] = -Q*THIRD * P1[i] * G23(j,k)
+          //   jx2[i][j][k] = -Q*THIRD * P2[j] * H13(i,k)
+          //   jx3[i][j][k] = -Q*THIRD * P3[k] * F12(i,j)
+          //
+          // with the 1D-shape cross-factors
+          //
+          //   G23(j,k) = iS_x2[j]*iS_x3[k] + fS_x2[j]*fS_x3[k]
+          //            + HALF*(iS_x3[k]*fS_x2[j] + iS_x2[j]*fS_x3[k])
+          //   H13(i,k) = iS_x1[i]*iS_x3[k] + fS_x1[i]*fS_x3[k]
+          //            + HALF*(iS_x3[k]*fS_x1[i] + iS_x1[i]*fS_x3[k])
+          //   F12(i,j) = iS_x1[i]*iS_x2[j] + fS_x1[i]*fS_x2[j]
+          //            + HALF*(iS_x1[i]*fS_x2[j] + iS_x2[j]*fS_x1[i])
+          //
+          // and Q = coeff*inv_dt (Qdxdt == Qdydt == Qdzdt). This is the
+          // same value as the old explicit Wx/jx tensors up to
+          // floating-point reassociation: charge-conserving by
+          // construction (the Esirkepov decomposition is exact). The
+          // prefix sums are carried as running scalars in the deposit
+          // loop, so the only per-thread state is the existing 1D shape
+          // arrays (no (O+2)^3 / (O+2)^2 locals, hence far fewer VGPRs
+          // and no private-memory tensor traffic).
 
           // account for ghost cells
           i1_min += N_GHOSTS;
@@ -767,29 +652,51 @@ namespace kernel {
           const int di_x2 = i2_max - i2_min;
           const int di_x3 = i3_max - i3_min;
 
+          // -Q*THIRD prefactor (Qdxdt == Qdydt == Qdzdt == coeff*inv_dt)
+          const real_t cf = -(coeff * inv_dt) * THIRD;
+
           /*
             Current update — fused over the union cube so the J cell
-            line stays L1-resident across the 3 component atomic_adds
-            (Candidate B in `pattern_a_implementation_progress.md`).
+            line stays L1-resident across the 3 component atomic_adds.
             Per-cell branches on (i<di_x1), (j<di_x2), (k<di_x3) skip
             the trailing slab where each component's stencil ends one
-            cell short of the union; they predicate cleanly on PVC
-            SIMD-32 since particles within a tile share di_x*.
+            cell short of the union; particles within a tile share
+            di_x* so the branch predicates cleanly. P1/P2/P3 are the
+            running prefix sums (P1 carried across i; P2 reset per i,
+            carried across j; P3 reset per (i,j), carried across k).
           */
+          real_t P1 = ZERO;
           for (int i = 0; i <= di_x1; ++i) {
+            P1 += fS_x1[i] - iS_x1[i];
+            const int    gi    = i1_min + i;
+            const real_t iSx1i = iS_x1[i];
+            const real_t fSx1i = fS_x1[i];
+            real_t       P2    = ZERO;
             for (int j = 0; j <= di_x2; ++j) {
+              P2 += fS_x2[j] - iS_x2[j];
+              const int    gj    = i2_min + j;
+              const real_t iSx2j = iS_x2[j];
+              const real_t fSx2j = fS_x2[j];
+              const real_t F12   = iSx1i * iSx2j + fSx1i * fSx2j +
+                                 HALF * (iSx1i * fSx2j + iSx2j * fSx1i);
+              real_t P3 = ZERO;
               for (int k = 0; k <= di_x3; ++k) {
-                const int gi = i1_min + i;
-                const int gj = i2_min + j;
-                const int gk = i3_min + k;
+                P3 += fS_x3[k] - iS_x3[k];
+                const int    gk    = i3_min + k;
+                const real_t iSx3k = iS_x3[k];
+                const real_t fSx3k = fS_x3[k];
                 if (i < di_x1) {
-                  deposit_at(gi, gj, gk, cur::jx1, jx1[i][j][k]);
+                  const real_t G23 = iSx2j * iSx3k + fSx2j * fSx3k +
+                                     HALF * (iSx3k * fSx2j + iSx2j * fSx3k);
+                  deposit_at(gi, gj, gk, cur::jx1, cf * P1 * G23);
                 }
                 if (j < di_x2) {
-                  deposit_at(gi, gj, gk, cur::jx2, jx2[i][j][k]);
+                  const real_t H13 = iSx1i * iSx3k + fSx1i * fSx3k +
+                                     HALF * (iSx3k * fSx1i + iSx1i * fSx3k);
+                  deposit_at(gi, gj, gk, cur::jx2, cf * P2 * H13);
                 }
                 if (k < di_x3) {
-                  deposit_at(gi, gj, gk, cur::jx3, jx3[i][j][k]);
+                  deposit_at(gi, gj, gk, cur::jx3, cf * P3 * F12);
                 }
               }
             }
@@ -929,22 +836,31 @@ namespace kernel {
    * **Halo sizing and escape valve.** Sort runs at the end of the
    * previous step (see `srpic.hpp`), so at deposit time the particle
    * has already been pushed once — its `min(i, i_prev)` may differ
-   * from the bin key by up to one cell per step elapsed since the
-   * last sort. The scratch HALO is `STENCIL_REACH(O) +
-   * TEAM_POLICY_SORT_INTERVAL`, where `STENCIL_REACH = 2` for zigzag
-   * (writes `{i_prev, i_prev+1, i, i+1}` ⇒ +2 above `min(i, i_prev)`
-   * with `|Δi|=1`) and `O+1` for Esirkepov. If a particle's stencil
-   * still escapes the scratch tile, the deposit lambda silently falls
-   * back to a direct `Kokkos::atomic_add` on the global J view —
-   * correct (charge-conserving) but slower per write.
+   * from the bin key by one cell of drift per step elapsed since the
+   * last sort. The scratch HALO is `STENCIL_REACH(O) + DRIFT`, where
+   * `STENCIL_REACH = 2` for zigzag (writes `{i_prev, i_prev+1, i,
+   * i+1}` ⇒ +2 above `min(i, i_prev)` with `|Δi|=1`) and `O` for
+   * Esirkepov, and `DRIFT` is a fixed constant (1) covering the one
+   * guaranteed post-sort pusher step.
+   *
+   * HALO is sized for the *common* (every-step-sorted) case, not for
+   * a worst-case sort cadence: correctness does **not** depend on it.
+   * Any particle whose stencil escapes the scratch tile — because it
+   * drifted further than `DRIFT` (e.g. a large runtime
+   * `spatial_sorting_interval`), or because the halo is otherwise
+   * undersized — silently falls back to a direct, bounds-clipped
+   * `Kokkos::atomic_add` on the global J view. That path is
+   * charge-conserving (each particle's stencil is deposited exactly
+   * once, partly to private SLM scratch and partly to global J, and
+   * scratch is flushed once via `atomic_add`); it is merely slower
+   * per write. Sorting less often than every step therefore costs
+   * escape-valve traffic, never accuracy.
    */
   template <SimEngine::type S, MetricClass M, unsigned short O,
             unsigned short T_TILE>
   class DepositCurrents_kernel_tiled {
     static_assert(O <= 11u, "Shape order O must be <= 11");
     static_assert(T_TILE > 0u, "T_TILE must be positive");
-    static_assert(TEAM_POLICY_SORT_INTERVAL >= 1,
-                  "TEAM_POLICY_SORT_INTERVAL must be >= 1");
     static constexpr auto D = M::Dim;
 
     // Per-side scratch halo, derived from first principles.
@@ -954,19 +870,38 @@ namespace kernel {
     // stencil_reach(O) — maximum cells the deposit writes ABOVE
     // min(i, i_prev) under CFL |v·dt/dx| ≤ 1/2:
     //   - O == 0 (zigzag):  writes {i_prev, i_prev+1, i, i+1}  ⇒ +2
-    //   - O >= 1 Esirkepov: stencil width (O+2), worst case    ⇒ O+1
+    //   - O >= 1 Esirkepov: `for_deposit` returns an (O+2)-wide
+    //     array but only O+1 entries are non-zero, and the union
+    //     window satisfies `i_max - i_min <= O+1` (see
+    //     particle_shapes.hpp::for_deposit). The genuine one-sided
+    //     reach above min(i, i_prev) is therefore O, not O+1 — the
+    //     old `O+1` carried one extra cell of conservative padding
+    //     on top of the already-conservative drift term below.
     //
     // drift — sort runs at end-of-step (see srpic.hpp), so a particle
-    // sees one pusher step before the *next* step's deposit even at
-    // `spatial_sorting_interval = 1`. Each additional skipped sort adds
-    // another cell of drift. `TEAM_POLICY_SORT_INTERVAL` is the
-    // compile-time upper bound on a species' runtime
-    // `spatial_sorting_interval`; `CallDepositKernelTiled` rejects
-    // species that exceed it.
+    // sees exactly one pusher step before the *next* step's deposit
+    // when sorted every step (the common case). DRIFT is therefore a
+    // fixed constant of 1, NOT a compile-time function of the runtime
+    // sort cadence. Sizing the halo for the common case (rather than a
+    // worst-case sort interval) is what keeps the scratch small enough
+    // for good occupancy on gfx90a; a species sorted less often than
+    // every step just drifts past the halo and takes the global-J
+    // escape valve more often — correct, only slower (see the class
+    // doc-comment for why this is charge-conserving).
+    //
+    // STENCIL_REACH tightened O+1 -> O for Esirkepov (perf P1): for
+    // O=2 this is HALO 4 -> 3, shrinking the per-team LDS scratch
+    // (TE = T_TILE + 2*HALO) from 16^3 to 14^3 and roughly doubling
+    // resident teams/CU on gfx90a (48 KiB -> 33 KiB, 1 -> 2 teams/CU).
+    // SAFETY: under-sizing HALO is a *performance* concern only, never
+    // correctness — the per-particle deposit lambda below routes any
+    // escaping stencil cell to the bounds-clipped global-J
+    // `atomic_add`. The next sweep point is O-1 (HALO 2 for O=2);
+    // validate charge/energy conservation before adopting it.
     static constexpr int STENCIL_REACH = (O == 0u)
                                            ? 2
-                                           : (static_cast<int>(O) + 1);
-    static constexpr int DRIFT = static_cast<int>(TEAM_POLICY_SORT_INTERVAL);
+                                           : static_cast<int>(O);
+    static constexpr int DRIFT = 1;
     static constexpr int HALO  = STENCIL_REACH + DRIFT;
     static constexpr int TE    = static_cast<int>(T_TILE) + 2 * HALO;
 

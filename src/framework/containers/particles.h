@@ -93,6 +93,22 @@ namespace ntt {
     // vendor libraries detected by CMake.
     TileLayout<D> m_tile_layout {};
 
+#if defined(TEAM_POLICY) &&                                                    \
+  ((defined(SYCL_ENABLED) && defined(ONEDPL_ENABLED)) ||                       \
+   (defined(CUDA_ENABLED) && defined(THRUST_ENABLED)) ||                       \
+   (defined(HIP_ENABLED) && defined(ROCTHRUST_ENABLED)))
+    // Persistent byte scratch reused by every SoA-member gather in
+    // `apply_permutation_to_soa`, across all members and all timesteps.
+    // Without this each member would allocate (and free) its own
+    // transient buffer every sort; recycling one persistent buffer
+    // removes that allocation churn entirely — the structural fix for
+    // the ROCm sort slowdown / fragmentation. Grown monotonically to
+    // the largest required size, never shrunk. Kokkos device
+    // allocations are over-aligned (>= 8 B), so reinterpreting the
+    // bytes as any SoA element type (<= 8 B PODs) is well-defined.
+    array_t<char*> m_perm_scratch {};
+#endif
+
 #if !defined(MPI_ENABLED)
     const uint8_t m_ntags { 2u };
 #else // MPI_ENABLED
@@ -294,7 +310,8 @@ namespace ntt {
 
 #if defined(TEAM_POLICY) &&                                                    \
   ((defined(SYCL_ENABLED) && defined(ONEDPL_ENABLED)) ||                       \
-   (defined(CUDA_ENABLED) && defined(THRUST_ENABLED)))
+   (defined(CUDA_ENABLED) && defined(THRUST_ENABLED)) ||                       \
+   (defined(HIP_ENABLED) && defined(ROCTHRUST_ENABLED)))
   private:
     /**
      * @brief Apply a particle-index permutation (built by oneDPL/Thrust
