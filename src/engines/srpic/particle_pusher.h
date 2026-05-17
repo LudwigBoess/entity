@@ -149,15 +149,34 @@ namespace ntt {
           has_atmosphere,
           [&](const auto& policies) {
             using policy_t = std::decay_t<decltype(policies)>;
-            Kokkos::parallel_for(
-              "ParticlePusher",
-              species.rangeActiveParticles(),
-              kernel::sr::Pusher_kernel<M, policy_t> { pusher_ctx,
-                                                       pusher_boundaries,
-                                                       species,
-                                                       domain.fields.em,
-                                                       domain.mesh.metric,
-                                                       policies });
+            // C1: dispatch pure-Boris species to the lean BorisOnly
+            // specialization (photon/GCA/Vay arms compile-DCE'd ⇒ fewer
+            // live SGPRs). Exact `== BORIS` excludes GCA-bit hybrids,
+            // Vay, Photon, None ⇒ those keep the byte-identical Generic
+            // kernel. Drag/emission are orthogonal (handled outside the
+            // PS-gated branches) so BorisOnly is numerically identical
+            // to Generic on the Boris path. Works for all metrics/dims:
+            // Generic == original behaviour; BorisOnly only runs the
+            // same Boris arithmetic.
+            if (species.pusher() == ParticlePusher::BORIS) {
+              Kokkos::parallel_for(
+                "ParticlePusher",
+                species.rangeActiveParticles(),
+                kernel::sr::Pusher_kernel<M, policy_t,
+                                          kernel::sr::PusherSpec::BorisOnly> {
+                  pusher_ctx, pusher_boundaries, species, domain.fields.em,
+                  domain.mesh.metric, policies });
+            } else {
+              Kokkos::parallel_for(
+                "ParticlePusher",
+                species.rangeActiveParticles(),
+                kernel::sr::Pusher_kernel<M, policy_t> { pusher_ctx,
+                                                         pusher_boundaries,
+                                                         species,
+                                                         domain.fields.em,
+                                                         domain.mesh.metric,
+                                                         policies });
+            }
             // if emission takes place, update the npart and counter of emitted species
             if constexpr (
               not ::traits::emission::IsNoPolicy<typename policy_t::EmissionPolicy>) {
