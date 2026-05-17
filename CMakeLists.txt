@@ -75,12 +75,14 @@ set(team_policy_tile_size
   ${default_team_policy_tile_size}
   CACHE STRING "team_policy tile edge length in cells")
 set(team_policy_tile_sizes
-  "4;8;12"
+  "4;6;8;10;12"
   CACHE STRING "team_policy tile-size choices")
-set(team_policy_sort_interval
-  ${default_team_policy_sort_interval}
-  CACHE STRING
-  "Max spatial_sorting_interval (steps) the tiled deposit's HALO is sized for")
+# Note: the tiled deposit's scratch HALO is a fixed constant
+# (stencil_reach(O) + 1) sized for the every-step-sorted common case.
+# It is intentionally NOT a build knob: correctness is independent of
+# the runtime spatial_sorting_interval (the per-particle global-J
+# escape valve absorbs any drift past the halo), so a knob here would
+# only trade occupancy for escape-valve traffic with no accuracy gain.
 
 # -------------------------- Compilation settings -------------------------- #
 set(CMAKE_CXX_STANDARD 20)
@@ -168,14 +170,8 @@ if(${team_policy})
       "${Red}team_policy_tile_size must be one of ${team_policy_tile_sizes}, "
       "got '${team_policy_tile_size}'${ColorReset}")
   endif()
-  if(NOT team_policy_sort_interval MATCHES "^[1-9][0-9]*$")
-    message(FATAL_ERROR
-      "${Red}team_policy_sort_interval must be a positive integer, "
-      "got '${team_policy_sort_interval}'${ColorReset}")
-  endif()
   add_compile_options("-D TEAM_POLICY")
   add_compile_options("-D TEAM_POLICY_TILE_SIZE=${team_policy_tile_size}")
-  add_compile_options("-D TEAM_POLICY_SORT_INTERVAL=${team_policy_sort_interval}")
 
   # Vendor sort: oneDPL on SYCL, Thrust on CUDA. Used automatically
   # when found; falls back to Kokkos::BinSort otherwise.

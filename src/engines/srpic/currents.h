@@ -101,17 +101,14 @@ namespace ntt {
                      "CallDepositKernelTiled: tile_offsets size inconsistent "
                      "with ntiles_total",
                      HERE);
-      // HALO is sized at compile time for a sort cadence of at most
-      // TEAM_POLICY_SORT_INTERVAL steps. A species sorted less often
-      // would routinely escape the scratch tile and pay the fallback
-      // J-atomic on every other particle — bump the CMake knob instead.
-      raise::ErrorIf(
-        species.spatial_sorting_interval() >
-          static_cast<timestep_t>(TEAM_POLICY_SORT_INTERVAL),
-        "CallDepositKernelTiled: species spatial_sorting_interval exceeds "
-        "the build-time team_policy_sort_interval; rebuild with a larger "
-        "-D team_policy_sort_interval=<N>",
-        HERE);
+      // No sort-cadence guard: the tiled deposit's scratch HALO is
+      // sized for the common (every-step-sorted) case, but correctness
+      // is independent of the runtime spatial_sorting_interval. A
+      // species sorted less often simply drifts past the halo more
+      // often and takes the bounds-clipped global-J escape valve in
+      // the per-particle deposit lambda — charge-conserving, only
+      // slower per escaped write (see DepositCurrents_kernel_tiled
+      // doc-comment).
 
       using kernel_t = kernel::DepositCurrents_kernel_tiled<SimEngine::SRPIC,
                                                             M,

@@ -121,12 +121,3 @@ set_property(CACHE default_team_policy PROPERTY TYPE BOOL)
 set(default_team_policy_tile_size
     8
     CACHE INTERNAL "Default tile edge length in cells for team_policy")
-
-# Maximum `spatial_sorting_interval` (in steps) that the tiled deposit's
-# per-team scratch is sized for. The scratch HALO is computed as
-# `stencil_reach(O) + team_policy_sort_interval`; setting a runtime
-# `spatial_sorting_interval` larger than this value at runtime is rejected
-# by `CallDepositKernelTiled`. Default = 1 (sort every step).
-set(default_team_policy_sort_interval
-    1
-    CACHE INTERNAL "Default sort-interval budget (steps) for team_policy HALO")

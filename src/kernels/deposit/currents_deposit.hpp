@@ -929,22 +929,31 @@ namespace kernel {
    * **Halo sizing and escape valve.** Sort runs at the end of the
    * previous step (see `srpic.hpp`), so at deposit time the particle
    * has already been pushed once — its `min(i, i_prev)` may differ
-   * from the bin key by up to one cell per step elapsed since the
-   * last sort. The scratch HALO is `STENCIL_REACH(O) +
-   * TEAM_POLICY_SORT_INTERVAL`, where `STENCIL_REACH = 2` for zigzag
-   * (writes `{i_prev, i_prev+1, i, i+1}` ⇒ +2 above `min(i, i_prev)`
-   * with `|Δi|=1`) and `O+1` for Esirkepov. If a particle's stencil
-   * still escapes the scratch tile, the deposit lambda silently falls
-   * back to a direct `Kokkos::atomic_add` on the global J view —
-   * correct (charge-conserving) but slower per write.
+   * from the bin key by one cell of drift per step elapsed since the
+   * last sort. The scratch HALO is `STENCIL_REACH(O) + DRIFT`, where
+   * `STENCIL_REACH = 2` for zigzag (writes `{i_prev, i_prev+1, i,
+   * i+1}` ⇒ +2 above `min(i, i_prev)` with `|Δi|=1`) and `O` for
+   * Esirkepov, and `DRIFT` is a fixed constant (1) covering the one
+   * guaranteed post-sort pusher step.
+   *
+   * HALO is sized for the *common* (every-step-sorted) case, not for
+   * a worst-case sort cadence: correctness does **not** depend on it.
+   * Any particle whose stencil escapes the scratch tile — because it
+   * drifted further than `DRIFT` (e.g. a large runtime
+   * `spatial_sorting_interval`), or because the halo is otherwise
+   * undersized — silently falls back to a direct, bounds-clipped
+   * `Kokkos::atomic_add` on the global J view. That path is
+   * charge-conserving (each particle's stencil is deposited exactly
+   * once, partly to private SLM scratch and partly to global J, and
+   * scratch is flushed once via `atomic_add`); it is merely slower
+   * per write. Sorting less often than every step therefore costs
+   * escape-valve traffic, never accuracy.
    */
   template <SimEngine::type S, MetricClass M, unsigned short O,
             unsigned short T_TILE>
   class DepositCurrents_kernel_tiled {
     static_assert(O <= 11u, "Shape order O must be <= 11");
     static_assert(T_TILE > 0u, "T_TILE must be positive");
-    static_assert(TEAM_POLICY_SORT_INTERVAL >= 1,
-                  "TEAM_POLICY_SORT_INTERVAL must be >= 1");
     static constexpr auto D = M::Dim;
 
     // Per-side scratch halo, derived from first principles.
@@ -963,27 +972,29 @@ namespace kernel {
     //     on top of the already-conservative drift term below.
     //
     // drift — sort runs at end-of-step (see srpic.hpp), so a particle
-    // sees one pusher step before the *next* step's deposit even at
-    // `spatial_sorting_interval = 1`. Each additional skipped sort adds
-    // another cell of drift. `TEAM_POLICY_SORT_INTERVAL` is the
-    // compile-time upper bound on a species' runtime
-    // `spatial_sorting_interval`; `CallDepositKernelTiled` rejects
-    // species that exceed it.
+    // sees exactly one pusher step before the *next* step's deposit
+    // when sorted every step (the common case). DRIFT is therefore a
+    // fixed constant of 1, NOT a compile-time function of the runtime
+    // sort cadence. Sizing the halo for the common case (rather than a
+    // worst-case sort interval) is what keeps the scratch small enough
+    // for good occupancy on gfx90a; a species sorted less often than
+    // every step just drifts past the halo and takes the global-J
+    // escape valve more often — correct, only slower (see the class
+    // doc-comment for why this is charge-conserving).
     //
-    // Tightened O+1 -> O for Esirkepov (perf P1): for O=2 this is
-    // HALO 4 -> 3, shrinking the per-team LDS scratch
+    // STENCIL_REACH tightened O+1 -> O for Esirkepov (perf P1): for
+    // O=2 this is HALO 4 -> 3, shrinking the per-team LDS scratch
     // (TE = T_TILE + 2*HALO) from 16^3 to 14^3 and roughly doubling
     // resident teams/CU on gfx90a (48 KiB -> 33 KiB, 1 -> 2 teams/CU).
     // SAFETY: under-sizing HALO is a *performance* concern only, never
-    // correctness — any particle whose stencil escapes the scratch
-    // tile falls back to the bounds-clipped global-J `atomic_add`
-    // escape valve in the per-particle deposit lambda below. The next
-    // sweep point is O-1 (HALO 2 for O=2); validate charge/energy
-    // conservation against the O+1 reference before adopting it.
+    // correctness — the per-particle deposit lambda below routes any
+    // escaping stencil cell to the bounds-clipped global-J
+    // `atomic_add`. The next sweep point is O-1 (HALO 2 for O=2);
+    // validate charge/energy conservation before adopting it.
     static constexpr int STENCIL_REACH = (O == 0u)
                                            ? 2
                                            : static_cast<int>(O);
-    static constexpr int DRIFT = static_cast<int>(TEAM_POLICY_SORT_INTERVAL);
+    static constexpr int DRIFT = 1;
     static constexpr int HALO  = STENCIL_REACH + DRIFT;
     static constexpr int TE    = static_cast<int>(T_TILE) + 2 * HALO;
 
