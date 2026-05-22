@@ -57,10 +57,25 @@ namespace kernel::sr {
   using namespace ntt;
 
   /**
-   * @tparam M Metric
-   * @tparam P Extra policies
+   * @brief C1: compile-time pusher-algorithm specialization.
+   *   `Generic` keeps the historical runtime `ctx.pusher_flags`
+   *   branching **byte-for-byte** (default for every caller).
+   *   `BorisOnly` is selected by the launcher for species that are
+   *   purely Boris (no GCA/Vay/Photon, no radiative drag): the photon,
+   *   GCA and Vay arms then `if constexpr` away, dropping their live
+   *   scalars (GCA E²/B²/rL, etc.) from the kernel's SGPR footprint —
+   *   numerically identical (static dispatch of the same Boris code).
    */
-  template <SRMetricClass M, class P = PusherPolicy<M>>
+  enum class PusherSpec { Generic, BorisOnly };
+
+  /**
+   * @tparam M  Metric
+   * @tparam P  Extra policies
+   * @tparam PS Pusher-algorithm specialization (see PusherSpec). Default
+   *   `Generic` ⇒ original behaviour for all existing callers.
+   */
+  template <SRMetricClass M, class P = PusherPolicy<M>,
+            PusherSpec PS = PusherSpec::Generic>
   struct Pusher_kernel {
     using E                   = typename P::EmissionPolicy;
     using PUPD                = typename P::CustomParticleUpdatePolicy;
@@ -121,9 +136,34 @@ namespace kernel::sr {
         }
         return;
       }
+      // C2 (pusher P5-analogue): for a Cartesian metric every consumer
+      // of the recovered position reduces to a constant dx / dx_inv
+      // scaling that **ignores** the position argument —
+      //   field rotation : transform_xyz<U,XYZ> = v * sqrt_h_(xp) = v*dx
+      //   position push  : transform<XYZ,U>     = v / sqrt_h_(xp) = v/dx
+      // (metric `sqrt_h_`/`h_` take an unnamed `const coord_t&` and
+      // return a constant for Minkowski; verified in minkowski.h). The
+      // `xp_Ph` chain is already policy-`if constexpr`-gated. So when no
+      // policy needs real coordinates the entire `getParticlePosition`
+      // recovery is dead scalar work: skip it, leave `xp_Cd` ZERO, and
+      // the transforms return the *identical* v*dx / v/dx. Bit-exact by
+      // construction; any non-Cartesian / policy-active config keeps the
+      // original behaviour verbatim (predicate false ⇒ call retained).
+      constexpr bool position_unused =
+        (M::CoordType == Coord::Cartesian) and (not HasEmission) and
+        (not HasExtForce) and (not Atm) and (not HasExtEfield) and
+        (not HasExtBfield) and (not HasCustomPrtlUpdate);
       coord_t<M::PrtlDim> xp_Cd { ZERO };
-      getParticlePosition(p, xp_Cd);
-      if (ctx.pusher_flags == ParticlePusher::PHOTON) {
+      if constexpr (not position_unused) {
+        getParticlePosition(p, xp_Cd);
+      }
+      // C1: condition folds to a compile-time constant for BorisOnly
+      // (pure-Boris species ⇒ never PHOTON) so the optimizer DCEs the
+      // photon arm + its scalars. Generic ⇒ exact original runtime test.
+      const bool is_photon_ = (PS == PusherSpec::BorisOnly)
+                                ? false
+                                : (ctx.pusher_flags == ParticlePusher::PHOTON);
+      if (is_photon_) {
         /**
          * Procedure for massless particles
          */
@@ -248,7 +288,13 @@ namespace kernel::sr {
           getExternalForce(xp_Cd, xp_Ph, external_force_Cart);
         }
 
-        if (ctx.pusher_flags & ParticlePusher::GCA) {
+        // C1: folds to false for BorisOnly ⇒ the entire GCA/hybrid arm
+        // (incl. its E²/B²/rL scalars + velocityEMPush_GCA) is DCE'd;
+        // is_gca stays false. Generic ⇒ exact original runtime test.
+        const bool use_gca_ = (PS == PusherSpec::BorisOnly)
+                                ? false
+                                : (ctx.pusher_flags & ParticlePusher::GCA);
+        if (use_gca_) {
           /* hybrid GCA/conventional mode --------------------------------- */
           const auto E2 { NORM_SQR(ei_Cart[0], ei_Cart[1], ei_Cart[2]) };
           const auto B2 { NORM_SQR(bi_Cart[0], bi_Cart[1], bi_Cart[2]) };
@@ -294,9 +340,16 @@ namespace kernel::sr {
             particles.ux2(p) += HALF * ctx.dt * external_force_Cart[1];
             particles.ux3(p) += HALF * ctx.dt * external_force_Cart[2];
           }
-          if (ctx.pusher_flags & ParticlePusher::BORIS) {
+          // C1: BorisOnly ⇒ use_boris_ folds to true (Vay + error arms
+          // DCE'd, dropping the Vay path's scalars); Generic ⇒ exact
+          // original BORIS/VAY/else dispatch.
+          const bool use_boris_ = (PS == PusherSpec::BorisOnly)
+                                    ? true
+                                    : (ctx.pusher_flags & ParticlePusher::BORIS);
+          if (use_boris_) {
             velocityEMPush_Boris(p, ei_Cart, bi_Cart);
-          } else if (ctx.pusher_flags & ParticlePusher::VAY) {
+          } else if ((PS != PusherSpec::BorisOnly) and
+                     (ctx.pusher_flags & ParticlePusher::VAY)) {
             velocityEMPush_Vay(p, ei_Cart, bi_Cart);
           } else {
             raise::KernelError(HERE, "Invalid pusher algorithm for GCA mode");
