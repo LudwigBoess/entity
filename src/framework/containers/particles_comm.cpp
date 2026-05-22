@@ -10,7 +10,6 @@
 #include "utils/log.h"
 
 #include "framework/containers/particles.h"
-
 #include "kernels/comm.hpp"
 
 #include <mpi.h>
@@ -29,6 +28,8 @@ namespace ntt {
                    npart_t      nsend,
                    npart_t      nrecv,
                    npart_t      offset) {
+      // Caller (Particles::Communicate) issues one Kokkos::fence per direction
+      // after PopulatePrtlSendBuffer. Required on Intel PVC for GPU-aware MPI.
 #if !defined(DEVICE_ENABLED) || defined(GPU_AWARE_MPI)
       MPI_Sendrecv(send_arr.data(),
                    nsend,
@@ -99,6 +100,7 @@ namespace ntt {
 
     template <typename T>
     void send(array_t<T*>& send_arr, int send_rank, npart_t nsend) {
+      // Caller fences once per direction. Required on Intel PVC.
 #if !defined(DEVICE_ENABLED) || defined(GPU_AWARE_MPI)
       MPI_Send(send_arr.data(), nsend, mpi::get_type<T>(), send_rank, 0, MPI_COMM_WORLD);
 #else
@@ -110,6 +112,7 @@ namespace ntt {
 
     template <typename T>
     void recv(array_t<T*>& recv_arr, int recv_rank, npart_t nrecv, npart_t offset) {
+      // Caller fences once per direction. Required on Intel PVC.
 #if !defined(DEVICE_ENABLED) || defined(GPU_AWARE_MPI)
       MPI_Recv(recv_arr.data() + offset,
                nrecv,
@@ -216,7 +219,7 @@ namespace ntt {
           shifts_in_x1, shifts_in_x2, shifts_in_x3,
           outgoing_indices,
           npart(), npart_alive, npart_dead, ntags(),
-          i1, i1_prev, 
+          i1, i1_prev,
           i2, i2_prev,
           i3, i3_prev,
           tag, tag_offsets)
@@ -225,7 +228,7 @@ namespace ntt {
 
     // number of arrays of each type to send/recv
     const unsigned short NREALS = 4 + static_cast<unsigned short>(
-                                        D == Dim::_2D and C != Coord::Cart);
+                                        D == Dim::_2D and C != Coord::Cartesian);
     const unsigned short NINTS   = 2 * static_cast<unsigned short>(D);
     const unsigned short NPRTLDX = 2 * static_cast<unsigned short>(D);
     const unsigned short NPLDS_R = npld_r();
@@ -249,8 +252,10 @@ namespace ntt {
                                             npart_recv * NPLDS_I };
     }
 
-    auto iteration        = 0;
-    auto current_received = 0;
+    // tag_offsets host mirror is invariant across directions; hoist once.
+    auto    tag_offsets_h    = Kokkos::create_mirror_view(tag_offsets);
+    Kokkos::deep_copy(tag_offsets_h, tag_offsets);
+    npart_t current_received = 0;
 
     for (const auto& direction : dirs_to_comm) {
       const auto send_rank     = send_ranks.at(direction);
@@ -277,9 +282,6 @@ namespace ntt {
                                               npart_send_in * NPLDS_I };
       }
 
-      auto tag_offsets_h = Kokkos::create_mirror_view(tag_offsets);
-      Kokkos::deep_copy(tag_offsets_h, tag_offsets);
-
       npart_t idx_offset = npart_dead;
       if (tag_send > 2) {
         idx_offset += tag_offsets_h(tag_send - 3);
@@ -294,11 +296,19 @@ namespace ntt {
           i1, i1_prev, dx1, dx1_prev,
           i2, i2_prev, dx2, dx2_prev,
           i3, i3_prev, dx3, dx3_prev,
-          ux1, ux2, ux3, 
+          ux1, ux2, ux3,
           weight, phi, pld_r, pld_i, tag,
           outgoing_indices)
       );
       // clang-format on
+
+#if defined(DEVICE_ENABLED)
+      // Required on Intel PVC: GPU-aware MPI must observe completed kernels
+      // before reading device buffers. One fence per direction covers all
+      // per-type prtls::communicate calls below (they read the same set of
+      // buffers written by the kernel above, with no intervening kernel).
+      Kokkos::fence();
+#endif
 
       const auto recv_offset_int    = current_received * NINTS;
       const auto recv_offset_real   = current_received * NREALS;
@@ -346,8 +356,6 @@ namespace ntt {
                                     recv_offset_pld_i);
       }
       current_received += npart_recv_in;
-      iteration++;
-
     } // end direction loop
 
     // clang-format off
@@ -382,13 +390,13 @@ namespace ntt {
                                              const dir::map_t<D, int>&,        \
                                              const dir::map_t<D, int>&);
 
-  PARTICLES_COMM(Dim::_1D, Coord::Cart)
-  PARTICLES_COMM(Dim::_2D, Coord::Cart)
-  PARTICLES_COMM(Dim::_3D, Coord::Cart)
-  PARTICLES_COMM(Dim::_2D, Coord::Sph)
-  PARTICLES_COMM(Dim::_2D, Coord::Qsph)
-  PARTICLES_COMM(Dim::_3D, Coord::Sph)
-  PARTICLES_COMM(Dim::_3D, Coord::Qsph)
+  PARTICLES_COMM(Dim::_1D, Coord::Cartesian)
+  PARTICLES_COMM(Dim::_2D, Coord::Cartesian)
+  PARTICLES_COMM(Dim::_3D, Coord::Cartesian)
+  PARTICLES_COMM(Dim::_2D, Coord::Spherical)
+  PARTICLES_COMM(Dim::_2D, Coord::Qspherical)
+  PARTICLES_COMM(Dim::_3D, Coord::Spherical)
+  PARTICLES_COMM(Dim::_3D, Coord::Qspherical)
 #undef PARTICLES_COMM
 
 } // namespace ntt

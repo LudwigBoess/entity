@@ -1,31 +1,69 @@
 if(${PGEN_FOUND})
-  printchoices(
-    "Problem generator"
-    "pgen"
-    "${problem_generators}"
-    ${PGEN}
-    ""
-    "${Blue}"
-    PGEN_REPORT
-    0)
-elseif(${TESTS})
+  if(${single_pgen_mode})
+    printchoices(
+      "Problem generator"
+      "pgen"
+      "${problem_generators}"
+      "${PGEN}"
+      ""
+      "${Blue}"
+      PGEN_REPORT
+      0)
+  else()
+    printchoices(
+      "Problem generators"
+      "pgens"
+      "${problem_generators}"
+      "${pgens_short}"
+      ""
+      "${Blue}"
+      PGEN_REPORT
+      0)
+  endif()
+endif()
+
+if(${TESTS})
   set(TEST_NAMES "")
   foreach(test_dir IN LISTS TEST_DIRECTORIES)
     get_property(
       LOCAL_TEST_NAMES
-      DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/${test_dir}/tests
+      DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/tests/${test_dir}
       PROPERTY TESTS)
     list(APPEND TEST_NAMES ${LOCAL_TEST_NAMES})
   endforeach()
   printchoices(
-    "Test cases"
+    "Tests"
+    "TESTS"
+    "${ON_OFF_VALUES}"
+    "ON"
+    "OFF"
+    "${Green}"
+    TESTS_REPORT_1
+    46)
+  printchoices(
+    ""
     ""
     "${TEST_NAMES}"
     ""
     "${ColorReset}"
     ""
-    TESTS_REPORT
+    TESTS_REPORT_2
     0)
+  # remove only first line of TESTS_REPORT_2
+  string(REPLACE "\n" ";" TESTS_REPORT_2_LIST "${TESTS_REPORT_2}")
+  list(REMOVE_AT TESTS_REPORT_2_LIST 0)
+  string(REPLACE ";" "\n" TESTS_REPORT_2 "${TESTS_REPORT_2_LIST}")
+  set(TESTS_REPORT "${TESTS_REPORT_1}\n${TESTS_REPORT_2}")
+else()
+  printchoices(
+    "Tests"
+    "TESTS"
+    "${ON_OFF_VALUES}"
+    "OFF"
+    "OFF"
+    "${Green}"
+    TESTS_REPORT
+    46)
 endif()
 
 printchoices(
@@ -65,6 +103,15 @@ printchoices(
   OUTPUT_REPORT
   46)
 printchoices(
+  "Ascent"
+  "ascent"
+  "${ON_OFF_VALUES}"
+  ${ascent}
+  ${default_ascent}
+  "${Green}"
+  ASCENT_REPORT
+  46)
+printchoices(
   "MPI"
   "mpi"
   "${ON_OFF_VALUES}"
@@ -82,6 +129,26 @@ if(${mpi} AND ${DEVICE_ENABLED})
     OFF
     "${Green}"
     GPU_AWARE_MPI_REPORT
+    46)
+endif()
+printchoices(
+  "Team Policy"
+  "team_policy"
+  "${ON_OFF_VALUES}"
+  ${team_policy}
+  OFF
+  "${Green}"
+  TEAM_POLICY_REPORT
+  46)
+if(${team_policy})
+  printchoices(
+    "Team Tile Size"
+    "team_policy_tile_size"
+    "${team_policy_tile_sizes}"
+    ${team_policy_tile_size}
+    ${default_team_policy_tile_size}
+    "${Blue}"
+    TEAM_POLICY_TILE_SIZE_REPORT
     46)
 endif()
 printchoices(
@@ -120,9 +187,8 @@ string(APPEND REPORT_TEXT ${DASHED_LINE_SYMBOL} "\n" "Configurations" "\n")
 
 if(${PGEN_FOUND})
   string(APPEND REPORT_TEXT "  " ${PGEN_REPORT} "\n")
-elseif(${TESTS})
-  string(APPEND REPORT_TEXT "  " ${TESTS_REPORT} "\n")
 endif()
+string(APPEND REPORT_TEXT "  " ${TESTS_REPORT} "\n")
 
 string(
   APPEND
@@ -138,6 +204,9 @@ string(
   "\n"
   "  "
   ${OUTPUT_REPORT}
+  "\n"
+  "  "
+  ${ASCENT_REPORT}
   "\n")
 
 string(REPLACE ";" "+" Kokkos_ARCH "${Kokkos_ARCH}")
@@ -158,6 +227,11 @@ string(
 
 if(${mpi} AND ${DEVICE_ENABLED})
   string(APPEND REPORT_TEXT "  " ${GPU_AWARE_MPI_REPORT} "\n")
+endif()
+
+string(APPEND REPORT_TEXT "  " ${TEAM_POLICY_REPORT} "\n")
+if(${team_policy})
+  string(APPEND REPORT_TEXT "  " ${TEAM_POLICY_TILE_SIZE_REPORT} "\n")
 endif()
 
 string(
@@ -236,6 +310,11 @@ if(${output})
     string(APPEND REPORT_TEXT "    " "${Dim}${adios2_BUILD_DIR}${ColorReset}"
            "\n")
   endif()
+endif()
+
+if(${ascent})
+  string(APPEND REPORT_TEXT "  - Ascent: v" ${ASCENT_VERSION} "\n")
+  string(APPEND REPORT_TEXT "    " "${Dim}${Ascent_DIR}${ColorReset}" "\n")
 endif()
 
 string(

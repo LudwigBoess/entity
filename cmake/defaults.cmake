@@ -59,6 +59,18 @@ endif()
 
 set_property(CACHE default_gui PROPERTY TYPE BOOL)
 
+if(DEFINED ENV{Entity_ENABLE_ASCENT})
+  set(default_ascent
+      $ENV{Entity_ENABLE_ASCENT}
+      CACHE INTERNAL "Default flag for Ascent in situ visualization")
+else()
+  set(default_ascent
+      OFF
+      CACHE INTERNAL "Default flag for Ascent in situ visualization")
+endif()
+
+set_property(CACHE default_ascent PROPERTY TYPE BOOL)
+
 if(DEFINED ENV{Entity_ENABLE_MPI})
   set(default_mpi
       $ENV{Entity_ENABLE_MPI}
@@ -92,3 +104,20 @@ else()
 endif()
 
 set_property(CACHE default_gpu_aware_mpi PROPERTY TYPE BOOL)
+
+# --------------------------- team_policy defaults -------------------------- #
+# (Pattern A — tile-blocked deposit/pusher with TeamPolicy + scratch.)
+if(DEFINED ENV{Entity_ENABLE_TEAM_POLICY})
+  set(default_team_policy
+      $ENV{Entity_ENABLE_TEAM_POLICY}
+      CACHE INTERNAL "Default flag for team_policy tile-blocked kernels")
+else()
+  set(default_team_policy
+      OFF
+      CACHE INTERNAL "Default flag for team_policy tile-blocked kernels")
+endif()
+set_property(CACHE default_team_policy PROPERTY TYPE BOOL)
+
+set(default_team_policy_tile_size
+    8
+    CACHE INTERNAL "Default tile edge length in cells for team_policy")

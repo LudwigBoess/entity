@@ -68,6 +68,7 @@ namespace ntt::defaults {
     const std::string              format           = "BPFile";
     const timestep_t               interval         = 100;
     const unsigned short           mom_smooth       = 0;
+    const bool                     mom_window       = false;
     const npart_t                  prtl_stride      = 100;
     const real_t                   spec_emin        = 1e-3;
     const real_t                   spec_emax        = 1e3;
@@ -97,11 +98,15 @@ namespace ntt::defaults {
   } // namespace gca
 
   namespace synchrotron {
-    const real_t gamma_rad = 1.0;
+    const real_t energy_min = 1e-3;
+    const real_t gamma_rad  = 1.0;
+    const real_t gamma_qed  = 10.0;
   } // namespace synchrotron
 
   namespace compton {
-    const real_t gamma_rad = 1.0;
+    const real_t energy_min = 1e-3;
+    const real_t gamma_rad  = 1.0;
+    const real_t gamma_qed  = 10.0;
   } // namespace compton
 } // namespace ntt::defaults
 

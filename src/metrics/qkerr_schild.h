@@ -33,12 +33,13 @@ namespace metric {
     // Spin parameter, in [0,1[
     // and horizon size in units of rg
     // all physical extents are in units of rg
-    const real_t a, rg_, rh_;
+    const real_t a, rg_ { ONE }, rh_;
 
     const real_t r0, h0;
     const real_t chi_min, eta_min, phi_min;
     const real_t dchi, deta, dphi;
     const real_t dchi_inv, deta_inv, dphi_inv;
+    const bool   small_angle;
 
     Inline auto Delta(real_t r) const -> real_t {
       return SQR(r) - TWO * r + SQR(a);
@@ -57,10 +58,10 @@ namespace metric {
     }
 
   public:
-    static constexpr const char*       Label { "qkerr_schild" };
-    static constexpr Dimension         PrtlDim { D };
-    static constexpr ntt::Metric::type MetricType { ntt::Metric::QKerr_Schild };
-    static constexpr ntt::Coord::type  CoordType { ntt::Coord::Qsph };
+    static constexpr const char* Label { "qkerr_schild" };
+    static constexpr Dimension   PrtlDim { D };
+    static constexpr ntt::Metric MetricType { ntt::Metric::QKerr_Schild };
+    static constexpr ntt::Coord::type CoordType { ntt::Coord::type::Qspherical };
     using MetricBase<D>::x1_min;
     using MetricBase<D>::x1_max;
     using MetricBase<D>::x2_min;
@@ -77,7 +78,6 @@ namespace metric {
                 const std::map<std::string, real_t>& params)
       : MetricBase<D> { res, ext }
       , a { params.at("a") }
-      , rg_ { ONE }
       , rh_ { ONE + math::sqrt(ONE - SQR(a)) }
       , r0 { params.at("r0") }
       , h0 { params.at("h") }
@@ -89,11 +89,10 @@ namespace metric {
       , dphi { (x3_max - phi_min) / nx3 }
       , dchi_inv { ONE / dchi }
       , deta_inv { ONE / deta }
-      , dphi_inv { ONE / dphi } {
+      , dphi_inv { ONE / dphi }
+      , small_angle { eta2theta(HALF * deta) < constant::SMALL_ANGLE } {
       set_dxMin(find_dxMin());
     }
-
-    ~QKerrSchild() = default;
 
     [[nodiscard]]
     Inline auto spin() const -> real_t {
@@ -114,15 +113,15 @@ namespace metric {
      * minimum effective cell size for a given metric (in physical units)
      */
     [[nodiscard]]
-    auto find_dxMin() const -> real_t override {
+    auto find_dxMin() const -> real_t {
       // for 2D
       real_t min_dx { -ONE };
       for (int i { 0 }; i < nx1; ++i) {
         for (int j { 0 }; j < nx2; ++j) {
-          real_t            i_ { static_cast<real_t>(i) + HALF };
-          real_t            j_ { static_cast<real_t>(j) + HALF };
-          coord_t<Dim::_2D> ij { i_, j_ };
-          real_t dx = ONE / (alpha(ij) * std::sqrt(h<1, 1>(ij) + h<2, 2>(ij)) +
+          const coord_t<Dim::_2D> ij { static_cast<real_t>(i) + HALF,
+                                       static_cast<real_t>(j) + HALF };
+          const real_t            dx = ONE /
+                            (alpha(ij) * std::sqrt(h<1, 1>(ij) + h<2, 2>(ij)) +
                              beta1(ij));
           if ((min_dx > dx) || (min_dx < 0.0)) {
             min_dx = dx;
@@ -136,7 +135,7 @@ namespace metric {
      * total volume of the region described by the metric (in physical units)
      */
     [[nodiscard]]
-    auto totVolume() const -> real_t override {
+    auto totVolume() const -> real_t {
       // @TODO: Ask Alisa
       return ZERO;
     }
@@ -503,15 +502,27 @@ namespace metric {
      * differential area at the pole (used in axisymmetric solvers)
      * @note approximate solution for the polar area
      * @param x1 radial coordinate along the axis (code units)
+     * @note uses small-angle approximation when the resolution is too high
      */
     Inline auto polar_area(real_t x1) const -> real_t {
       if constexpr (D != Dim::_1D) {
-        return dchi * math::exp(x1 * dchi + chi_min) *
-               (SQR(r0 + math::exp(x1 * dchi + chi_min)) + SQR(a)) *
-               math::sqrt(
-                 ONE + TWO * (r0 + math::exp(x1 * dchi + chi_min)) /
-                         (SQR(r0 + math::exp(x1 * dchi + chi_min)) + SQR(a))) *
-               (ONE - math::cos(eta2theta(HALF * deta)));
+        if (small_angle) {
+          const real_t dtheta = eta2theta(HALF * deta);
+          return dchi * math::exp(x1 * dchi + chi_min) *
+                 (SQR(r0 + math::exp(x1 * dchi + chi_min)) + SQR(a)) *
+                 math::sqrt(
+                   ONE + TWO * (r0 + math::exp(x1 * dchi + chi_min)) /
+                           (SQR(r0 + math::exp(x1 * dchi + chi_min)) + SQR(a))) *
+                 (static_cast<real_t>(48) - SQR(dtheta)) * SQR(dtheta) /
+                 static_cast<real_t>(384);
+        } else {
+          return dchi * math::exp(x1 * dchi + chi_min) *
+                 (SQR(r0 + math::exp(x1 * dchi + chi_min)) + SQR(a)) *
+                 math::sqrt(
+                   ONE + TWO * (r0 + math::exp(x1 * dchi + chi_min)) /
+                           (SQR(r0 + math::exp(x1 * dchi + chi_min)) + SQR(a))) *
+                 (ONE - math::cos(eta2theta(HALF * deta)));
+        }
       }
     }
 
@@ -649,6 +660,53 @@ namespace metric {
       }
     }
 
+    /**
+     * component-wise vector transformations
+     * @note phys cntrv/cov <-> cntrv/cov
+     */
+    template <idx_t i, Idx in, Idx out>
+    Inline auto transform(const coord_t<D>& xi, real_t v_in) const -> real_t {
+      static_assert(i > 0 && i <= 3, "Invalid index i");
+      static_assert(in != out, "Invalid vector transformation");
+      static_assert(((in == Idx::U) and (out == Idx::PU)) or
+                      ((in == Idx::PU) and (out == Idx::U)) or
+                      ((in == Idx::D) and (out == Idx::PD)) or
+                      ((in == Idx::PD) and (out == Idx::D)),
+                    "Invalid vector transformation: only cntrv/cov <-> phys "
+                    "cntrv/cov allowed");
+      if constexpr ((in == Idx::PU && out == Idx::U) ||
+                    (in == Idx::D && out == Idx::PD)) {
+        // phys cntrv -> cntrv || cov -> phys cov
+        if constexpr (i == 1) {
+          return v_in * dchi_inv / (math::exp(xi[0] * dchi + chi_min));
+        } else if constexpr (i == 2) {
+          return v_in * deta_inv / (dtheta_deta(xi[1] * deta + eta_min));
+        } else {
+          if constexpr (D == Dim::_2D) {
+            return v_in;
+          } else {
+            return v_in * dphi_inv;
+          }
+        }
+      } else if constexpr ((in == Idx::U && out == Idx::PU) ||
+                           (in == Idx::PD && out == Idx::D)) {
+        // cntrv -> phys cntrv || phys cov -> cov
+        if constexpr (i == 1) {
+          return v_in * math::exp(xi[0] * dchi + chi_min) * dchi;
+        } else if constexpr (i == 2) {
+          return v_in * (dtheta_deta(xi[1] * deta + eta_min) * deta);
+        } else {
+          if constexpr (D == Dim::_2D) {
+            return v_in;
+          } else {
+            return v_in * dphi;
+          }
+        }
+      } else {
+        raise::KernelError(HERE, "Invalid transformation");
+      }
+    }
+
   private:
     /* Specific for Quasi-Spherical metric with angle stretching ------------ */
     /**
@@ -704,7 +762,7 @@ namespace metric {
         using namespace constant;
         // R = (-9 h^2 (Pi - 2 y) + Sqrt[3] Sqrt[-(h^3 ((-4 + h) (Pi + 2 h Pi)^2
         // + 108 h Pi y - 108 h y^2))])^(1/3)
-        double                  R { math::pow(
+        const double            R { math::pow(
           -9.0 * SQR(h0) * (PI - 2.0 * theta) +
             SQRT3 * math::sqrt((CUBE(h0) * ((4.0 - h0) * SQR(PI + h0 * TWO_PI) -
                                             108.0 * h0 * PI * theta +

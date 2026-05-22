@@ -1,5 +1,6 @@
 #include "output/writer.h"
 
+#include "enums.h"
 #include "global.h"
 
 #include "arch/kokkos_aliases.h"
@@ -10,7 +11,7 @@
 
 #include <Kokkos_Core.hpp>
 #include <adios2.h>
-#include <adios2/cxx11/KokkosView.h>
+#include <adios2/cxx/KokkosView.h>
 
 #if defined(MPI_ENABLED)
   #include "arch/mpi_aliases.h"
@@ -18,19 +19,22 @@
   #include <mpi.h>
 #endif
 
+#include <algorithm>
+#include <cstddef>
+#include <exception>
 #include <filesystem>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace out {
 
   void Writer::init(adios2::ADIOS*     ptr_adios,
                     const std::string& engine,
-                    const std::string& title,
-                    bool               use_separate_files) {
-    m_separate_files = use_separate_files;
-    m_engine         = fmt::toLower(engine);
-    p_adios          = ptr_adios;
+                    const std::string& title) {
+    m_engine = fmt::toLower(engine);
+    p_adios  = ptr_adios;
 
     raise::ErrorIf(p_adios == nullptr, "ADIOS pointer is null", HERE);
 
@@ -48,9 +52,8 @@ namespace out {
     m_trackers.insert({ type, tools::Tracker(type, interval, interval_time) });
   }
 
-  auto Writer::shouldWrite(const std::string& type,
-                           timestep_t         step,
-                           simtime_t          time) -> bool {
+  auto Writer::shouldWrite(const std::string& type, timestep_t step, simtime_t time)
+    -> bool {
     if (m_trackers.find(type) != m_trackers.end()) {
       return m_trackers.at(type).shouldWrite(step, time);
     } else {
@@ -63,10 +66,37 @@ namespace out {
     m_mode = mode;
   }
 
+  void Writer::setLocalLayout(const std::vector<ncells_t>& loc_corner,
+                              const std::vector<ncells_t>& loc_shape) {
+    raise::ErrorIf(loc_corner.size() != m_flds_l_corner.size() or
+                     loc_shape.size() != m_flds_l_shape.size(),
+                   "setLocalLayout dim mismatch with the original layout",
+                   HERE);
+    m_flds_l_corner = loc_corner;
+    m_flds_l_shape  = loc_shape;
+    m_flds_l_corner_dwn.clear();
+    m_flds_l_shape_dwn.clear();
+    m_flds_l_first.clear();
+    for (auto i { 0u }; i < m_flds_g_shape.size(); ++i) {
+      const double d = static_cast<double>(m_dwn[i]);
+      const double l = static_cast<double>(loc_corner[i]);
+      const double n = static_cast<double>(loc_shape[i]);
+      const double f = math::ceil(l / d) * d - l;
+      m_flds_l_corner_dwn.push_back(static_cast<ncells_t>(math::ceil(l / d)));
+      m_flds_l_first.push_back(static_cast<ncells_t>(f));
+      m_flds_l_shape_dwn.push_back(static_cast<ncells_t>(math::ceil((n - f) / d)));
+    }
+    if constexpr (not std::is_same<typename ndfield_t<Dim::_3D, 6>::array_layout,
+                                   Kokkos::LayoutRight>::value) {
+      std::reverse(m_flds_l_corner_dwn.begin(), m_flds_l_corner_dwn.end());
+      std::reverse(m_flds_l_shape_dwn.begin(), m_flds_l_shape_dwn.end());
+    }
+  }
+
   void Writer::defineMeshLayout(
-    const std::vector<std::size_t>&              glob_shape,
-    const std::vector<std::size_t>&              loc_corner,
-    const std::vector<std::size_t>&              loc_shape,
+    const std::vector<ncells_t>&                 glob_shape,
+    const std::vector<ncells_t>&                 loc_corner,
+    const std::vector<ncells_t>&                 loc_shape,
     const std::pair<unsigned int, unsigned int>& domain_idx,
     const std::vector<unsigned int>&             dwn,
     bool                                         incl_ghosts,
@@ -83,10 +113,10 @@ namespace out {
                      "Downsampling with ghosts not supported",
                      HERE);
 
-      const double g = glob_shape[i];
-      const double d = m_dwn[i];
-      const double l = loc_corner[i];
-      const double n = loc_shape[i];
+      const double g = static_cast<double>(glob_shape[i]);
+      const double d = static_cast<double>(m_dwn[i]);
+      const double l = static_cast<double>(loc_corner[i]);
+      const double n = static_cast<double>(loc_shape[i]);
       const double f = math::ceil(l / d) * d - l;
       m_flds_g_shape_dwn.push_back(static_cast<ncells_t>(math::ceil(g / d)));
       m_flds_l_corner_dwn.push_back(static_cast<ncells_t>(math::ceil(l / d)));
@@ -94,30 +124,31 @@ namespace out {
       m_flds_l_shape_dwn.push_back(static_cast<ncells_t>(math::ceil((n - f) / d)));
     }
 
-    m_io.DefineAttribute("NGhosts", incl_ghosts ? N_GHOSTS : 0);
+    m_io.DefineAttribute("NGhosts",
+                         incl_ghosts ? N_GHOSTS : static_cast<ncells_t>(0));
     m_io.DefineAttribute("Dimension", m_flds_g_shape.size());
     m_io.DefineAttribute("Coordinates", std::string(coords.to_string()));
 
     for (auto i { 0u }; i < m_flds_g_shape.size(); ++i) {
       // cell-centers
+      // ConstantDims is intentionally NOT set: per-rank slab shape can change
+      // when dynamic load balancing shifts domain boundaries between writes.
       m_io.DefineVariable<real_t>("X" + std::to_string(i + 1),
                                   { m_flds_g_shape_dwn[i] },
                                   { m_flds_l_corner_dwn[i] },
-                                  { m_flds_l_shape_dwn[i] },
-                                  adios2::ConstantDims);
+                                  { m_flds_l_shape_dwn[i] });
       // cell-edges
       const auto is_last = (m_flds_l_corner[i] + m_flds_l_shape[i] ==
                             m_flds_g_shape[i]);
       m_io.DefineVariable<real_t>("X" + std::to_string(i + 1) + "e",
                                   { m_flds_g_shape_dwn[i] + 1 },
                                   { m_flds_l_corner_dwn[i] },
-                                  { m_flds_l_shape_dwn[i] + (is_last ? 1 : 0) },
-                                  adios2::ConstantDims);
-      m_io.DefineVariable<std::size_t>("N" + std::to_string(i + 1) + "l",
-                                       { 2 * domain_idx.second },
-                                       { 2 * domain_idx.first },
-                                       { 2 },
-                                       adios2::ConstantDims);
+                                  { m_flds_l_shape_dwn[i] + (is_last ? 1 : 0) });
+      m_io.DefineVariable<std::size_t>(
+        "N" + std::to_string(i + 1) + "l",
+        { static_cast<unsigned long>(2 * domain_idx.second) },
+        { static_cast<unsigned long>(2 * domain_idx.first) },
+        { static_cast<unsigned long>(2) });
     }
 
     if constexpr (std::is_same<typename ndfield_t<Dim::_3D, 6>::array_layout,
@@ -134,30 +165,29 @@ namespace out {
   void Writer::defineFieldOutputs(const SimEngine&                S,
                                   const std::vector<std::string>& flds_out) {
     m_flds_writers.clear();
-    raise::ErrorIf((m_flds_g_shape_dwn.size() == 0) ||
-                     (m_flds_l_corner_dwn.size() == 0) ||
-                     (m_flds_l_shape_dwn.size() == 0),
+    raise::ErrorIf(m_flds_g_shape_dwn.empty() or m_flds_l_corner_dwn.empty() or
+                     m_flds_l_shape_dwn.empty(),
                    "Mesh layout must be defined before field output",
                    HERE);
     for (const auto& fld : flds_out) {
       m_flds_writers.emplace_back(S, fld);
     }
     for (const auto& fld : m_flds_writers) {
-      if (fld.comp.size() == 0) {
+      // ConstantDims is intentionally NOT set: per-rank slab shape can change
+      // when dynamic load balancing shifts domain boundaries between writes.
+      if (fld.comp.empty()) {
         // scalar
         m_io.DefineVariable<real_t>(fld.name(),
                                     m_flds_g_shape_dwn,
                                     m_flds_l_corner_dwn,
-                                    m_flds_l_shape_dwn,
-                                    adios2::ConstantDims);
+                                    m_flds_l_shape_dwn);
       } else {
         // vector or tensor
         for (auto i { 0u }; i < fld.comp.size(); ++i) {
           m_io.DefineVariable<real_t>(fld.name(i),
                                       m_flds_g_shape_dwn,
                                       m_flds_l_corner_dwn,
-                                      m_flds_l_shape_dwn,
-                                      adios2::ConstantDims);
+                                      m_flds_l_shape_dwn);
         }
       }
     }
@@ -186,22 +216,27 @@ namespace out {
                   std::size_t               comp,
                   std::vector<unsigned int> dwn,
                   std::vector<ncells_t>     first_cell,
-                  bool                      ghosts) {
+                  bool                      ghosts,
+                  const adios2::Dims&       loc_corner_dwn,
+                  const adios2::Dims&       loc_shape_dwn) {
     // when dwn != 1 in any direction, it is assumed that ghosts == false
-    auto         var      = io.InquireVariable<real_t>(varname);
+    auto var = io.InquireVariable<real_t>(varname);
+    // Refresh the per-step (start, count) so the slab tracks any rebalance
+    // that happened since the variable was declared.
+    var.SetSelection(adios2::Box<adios2::Dims>(loc_corner_dwn, loc_shape_dwn));
     const auto   gh_zones = ghosts ? 0 : N_GHOSTS;
     ndarray_t<D> output_field {};
 
     if constexpr (D == Dim::_1D) {
       if (ghosts || dwn[0] == 1) {
-        auto slice_i1 = range_tuple_t(gh_zones, field.extent(0) - gh_zones);
+        auto slice_i1 = cell_range_t(gh_zones, field.extent(0) - gh_zones);
         auto slice    = Kokkos::subview(field, slice_i1, comp);
         output_field  = array_t<real_t*> { "output_field", slice.extent(0) };
         Kokkos::deep_copy(output_field, slice);
       } else {
 
         const auto   dwn1          = dwn[0];
-        const double first_cell1_d = first_cell[0];
+        const double first_cell1_d = static_cast<double>(first_cell[0]);
         const double nx1_full      = field.extent(0) - 2 * N_GHOSTS;
         const auto   first_cell1   = first_cell[0];
 
@@ -212,14 +247,14 @@ namespace out {
         Kokkos::parallel_for(
           "outputField",
           nx1_dwn,
-          Lambda(index_t i1) {
+          Lambda(cellidx_t i1) {
             output_field(i1) = field(first_cell1 + i1 * dwn1 + N_GHOSTS, comp);
           });
       }
     } else if constexpr (D == Dim::_2D) {
       if (ghosts || (dwn[0] == 1 && dwn[1] == 1)) {
-        auto slice_i1 = range_tuple_t(gh_zones, field.extent(0) - gh_zones);
-        auto slice_i2 = range_tuple_t(gh_zones, field.extent(1) - gh_zones);
+        auto slice_i1 = cell_range_t(gh_zones, field.extent(0) - gh_zones);
+        auto slice_i2 = cell_range_t(gh_zones, field.extent(1) - gh_zones);
         auto slice    = Kokkos::subview(field, slice_i1, slice_i2, comp);
         output_field  = array_t<real_t**> { "output_field",
                                             slice.extent(0),
@@ -228,8 +263,8 @@ namespace out {
       } else {
         const auto   dwn1          = dwn[0];
         const auto   dwn2          = dwn[1];
-        const double first_cell1_d = first_cell[0];
-        const double first_cell2_d = first_cell[1];
+        const double first_cell1_d = static_cast<double>(first_cell[0]);
+        const double first_cell2_d = static_cast<double>(first_cell[1]);
         const double nx1_full      = field.extent(0) - 2 * N_GHOSTS;
         const double nx2_full      = field.extent(1) - 2 * N_GHOSTS;
         const auto   first_cell1   = first_cell[0];
@@ -243,7 +278,7 @@ namespace out {
         Kokkos::parallel_for(
           "outputField",
           CreateRangePolicy<Dim::_2D>({ 0, 0 }, { nx1_dwn, nx2_dwn }),
-          Lambda(index_t i1, index_t i2) {
+          Lambda(cellidx_t i1, cellidx_t i2) {
             output_field(i1, i2) = field(first_cell1 + i1 * dwn1 + N_GHOSTS,
                                          first_cell2 + i2 * dwn2 + N_GHOSTS,
                                          comp);
@@ -251,9 +286,9 @@ namespace out {
       }
     } else if constexpr (D == Dim::_3D) {
       if (ghosts || (dwn[0] == 1 && dwn[1] == 1 && dwn[2] == 1)) {
-        auto slice_i1 = range_tuple_t(gh_zones, field.extent(0) - gh_zones);
-        auto slice_i2 = range_tuple_t(gh_zones, field.extent(1) - gh_zones);
-        auto slice_i3 = range_tuple_t(gh_zones, field.extent(2) - gh_zones);
+        auto slice_i1 = cell_range_t(gh_zones, field.extent(0) - gh_zones);
+        auto slice_i2 = cell_range_t(gh_zones, field.extent(1) - gh_zones);
+        auto slice_i3 = cell_range_t(gh_zones, field.extent(2) - gh_zones);
         auto slice = Kokkos::subview(field, slice_i1, slice_i2, slice_i3, comp);
         output_field = array_t<real_t***> { "output_field",
                                             slice.extent(0),
@@ -264,9 +299,9 @@ namespace out {
         const auto   dwn1          = dwn[0];
         const auto   dwn2          = dwn[1];
         const auto   dwn3          = dwn[2];
-        const double first_cell1_d = first_cell[0];
-        const double first_cell2_d = first_cell[1];
-        const double first_cell3_d = first_cell[2];
+        const double first_cell1_d = static_cast<double>(first_cell[0]);
+        const double first_cell2_d = static_cast<double>(first_cell[1]);
+        const double first_cell3_d = static_cast<double>(first_cell[2]);
         const double nx1_full      = field.extent(0) - 2 * N_GHOSTS;
         const double nx2_full      = field.extent(1) - 2 * N_GHOSTS;
         const double nx3_full      = field.extent(2) - 2 * N_GHOSTS;
@@ -285,7 +320,7 @@ namespace out {
         Kokkos::parallel_for(
           "outputField",
           CreateRangePolicy<Dim::_3D>({ 0, 0, 0 }, { nx1_dwn, nx2_dwn, nx3_dwn }),
-          Lambda(index_t i1, index_t i2, index_t i3) {
+          Lambda(cellidx_t i1, cellidx_t i2, cellidx_t i3) {
             output_field(i1, i2, i3) = field(first_cell1 + i1 * dwn1 + N_GHOSTS,
                                              first_cell2 + i2 * dwn2 + N_GHOSTS,
                                              first_cell3 + i3 * dwn3 + N_GHOSTS,
@@ -295,13 +330,16 @@ namespace out {
     }
     auto output_field_h = Kokkos::create_mirror_view(output_field);
     Kokkos::deep_copy(output_field_h, output_field);
+    // Pin Host: see writers.cpp pin_host() — Aurora SYCL `Detect` mis-labels
+    // host VAs as GPU and BP5 dispatches stats kernels onto unmapped pages.
+    var.SetMemorySpace(adios2::MemorySpace::Host);
     writer.Put(var, output_field_h, adios2::Mode::Sync);
   }
 
   template <Dimension D, int N>
   void Writer::writeField(const std::vector<std::string>& names,
                           const ndfield_t<D, N>&          fld,
-                          const std::vector<std::size_t>& addresses) {
+                          const std::vector<size_t>&      addresses) {
     raise::ErrorIf(addresses.size() > N,
                    "addresses vector size must be less than N",
                    HERE);
@@ -316,7 +354,9 @@ namespace out {
                        addresses[i],
                        m_dwn,
                        m_flds_l_first,
-                       m_flds_ghosts);
+                       m_flds_ghosts,
+                       m_flds_l_corner_dwn,
+                       m_flds_l_shape_dwn);
     }
   }
 
@@ -325,6 +365,7 @@ namespace out {
                                      npart_t                 loc_offset,
                                      const std::string&      varname) {
     auto var = m_io.InquireVariable<real_t>(varname);
+    var.SetMemorySpace(adios2::MemorySpace::Host);
     var.SetShape({ glob_total });
     var.SetSelection(
       adios2::Box<adios2::Dims>({ loc_offset }, { array.extent(0) }));
@@ -336,6 +377,7 @@ namespace out {
   void Writer::writeSpectrum(const array_t<real_t*>& counts,
                              const std::string&      varname) {
     auto var      = m_io.InquireVariable<real_t>(varname);
+    var.SetMemorySpace(adios2::MemorySpace::Host);
     auto counts_h = Kokkos::create_mirror_view(counts);
     Kokkos::deep_copy(counts_h, counts);
 #if defined(MPI_ENABLED)
@@ -345,7 +387,7 @@ namespace out {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Reduce(counts_h.data(),
                counts_h_all.data(),
-               counts_h.extent(0),
+               static_cast<int>(counts_h.extent(0)),
                mpi::get_type<real_t>(),
                MPI_SUM,
                MPI_ROOT_RANK,
@@ -367,6 +409,7 @@ namespace out {
   void Writer::writeSpectrumBins(const array_t<real_t*>& e_bins,
                                  const std::string&      varname) {
     auto var      = m_io.InquireVariable<real_t>(varname);
+    var.SetMemorySpace(adios2::MemorySpace::Host);
     auto e_bins_h = Kokkos::create_mirror_view(e_bins);
     Kokkos::deep_copy(e_bins_h, e_bins);
 #if defined(MPI_ENABLED)
@@ -389,8 +432,30 @@ namespace out {
                          const array_t<real_t*>&         xc,
                          const array_t<real_t*>&         xe,
                          const std::vector<std::size_t>& loc_off_sz) {
+    // Per-step (start, count) for the per-rank slab; tracks the (possibly
+    // rebalanced) layout cached by setLocalLayout().
     auto varc = m_io.InquireVariable<real_t>("X" + std::to_string(dim + 1));
     auto vare = m_io.InquireVariable<real_t>("X" + std::to_string(dim + 1) + "e");
+    varc.SetMemorySpace(adios2::MemorySpace::Host);
+    vare.SetMemorySpace(adios2::MemorySpace::Host);
+    // m_flds_l_corner_dwn / m_flds_l_shape_dwn are reversed for non-LayoutRight
+    // (see defineMeshLayout / setLocalLayout); m_flds_l_corner / m_flds_l_shape
+    // / m_flds_g_shape are not. Map the dim-order index to the dwn-array index.
+    constexpr bool layout_right = std::is_same<
+      typename ndfield_t<Dim::_3D, 6>::array_layout,
+      Kokkos::LayoutRight>::value;
+    const auto i_dwn = layout_right
+                         ? static_cast<std::size_t>(dim)
+                         : (m_flds_g_shape.size() - 1u -
+                            static_cast<std::size_t>(dim));
+    const auto is_last = (m_flds_l_corner[dim] + m_flds_l_shape[dim] ==
+                          m_flds_g_shape[dim]);
+    varc.SetSelection(adios2::Box<adios2::Dims>(
+      { m_flds_l_corner_dwn[i_dwn] },
+      { m_flds_l_shape_dwn[i_dwn] }));
+    vare.SetSelection(adios2::Box<adios2::Dims>(
+      { m_flds_l_corner_dwn[i_dwn] },
+      { m_flds_l_shape_dwn[i_dwn] + (is_last ? 1ul : 0ul) }));
     auto xc_h = Kokkos::create_mirror_view(xc);
     auto xe_h = Kokkos::create_mirror_view(xe);
     Kokkos::deep_copy(xc_h, xc);
@@ -399,6 +464,7 @@ namespace out {
     m_writer.Put(vare, xe_h, adios2::Mode::Sync);
     auto vard = m_io.InquireVariable<std::size_t>(
       "N" + std::to_string(dim + 1) + "l");
+    vard.SetMemorySpace(adios2::MemorySpace::Host);
     m_writer.Put(vard, loc_off_sz.data(), adios2::Mode::Sync);
   }
 
@@ -414,45 +480,45 @@ namespace out {
       path_t filename;
 
       const std::string ext = (m_engine == "hdf5") ? "h5" : "bp";
-      if (m_separate_files) {
-        std::string mode_str;
-        if (write_mode == WriteMode::Fields) {
-          mode_str = "fields";
-        } else if (write_mode == WriteMode::Particles) {
-          mode_str = "particles";
-        } else if (write_mode == WriteMode::Spectra) {
-          mode_str = "spectra";
-        } else {
-          raise::Fatal("Unknown write mode", HERE);
-        }
-        CallOnce(
-          [](auto&& main_path, auto&& mode_path) {
-            const path_t main { main_path };
-            const path_t mode { mode_path };
-            if (!std::filesystem::exists(main_path)) {
-              std::filesystem::create_directory(main_path);
-            }
-            if (!std::filesystem::exists(main_path / mode_path)) {
-              std::filesystem::create_directory(main_path / mode_path);
-            }
-          },
-          m_root,
-          mode_str);
-#if defined(MPI_ENABLED)
-        MPI_Barrier(MPI_COMM_WORLD);
-#endif
-        filename = m_root / path_t(mode_str) /
-                   fmt::format("%s.%08lu.%s", mode_str.c_str(), tstep, ext.c_str());
-        m_mode = adios2::Mode::Write;
+      std::string       mode_str;
+      if (write_mode == WriteMode::Fields) {
+        mode_str = "fields";
+      } else if (write_mode == WriteMode::Particles) {
+        mode_str = "particles";
+      } else if (write_mode == WriteMode::Spectra) {
+        mode_str = "spectra";
       } else {
-        filename = fmt::format("%s.%s", m_root.c_str(), ext.c_str());
-        m_mode   = std::filesystem::exists(filename) ? adios2::Mode::Append
-                                                     : adios2::Mode::Write;
+        raise::Fatal("Unknown write mode", HERE);
       }
+      CallOnce(
+        [](auto&& main_path, auto&& mode_path) {
+          if (!std::filesystem::exists(main_path)) {
+            std::filesystem::create_directory(main_path);
+          }
+          if (!std::filesystem::exists(main_path / mode_path)) {
+            std::filesystem::create_directory(main_path / mode_path);
+          }
+        },
+        m_root,
+        mode_str);
+#if defined(MPI_ENABLED)
+      MPI_Barrier(MPI_COMM_WORLD);
+#endif
+      filename = m_root / path_t(mode_str) /
+                 fmt::format("%s.%08lu.%s", mode_str.c_str(), tstep, ext.c_str());
+      m_mode   = adios2::Mode::Write;
       m_writer = m_io.Open(filename, m_mode);
       m_writer.BeginStep();
-      m_writer.Put(m_io.InquireVariable<timestep_t>("Step"), &tstep);
-      m_writer.Put(m_io.InquireVariable<simtime_t>("Time"), &time);
+      // Sync mode: tstep/time are local parameters that disappear when this
+      // function returns; a deferred Put would dangle until EndStep().
+      // Pin Host: see writers.cpp pin_host() — Aurora SYCL `Detect` mis-labels
+      // host scalar addresses as GPU.
+      auto step_var = m_io.InquireVariable<timestep_t>("Step");
+      auto time_var = m_io.InquireVariable<simtime_t>("Time");
+      step_var.SetMemorySpace(adios2::MemorySpace::Host);
+      time_var.SetMemorySpace(adios2::MemorySpace::Host);
+      m_writer.Put(step_var, &tstep, adios2::Mode::Sync);
+      m_writer.Put(time_var, &time, adios2::Mode::Sync);
       m_active_mode = write_mode;
     } catch (std::exception& e) {
       raise::Fatal(e.what(), HERE);
@@ -484,7 +550,9 @@ namespace out {
                                  std::size_t,                                  \
                                  std::vector<unsigned int>,                    \
                                  std::vector<ncells_t>,                        \
-                                 bool);
+                                 bool,                                         \
+                                 const adios2::Dims&,                          \
+                                 const adios2::Dims&);
   WRITE_FIELD(Dim::_1D, 3)
   WRITE_FIELD(Dim::_1D, 6)
   WRITE_FIELD(Dim::_2D, 3)

@@ -7,10 +7,14 @@
 
 #if defined(MPI_ENABLED)
   #include "arch/mpi_aliases.h"
+  #include "utils/tools.h"
 
   #include <mpi.h>
+
+  #include <iterator>
 #endif // MPI_ENABLED
 
+#include <algorithm>
 #include <map>
 #include <sstream>
 #include <string>
@@ -130,10 +134,12 @@ namespace timer {
     return timer_stats;
   }
 
-  auto Timers::printAll(TimerFlags flags,
-                        npart_t    npart,
-                        ncells_t   ncells) const -> std::string {
-    const std::vector<std::string> extras { "PrtlClear", "Output", "Checkpoint" };
+  auto Timers::printAll(TimerFlags flags, npart_t npart, ncells_t ncells) const
+    -> std::string {
+    const std::vector<std::string> extras { "ParticleSort",
+                                             "Output",
+                                             "Ascent",
+                                             "Checkpoint" };
     const auto stats = gather(extras, npart, ncells);
     if (stats.empty()) {
       return "";
@@ -182,7 +188,6 @@ namespace timer {
       auto        per_npart  = std::get<1>(stats.at(name));
       auto        per_ncells = std::get<2>(stats.at(name));
       const auto  tot_pct    = std::get<3>(stats.at(name));
-      const auto  var_pct    = std::get<4>(stats.at(name));
       if (flags & Timer::AutoConvert) {
         convertTime(time, units);
         convertTime(per_npart, units_npart);
@@ -190,6 +195,7 @@ namespace timer {
       }
 
       if (multi_rank) {
+        const auto var_pct = std::get<4>(stats.at(name));
         ss << fmt::alignedTable(
           { name,
             fmt::format("%.2f", time) + " " + units,
@@ -228,13 +234,13 @@ namespace timer {
 
     // total
     if (flags & Timer::PrintTotal) {
-      std::string units   = "µs";
-      auto        time    = std::get<0>(stats.at("Total"));
-      const auto  var_pct = std::get<4>(stats.at("Total"));
+      std::string units = "µs";
+      auto        time  = std::get<0>(stats.at("Total"));
       if (flags & Timer::AutoConvert) {
         convertTime(time, units);
       }
       if (multi_rank) {
+        const auto var_pct = std::get<4>(stats.at("Total"));
         ss << fmt::alignedTable(
           { "Total",
             fmt::format("%.2f", time) + " " + units,
@@ -256,12 +262,13 @@ namespace timer {
       }
     }
 
-    // print extra timers for output/checkpoint/prtlClear
-    const std::vector<TimerFlags> extras_f { Timer::PrintPrtlClear,
+    // print extra timers for output/ascent/checkpoint/particleSort
+    const std::vector<TimerFlags> extras_f { Timer::PrintParticleSort,
                                              Timer::PrintOutput,
+                                             Timer::PrintAscent,
                                              Timer::PrintCheckpoint };
     for (auto i { 0u }; i < extras.size(); ++i) {
-      const auto  name    = extras[i];
+      const auto& name    = extras[i];
       const auto  active  = flags & extras_f[i];
       std::string units   = "µs";
       auto        time    = std::get<0>(stats.at(name));

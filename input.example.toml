@@ -28,6 +28,35 @@
     #   @example: [2, 2, 2] (total of 8 domains)
     decomposition = ""
 
+    # Diffusion-style dynamic load balancing (Cartesian metrics only).
+    # Domain boundaries between MPI neighbors are nudged to equalize the
+    # active-particle count per rank. All inter-rank traffic uses only the
+    # existing nearest-neighbor field/particle communication paths.
+    [simulation.domain.load_balance]
+      # Enable dynamic load balancing
+      #   @type: bool
+      #   @default: false
+      enable = ""
+      # Run the rebalancer every `interval` timesteps (0 disables)
+      #   @type: int
+      #   @default: 0
+      interval = ""
+      # Dimensions along which load is redistributed (1 = x1, 2 = x2, 3 = x3)
+      #   @type: array of int, subset of [1, 2, 3]
+      #   @default: [1]
+      dimensions = ""
+      # Skip rebalancing along a dim when (max - min) / mean of the per-slice
+      # particle count is below this fraction
+      #   @type: float
+      #   @default: 0.1
+      tolerance = ""
+      # Maximum cell-shift per interior boundary per event; clamped at compile
+      # time to N_GHOSTS so the migrating field strip is already cached in the
+      # rank's ghost zone.
+      #   @type: int
+      #   @default: N_GHOSTS
+      max_shift = ""
+
 [grid]
   # Spatial resolution of the grid
   #   @required
@@ -107,7 +136,7 @@
 
     [grid.boundaries.match]
       # Size of the matching layer in each direction for fields in physical (code) units
-      #   @type: float | array<tuple<float>> 
+      #   @type: float | array<tuple<float>>
       #   @default: 1% of the domain size (in shortest dimension)
       #   @note: In spherical, this is the size of the layer in `r` from the outer wall
       #   @example: `ds = 1.5` (will set the same for all directions)
@@ -195,6 +224,83 @@
   #     @from: `scales.larmor0`
   #     @value: `1 / larmor0`
 
+[radiation]
+  [radiation.drag]
+    [radiation.drag.synchrotron]
+      # Radiation reaction limit gamma-factor for synchrotron
+      #   @type: float [> 0.0]
+      #   @default: 1.0
+      #   @note: [required] if one of the species has `radiative_drag = "synchrotron"`
+      gamma_rad = ""
+
+    [radiation.drag.compton]
+      # Radiation reaction limit gamma-factor for Compton drag
+      #   @type: float [> 0.0]
+      #   @default: 1.0
+      #   @note: [required] if one of the species has `radiative_drag = "compton"`
+      gamma_rad = ""
+
+  [radiation.emission]
+    [radiation.emission.synchrotron]
+      # Gamma-factor of a particle emitting synchrotron photons at energy `m0 c^2` in fiducial magnetic field `B0`
+      #   @type: float [> 1.0]
+      #   @default: 10.0
+      gamma_qed = ""
+      # Minimum photon energy for synchrotron emission (units of `m0 c^2`)
+      #   @type: float [> 0.0]
+      #   @default: 1e-4
+      photon_energy_min = ""
+      # Weights for the emitted synchrotron photons
+      #   @type: float [> 0.0]
+      #   @default: 1.0
+      photon_weight = ""
+      # Index of species for the emitted photon
+      #   @type: ushort [> 0]
+      #   @required
+      photon_species = ""
+
+      # @inferred:
+      # - nominal_probability
+      #     @brief: Nominal probability of the emission for a particle with `gamma * beta = 1`, charge-to-mass = `q0 / m0`
+      #     @type: float
+      #     @from: `.gamma_qed`, `.photon_weight`, `...drag.synchrotron.gamma_rad`, `scales.omegaB0`, `algorithms.timestep.dt`
+      #     @value: `0.1 * omegaB0 * dt * (gamma_qed / gamma_rad)^2 / photon_weight`
+      # - nominal_photon_energy
+      #     @brief: Nominal energy of the emitted photon for a particle with `gamma * beta = 1`, mass = `m0`
+      #     @type: float
+      #     @from: `.gamma_qed`
+      #     @value: `(1 / gamma_qed)^2`
+
+    [radiation.emission.compton]
+      # Gamma-factor of a particle emitting inverse Compton photons at energy `m0 c^2` in fiducial magnetic field `B0`
+      #   @type: float [> 1.0]
+      #   @default: 10.0
+      gamma_qed = ""
+      # Minimum photon energy for inverse Compton emission (units of `m0 c^2`)
+      #   @type: float [> 0.0]
+      #   @default: 1e-4
+      photon_energy_min = ""
+      # Weights for the emitted inverse Compton photons
+      #   @type: float [> 0.0]
+      #   @default: 1.0
+      photon_weight = ""
+      # Index of species for the emitted photon
+      #   @type: ushort [> 0]
+      #   @required
+      photon_species = ""
+
+      # @inferred:
+      # - nominal_probability
+      #     @brief: Nominal probability of the emission for a particle with `gamma * beta = 1`, charge-to-mass = `q0 / m0`
+      #     @type: float
+      #     @from: `.gamma_qed`, `.photon_weight`, `...drag.compton.gamma_rad`, `scales.omegaB0`, `algorithms.timestep.dt`
+      #     @value: `0.1 * omegaB0 * dt * (gamma_qed / gamma_rad)^2 / photon_weight`
+      # - nominal_photon_energy
+      #     @brief: Nominal energy of the emitted photon for a particle with `gamma * beta = 1`, mass = `m0`
+      #     @type: float
+      #     @from: `.gamma_qed`
+      #     @value: `(1 / gamma_qed)^2`
+
 [algorithms]
   # Number of current smoothing passes
   #   @type: ushort [>= 0]
@@ -224,10 +330,12 @@
     #   @type: bool
     #   @default: true
     enable = ""
-    # Order of the particle shape function
-    #   @type: int
-    #   @default: 1
-    order = ""
+
+    # @inferred:
+    # - order
+    #     @brief: order of the particle shape function
+    #     @from: compile-time definition `shape_order`
+    #     @type: ushort [0 -> 10]
 
   [algorithms.gr]
     # Stepsize for numerical differentiation in GR pusher
@@ -249,13 +357,6 @@
     #   @default: 0.0
     #   @note: When `larmor_max` == 0, the limit is disabled
     larmor_max = ""
-
-  [algorithms.synchrotron]
-    # Radiation reaction limit gamma-factor for synchrotron
-    #   @type: float [> 0.0]
-    #   @default: 1.0
-    #   @note: [required] if one of the species has `cooling = "synchrotron"`
-    gamma_rad = ""
 
   # Stencil coefficients for the field solver [notation as in Blinne+ (2018)]
   #   @note: Standard Yee solver: `delta_i = beta_ij = 0.0`
@@ -318,11 +419,16 @@
   #   @type: bool
   #   @default: false
   use_weights = ""
-  # Timesteps between particle re-sorting (removing dead particles)
+  # Timesteps between particle re-sorting by tags (removing dead particles)
   #   @type: uint
   #   @default: 100
   #   @note: Set to 0 to disable re-sorting
   clear_interval = ""
+  # Timesteps between spatial sorting of particles (for better cache performance)
+  #   @type: uint
+  #   @default: 0
+  #   @note: Set to 0 to disable spatial sorting
+  spatial_sorting_interval = ""
 
   # @inferred:
   # - nspec
@@ -370,8 +476,29 @@
     # Radiation reaction to use for the species
     #   @type: string
     #   @default: "None"
-    #   @enum: "None", "Synchrotron"
-    cooling = ""
+    #   @enum: "None", "Synchrotron", "Compton"
+    #   @note: Can also be coma-separated combination, e.g., "Synchrotron,Compton"
+    #   @note: Relevant radiation.drag parameters should also be provided
+    radiative_drag = ""
+    # Particle emission policy for the species
+    #   @type: string
+    #   @default: "None"
+    #   @enum: "None", "Synchrotron", "Compton"
+    #   @note: Only one emission mechanism allowed
+    #   @note: Appropriate radiation drag flag will be applied automatically (unless explicitly set to "None")
+    emission = ""
+    # Timesteps between spatial sorting of particles for given species
+    #   @type: uint
+    #   @default: 0
+    #   @note: Set to 0 to disable spatial sorting
+    #   @note: Overrides `particles.spatial_sorting_interval` for the given species
+    spatial_sorting_interval = ""
+    # Timesteps between particle re-sorting by tags (removing dead particles)
+    #   @type: uint
+    #   @default: 100
+    #   @note: Set to 0 to disable re-sorting
+    #   @note: Overrides `particles.clear_interval` for the given species
+    clear_interval = ""
 
 # Parameters for specific problem generators and setups
 [setup]
@@ -419,7 +546,24 @@
     # Smoothing window for the output of moments ("Rho", "Charge", "T", ...)
     #   @type: ushort
     #   @default: 0
+    #   @note: Only used when `window = true` (the legacy box smoothing).
     mom_smooth = ""
+    # Deposition method for moment output ("Rho", "Charge", "N", "T", ...)
+    #   @type: bool
+    #   @default: false
+    #   @note: When `true`, deposition uses the legacy uniform box of
+    #          half-size `mom_smooth` (each cell within the window receives
+    #          the same fraction of the per-particle quantity).
+    #   @note: When `false`, the per-particle quantity is spread over a
+    #          (SHAPE_ORDER+1)-wide stencil weighted by the b-spline particle
+    #          shape function used for current deposition (see
+    #          kernels/particle_shapes.hpp). The compile-time `SHAPE_ORDER`
+    #          guarantees the stencil fits within `N_GHOSTS`, so cross-rank
+    #          contributions are correctly exchanged. Requires a build with
+    #          `-D deposit=esirkepov -D shape_order >= 1`.
+    #   @note: `false` is useful with Ascent for smoother in-situ rendering
+    #          of particle-derived fields like N, Rho, T, ...
+    window = ""
     # Number of timesteps between field outputs
     #   @type: uint
     #   @default: 0
@@ -510,6 +654,70 @@
     #   @default: false
     ghosts = ""
 
+  [output.ascent]
+    # Enable in-situ visualization via Ascent (https://ascent.readthedocs.io/)
+    #   @type: bool
+    #   @default: false
+    #   @note: Entity must be configured with `-D ascent=ON`; otherwise this is ignored
+    enable = ""
+    # Path to a YAML/JSON file describing the Ascent actions (scenes, plots, ...)
+    #   @type: string
+    #   @default: ""
+    #   @note: When empty, Ascent will look for `ascent_actions.yaml` in the cwd
+    actions_file = ""
+    # Names of field quantities to publish to Ascent every render cycle
+    #   @type: array<string>
+    #   @default: []
+    #   @note: Vector components are suffixed with the index, e.g. "B3" is the third component of B
+    fields = ""
+    # When true, components named "<X>1"/"<X>2"/"<X>3" are ALSO published as the
+    # u/v/w components of an MCArray vector field "<X>" (so streamline / gradient
+    # filters can reference the prefix directly). Disable to halve the published
+    # mesh size when the actions file only uses the scalar form (or only the
+    # vector form).
+    #   @type: bool
+    #   @default: true
+    vector_aliases = ""
+    # Per-axis stride applied when extracting fields for Ascent. A factor of
+    # `k` cuts the published mesh and per-render rendering cost by `k` along
+    # that axis (`k^Dim` overall in 3D). Aligned to the global grid so cells
+    # line up across MPI ranks. Independent of `output.fields.downsampling`.
+    #   @type: array<uint> [length = `grid.dim`] OR uint (broadcast to all axes)
+    #   @default: 1 (no downsampling)
+    #   @note: Each factor must be > 0 and small enough to leave at least one cell per rank.
+    downsample = ""
+    # Number of timesteps between Ascent renders
+    #   @type: uint
+    #   @default: 0
+    #   @note: When `!= 0`, overrides `output.interval`
+    #   @note: When `== 0` and `interval_time == -1`, falls back to the global `output.interval`
+    #   @note: This cadence is independent of `output.fields.interval`
+    interval = ""
+    # Physical (code) time interval between Ascent renders
+    #   @type: float
+    #   @default: -1.0
+    #   @note: When `>= 0`, overrides `interval`
+    #   @note: This cadence is independent of `output.fields.interval_time`
+    interval_time = ""
+    # Drift velocity along the x-axis (code units). At render time
+    # `v_drift * t` is added to the x-component of every `camera/position`
+    # and `camera/look_at` in the actions file, so the camera tracks a
+    # feature drifting through the simulation domain (e.g. a shock front
+    # under a moving window).
+    #   @type: float
+    #   @default: 0.0
+    #   @note: Zero leaves the actions file untouched.
+    v_drift = ""
+    # Rotational velocity (radians per code time unit) of the camera
+    # about its `look_at` point, using the camera's `up` vector as the
+    # rotation axis. Combined freely with `v_drift`: the camera orbits
+    # the (drifted) focus point at angular rate `v_rot`, so theta = v_rot * t.
+    #   @type: float
+    #   @default: 0.0
+    #   @note: Zero leaves camera positions unrotated.
+    #   @note: A full orbit takes `2*pi / v_rot` code time units.
+    v_rot = ""
+
   [output.stats]
     # Toggle for the stats output
     #   @type: bool
@@ -553,7 +761,7 @@
   #   @note: 0 = disable checkpointing
   #   @note: -1 = keep all checkpoints
   keep = ""
-  # Write a checkpoint once after a fixed walltime 
+  # Write a checkpoint once after a fixed walltime
   #   @type: string
   #   @default: "00:00:00"
   #   @note: The format is "HH:MM:SS"

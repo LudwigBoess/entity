@@ -2,6 +2,7 @@
 
 #include "global.h"
 
+#include "arch/mpi_aliases.h"
 #include "utils/error.h"
 #include "utils/formatting.h"
 #include "utils/log.h"
@@ -9,6 +10,8 @@
 #include <Kokkos_Core.hpp>
 #include <adios2.h>
 
+#include <cstddef>
+#include <exception>
 #include <filesystem>
 #include <string>
 
@@ -62,18 +65,28 @@ namespace checkpoint {
       const auto metafilename = m_checkpoint_root /
                                 fmt::format("meta-%08lu.toml", step);
       m_writer = m_io.Open(filename, adios2::Mode::Write);
-      m_written.push_back({ filename, metafilename });
+      m_written.emplace_back(filename, metafilename);
       logger::Checkpoint(fmt::format("Writing checkpoint to %s and %s",
                                      filename.c_str(),
                                      metafilename.c_str()),
                          HERE);
-    } catch (std::exception& e) {
+    } catch (const std::exception& e) {
       raise::Fatal(e.what(), HERE);
     }
 
     m_writer.BeginStep();
-    m_writer.Put(m_io.InquireVariable<timestep_t>("Step"), &step);
-    m_writer.Put(m_io.InquireVariable<simtime_t>("Time"), &time);
+    // Sync mode: the `step`/`time` arguments are local copies that go out of
+    // scope when this function returns. A deferred Put would leave ADIOS2
+    // holding a pointer into a dead stack frame, which it would dereference
+    // at endSaving()/EndStep() time.
+    // Pin to Host: see out::pin_host comment in writers.cpp — Aurora SYCL
+    // Detect mis-classifies host scalar addresses as GPU.
+    auto step_var = m_io.InquireVariable<timestep_t>("Step");
+    auto time_var = m_io.InquireVariable<simtime_t>("Time");
+    step_var.SetMemorySpace(adios2::MemorySpace::Host);
+    time_var.SetMemorySpace(adios2::MemorySpace::Host);
+    m_writer.Put(step_var, &step, adios2::Mode::Sync);
+    m_writer.Put(time_var, &time, adios2::Mode::Sync);
   }
 
   void Writer::endSaving() {
