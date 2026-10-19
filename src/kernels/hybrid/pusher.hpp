@@ -443,6 +443,11 @@ namespace kernel::hybrid {
 
     // ........................................................................
     // cell-centered field gather at (i, dx) — transpose of the moment deposit.
+    // One footprint test per particle: when the whole stencil lies inside the
+    // field storage (all but the particles overshooting the ghost layers), the
+    // stencil is read without per-point tests, so the loads of consecutive i1
+    // can be merged; otherwise the out-of-storage points are skipped. Both
+    // read and sum the same values in the same order.
     // ........................................................................
     Inline void gather(int              i1,
                        real_t           dx1,
@@ -452,11 +457,38 @@ namespace kernel::hybrid {
                        real_t           dx3,
                        vec_t<Dim::_3D>& e0,
                        vec_t<Dim::_3D>& b0) const {
+      const int G      = static_cast<int>(N_GHOSTS);
+      bool      inside = inX1(i1 + G - window) and inX1(i1 + G + window);
+      if constexpr (D == Dim::_2D || D == Dim::_3D) {
+        inside = inside and inX2(i2 + G - window) and inX2(i2 + G + window);
+      }
+      if constexpr (D == Dim::_3D) {
+        inside = inside and inX3(i3 + G - window) and inX3(i3 + G + window);
+      }
+      if (inside) {
+        gatherStencil<false>(i1, dx1, i2, dx2, i3, dx3, e0, b0);
+      } else {
+        gatherStencil<true>(i1, dx1, i2, dx2, i3, dx3, e0, b0);
+      }
+    }
+
+    // stencil sum of the gather; CHECK: skip the points outside the storage
+    template <bool CHECK>
+    Inline void gatherStencil(int              i1,
+                              real_t           dx1,
+                              int              i2,
+                              real_t           dx2,
+                              int              i3,
+                              real_t           dx3,
+                              vec_t<Dim::_3D>& e0,
+                              vec_t<Dim::_3D>& b0) const {
       if constexpr (D == Dim::_1D) {
         for (int di1 { -window }; di1 <= window; ++di1) {
           const int c { i1 + di1 + static_cast<int>(N_GHOSTS) };
-          if (not inX1(c)) {
-            continue;
+          if constexpr (CHECK) {
+            if (not inX1(c)) {
+              continue;
+            }
           }
           const real_t S { prtl_shape::particle_shape<O>(
             math::abs(dx1 - (static_cast<real_t>(di1) + HALF))) };
@@ -470,15 +502,19 @@ namespace kernel::hybrid {
       } else if constexpr (D == Dim::_2D) {
         for (int di2 { -window }; di2 <= window; ++di2) {
           const int c2 { i2 + di2 + static_cast<int>(N_GHOSTS) };
-          if (not inX2(c2)) {
-            continue;
+          if constexpr (CHECK) {
+            if (not inX2(c2)) {
+              continue;
+            }
           }
           const real_t sx2 { prtl_shape::particle_shape<O>(
             math::abs(dx2 - (static_cast<real_t>(di2) + HALF))) };
           for (int di1 { -window }; di1 <= window; ++di1) {
             const int c1 { i1 + di1 + static_cast<int>(N_GHOSTS) };
-            if (not inX1(c1)) {
-              continue;
+            if constexpr (CHECK) {
+              if (not inX1(c1)) {
+                continue;
+              }
             }
             const real_t S { sx2 * prtl_shape::particle_shape<O>(
                                      math::abs(dx1 - (static_cast<real_t>(di1) + HALF))) };
@@ -493,22 +529,28 @@ namespace kernel::hybrid {
       } else if constexpr (D == Dim::_3D) {
         for (int di3 { -window }; di3 <= window; ++di3) {
           const int c3 { i3 + di3 + static_cast<int>(N_GHOSTS) };
-          if (not inX3(c3)) {
-            continue;
+          if constexpr (CHECK) {
+            if (not inX3(c3)) {
+              continue;
+            }
           }
           const real_t sx3 { prtl_shape::particle_shape<O>(
             math::abs(dx3 - (static_cast<real_t>(di3) + HALF))) };
           for (int di2 { -window }; di2 <= window; ++di2) {
             const int c2 { i2 + di2 + static_cast<int>(N_GHOSTS) };
-            if (not inX2(c2)) {
-              continue;
+            if constexpr (CHECK) {
+              if (not inX2(c2)) {
+                continue;
+              }
             }
             const real_t sx23 { sx3 * prtl_shape::particle_shape<O>(
                                         math::abs(dx2 - (static_cast<real_t>(di2) + HALF))) };
             for (int di1 { -window }; di1 <= window; ++di1) {
               const int c1 { i1 + di1 + static_cast<int>(N_GHOSTS) };
-              if (not inX1(c1)) {
-                continue;
+              if constexpr (CHECK) {
+                if (not inX1(c1)) {
+                  continue;
+                }
               }
               const real_t S { sx23 * prtl_shape::particle_shape<O>(
                                         math::abs(dx1 - (static_cast<real_t>(di1) + HALF))) };
