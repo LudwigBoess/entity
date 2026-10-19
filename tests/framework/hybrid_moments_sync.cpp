@@ -369,6 +369,9 @@ auto main(int argc, char* argv[]) -> int {
     ok &= run<Dim::_3D>({ 24, 12, 12 }, { -1, 1, 1 }, "3D x1 split");
     ok &= run<Dim::_2D>({ 24, 20 }, { -1, -1 }, "2D x1/x2 split");
     ok &= run<Dim::_3D>({ 24, 20, 20 }, { -1, -1, -1 }, "3D x1/x2/x3 split");
+    // long x1 rows: the halo blocks of the x2/x3 faces are cut into row chunks
+    ok &= run<Dim::_2D>({ 400, 24 }, { 1, -1 }, "2D long x1, x2 split");
+    ok &= run<Dim::_3D>({ 200, 15, 15 }, { 1, -1, -1 }, "3D long x1, x2/x3 split");
   } catch (std::exception& e) {
     std::cerr << e.what() << std::endl;
     GlobalFinalize();

@@ -9,6 +9,7 @@
  *        summed owned cells and the filled ghost cells in one kernel.
  * @implements
  *   - comm::HaloSegment
+ *   - comm::HaloChunk
  *   - comm::HaloSlot
  *   - comm::HaloField
  *   - comm::HaloDirection
@@ -44,6 +45,7 @@
 #include <Kokkos_Core.hpp>
 #include <mpi.h>
 
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -138,48 +140,66 @@ namespace comm {
   };
 
   /**
-   * Device functor applying the segments [sb, se) of a table to the flat
-   * element range [start(sb), start(se)) (thread l handles element
-   * start(sb) + l).
+   * Up to HaloSegments_kernel::CH consecutive elements of one segment: the
+   * unit of work of one group of threads. A row chunk lies in one i1 row of
+   * the block and starts at block-local (i1, i2, i3, c); the elements of a
+   * flat chunk are located by index decomposition.
+   */
+  struct HaloChunk {
+    int32_t seg { 0 };   // segment of the plan
+    int32_t loc { 0 };   // element offset of the first element in the segment
+    int32_t count { 0 }; // number of elements
+    int32_t row { 0 };   // 1: row chunk
+    int32_t i1 { 0 }, i2 { 0 }, i3 { 0 }, c { 0 };
+  };
+
+  /**
+   * Device functor applying the chunks [k0, k0 + n) of a table: thread t
+   * handles element t % CH of chunk k0 + t / CH. The CH threads of a chunk
+   * read the same chunk and segment descriptors; along a row chunk the
+   * element index needs no division.
    */
   struct HaloSegments_kernel {
+    static constexpr int     LOG2_CH = 8;
+    static constexpr int32_t CH      = 1 << LOG2_CH;
+
     Kokkos::View<const HaloSegment*> seg;
-    Kokkos::View<const int64_t*>     start;
+    Kokkos::View<const HaloChunk*>   chunk;
     Kokkos::View<real_t*>            sbuf;
     Kokkos::View<const real_t*>      rbuf;
-    std::size_t                      sb, se;
-    int64_t                          e0;
+    int64_t                          k0;
 
-    Inline void operator()(const int64_t l) const {
-      const int64_t e  = e0 + l;
-      // largest s in [sb, se) with start(s) <= e
-      std::size_t   lo = sb;
-      std::size_t   hi = se;
-      while (hi - lo > 1u) {
-        const std::size_t mid = (lo + hi) / 2u;
-        if (start(mid) <= e) {
-          lo = mid;
-        } else {
-          hi = mid;
-        }
+    Inline void operator()(const int64_t t) const {
+      const HaloChunk& ch = chunk(k0 + (t >> LOG2_CH));
+      const auto lane = static_cast<int32_t>(t & static_cast<int64_t>(CH - 1));
+      if (lane >= ch.count) {
+        return;
       }
-      const HaloSegment& g   = seg(lo);
-      const int64_t      loc = e - start(lo);
-      // block-local index decomposition in 32 bit (a halo block holds far
-      // fewer than 2^32 elements; 64-bit integer division is emulated on
-      // GPUs)
-      const auto     n0  = static_cast<uint32_t>(g.n[0]);
-      const auto     n1  = static_cast<uint32_t>(g.n[1]);
-      const auto     n2  = static_cast<uint32_t>(g.n[2]);
-      const auto     r   = static_cast<uint32_t>(loc);
-      const uint32_t q1  = r / n0;
-      const int64_t  i1  = r - q1 * n0;
-      const uint32_t q2  = q1 / n1;
-      const int64_t  i2  = q1 - q2 * n1;
-      const uint32_t q3  = q2 / n2;
-      const int64_t  i3  = q2 - q3 * n2;
-      const int64_t  c   = g.c0 + static_cast<int64_t>(q3);
-      const int64_t a_src    = (g.src_lo[0] + i1) * g.st[0] +
+      const HaloSegment& g   = seg(ch.seg);
+      const int64_t      loc = static_cast<int64_t>(ch.loc) + lane;
+      int64_t            i1, i2, i3, c;
+      if (ch.row != 0) {
+        i1 = ch.i1 + lane;
+        i2 = ch.i2;
+        i3 = ch.i3;
+        c  = g.c0 + ch.c;
+      } else {
+        // block-local index decomposition in 32 bit (a halo block holds far
+        // fewer than 2^32 elements; 64-bit integer division is emulated on
+        // GPUs)
+        const auto     n0 = static_cast<uint32_t>(g.n[0]);
+        const auto     n1 = static_cast<uint32_t>(g.n[1]);
+        const auto     n2 = static_cast<uint32_t>(g.n[2]);
+        const auto     r  = static_cast<uint32_t>(loc);
+        const uint32_t q1 = r / n0;
+        const uint32_t q2 = q1 / n1;
+        const uint32_t q3 = q2 / n2;
+        i1                = r - q1 * n0;
+        i2                = q1 - q2 * n1;
+        i3                = q2 - q3 * n2;
+        c                 = g.c0 + static_cast<int64_t>(q3);
+      }
+      const int64_t a_src = (g.src_lo[0] + i1) * g.st[0] +
                             (g.src_lo[1] + i2) * g.st[1] +
                             (g.src_lo[2] + i3) * g.st[2] + c * g.st[3];
       const int64_t a_dst = (g.dst_lo[0] + i1) * g.st[0] +
@@ -336,10 +356,12 @@ namespace comm {
       std::vector<seg_range_t> per_dir;          // additive unpack, direction order
       std::vector<Message>     sends, recvs;
       int64_t                  send_total { 0 }, recv_total { 0 };
-      std::vector<HaloSlot> h_slot; // SyncFill: 27 entries, by direction code
+      std::vector<HaloSlot>  h_slot;  // SyncFill: 27 entries, by direction code
+      std::vector<HaloChunk> h_chunk; // the segments cut into chunks
+      std::vector<int64_t> h_chunk_start; // first chunk per segment, size nseg + 1
 
       Kokkos::View<HaloSegment*> d_seg;
-      Kokkos::View<int64_t*>     d_start;
+      Kokkos::View<HaloChunk*>   d_chunk;
       Kokkos::View<HaloSlot*>    d_slot;
 
       auto same_as(const Plan& o) const -> bool {
@@ -417,6 +439,58 @@ namespace comm {
       g.off  = off;
       g.kind = kind;
       return g;
+    }
+
+    /**
+     * Split every segment of `p` into chunks of at most CH elements: rows of
+     * the block cut into chunks when the rows are long enough to fill them
+     * (at least 3/4 of the threads busy), consecutive elements otherwise.
+     */
+    static void make_chunks(Plan& p) {
+      constexpr int64_t CH = HaloSegments_kernel::CH;
+      p.h_chunk.clear();
+      p.h_chunk_start.assign(p.h_seg.size() + 1u, 0);
+      for (auto s { 0u }; s < p.h_seg.size(); ++s) {
+        const auto&   g     = p.h_seg[s];
+        const int64_t n0    = g.n[0];
+        const int64_t nrow  = (n0 + CH - 1) / CH;
+        const bool    rows  = (4 * n0 >= 3 * nrow * CH);
+        const int64_t total = g.size();
+        raise::ErrorIf(total > static_cast<int64_t>(INT32_MAX),
+                       "HaloExchange: block too large",
+                       HERE);
+        p.h_chunk_start[s] = static_cast<int64_t>(p.h_chunk.size());
+        if (rows) {
+          for (int64_t c = 0; c < g.nc; ++c) {
+            for (int64_t i3 = 0; i3 < g.n[2]; ++i3) {
+              for (int64_t i2 = 0; i2 < g.n[1]; ++i2) {
+                const int64_t row0 = ((c * g.n[2] + i3) * g.n[1] + i2) * n0;
+                for (int64_t i1 = 0; i1 < n0; i1 += CH) {
+                  HaloChunk ch;
+                  ch.seg   = static_cast<int32_t>(s);
+                  ch.loc   = static_cast<int32_t>(row0 + i1);
+                  ch.count = static_cast<int32_t>(std::min(CH, n0 - i1));
+                  ch.row   = 1;
+                  ch.i1    = static_cast<int32_t>(i1);
+                  ch.i2    = static_cast<int32_t>(i2);
+                  ch.i3    = static_cast<int32_t>(i3);
+                  ch.c     = static_cast<int32_t>(c);
+                  p.h_chunk.push_back(ch);
+                }
+              }
+            }
+          }
+        } else {
+          for (int64_t e = 0; e < total; e += CH) {
+            HaloChunk ch;
+            ch.seg   = static_cast<int32_t>(s);
+            ch.loc   = static_cast<int32_t>(e);
+            ch.count = static_cast<int32_t>(std::min(CH, total - e));
+            p.h_chunk.push_back(ch);
+          }
+        }
+      }
+      p.h_chunk_start[p.h_seg.size()] = static_cast<int64_t>(p.h_chunk.size());
     }
 
     static auto build(const std::vector<HaloDirection>& dirs,
@@ -498,6 +572,7 @@ namespace comm {
       for (auto s { 0u }; s < p.h_seg.size(); ++s) {
         p.h_start[s + 1] = p.h_start[s] + p.h_seg[s].size();
       }
+      make_chunks(p);
       return p;
     }
 
@@ -568,23 +643,25 @@ namespace comm {
       for (auto s { 0u }; s < p.h_seg.size(); ++s) {
         p.h_start[s + 1] = p.h_start[s] + p.h_seg[s].size();
       }
+      make_chunks(p);
       return p;
     }
 
     void upload(Plan& p) {
-      const auto nseg = p.h_seg.size();
-      p.d_seg   = Kokkos::View<HaloSegment*> { "halo_segments", nseg };
-      p.d_start = Kokkos::View<int64_t*> { "halo_segment_starts", nseg + 1u };
-      auto h_seg   = Kokkos::create_mirror_view(p.d_seg);
-      auto h_start = Kokkos::create_mirror_view(p.d_start);
+      const auto nseg   = p.h_seg.size();
+      const auto nchunk = p.h_chunk.size();
+      p.d_seg           = Kokkos::View<HaloSegment*> { "halo_segments", nseg };
+      p.d_chunk         = Kokkos::View<HaloChunk*> { "halo_chunks", nchunk };
+      auto h_seg        = Kokkos::create_mirror_view(p.d_seg);
+      auto h_chnk       = Kokkos::create_mirror_view(p.d_chunk);
       for (auto s { 0u }; s < nseg; ++s) {
         h_seg(s) = p.h_seg[s];
       }
-      for (auto s { 0u }; s <= nseg; ++s) {
-        h_start(s) = p.h_start[s];
+      for (auto k { 0u }; k < nchunk; ++k) {
+        h_chnk(k) = p.h_chunk[k];
       }
       Kokkos::deep_copy(p.d_seg, h_seg);
-      Kokkos::deep_copy(p.d_start, h_start);
+      Kokkos::deep_copy(p.d_chunk, h_chnk);
       if (not p.h_slot.empty()) {
         p.d_slot   = Kokkos::View<HaloSlot*> { "halo_slots", p.h_slot.size() };
         auto h_slt = Kokkos::create_mirror_view(p.d_slot);
@@ -645,17 +722,17 @@ namespace comm {
       if (grp.second <= grp.first) {
         return;
       }
-      const int64_t e0    = p.h_start[grp.first];
-      const int64_t count = p.h_start[grp.second] - e0;
-      if (count <= 0) {
+      const int64_t k0 = p.h_chunk_start[grp.first];
+      const int64_t nk = p.h_chunk_start[grp.second] - k0;
+      if (nk <= 0) {
         return;
       }
       Kokkos::parallel_for(
         "HaloExchange",
         Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace, Kokkos::IndexType<int64_t>>(
           0,
-          count),
-        HaloSegments_kernel { p.d_seg, p.d_start, m_send, m_recv, grp.first, grp.second, e0 });
+          nk * HaloSegments_kernel::CH),
+        HaloSegments_kernel { p.d_seg, p.d_chunk, m_send, m_recv, k0 });
     }
 
   public:
