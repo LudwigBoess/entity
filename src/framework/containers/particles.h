@@ -143,9 +143,11 @@ namespace ntt {
     array_t<std::uint8_t*>  m_sort_keys8 {};
     array_t<std::uint16_t*> m_sort_keys16 {};
     prtl_perm_t             m_sort_perm {};
-    array_t<int*>           m_sort_scratch_int {};
-    array_t<prtldx_t*>      m_sort_scratch_prtldx {};
-    array_t<real_t*>        m_sort_scratch_real {};
+    // gather scratch of the permutation, one per permuted member: i1..i3,
+    // dx1..dx3, (ux1, ux2, ux3, weight, phi), tag and the payloads
+    array_t<int*>           m_sort_scratch_i[3] {};
+    array_t<prtldx_t*>      m_sort_scratch_dx[3] {};
+    array_t<real_t*>        m_sort_scratch_u[5] {};
     array_t<short*>         m_sort_scratch_tag {};
     array_t<real_t**>       m_sort_scratch_pld_r {};
     array_t<npart_t**>      m_sort_scratch_pld_i {};
@@ -275,16 +277,17 @@ namespace ntt {
 
 #if defined(TILED_DEPOSIT)
     // Build m_tile_layout.tile_offsets / npart_partitioned from the
-    // already-sorted tile-index keys. A separate member function (not a
-    // lambda local to SortSpatially) so the inner device kernel is not an
-    // extended __device__ lambda nested inside another lambda — which
-    // nvcc forbids. Lets the vendor path run the offsets pass and then
-    // release the keys before the SoA gather allocates its buffers.
+    // already-sorted tile-index keys (of any unsigned key type), on the
+    // device; only the alive count is copied to the host. A separate member
+    // function (not a lambda local to SortSpatially) so the inner device
+    // kernel is not an extended __device__ lambda nested inside another
+    // lambda — which nvcc forbids.
     // NOTE: must be public — nvcc forbids an extended __host__ __device__
     // lambda inside a member function with private/protected access.
-    void compute_tile_offsets(const array_t<ncells_t*>& tile_indices,
-                              ncells_t                  total_tiles,
-                              npart_t                   npart_local);
+    template <typename K>
+    void compute_tile_offsets(const array_t<K*>& tile_indices,
+                              ncells_t           total_tiles,
+                              npart_t            npart_local);
 #endif
 
     [[nodiscard]]
@@ -364,17 +367,14 @@ namespace ntt {
   private:
     /**
      * @brief Apply a particle-index permutation (built by oneDPL/Thrust
-     *        sort_by_key) to the SoA member arrays. Members are gathered
-     *        through `perm` into a reusable `n`-sized scratch buffer
-     *        (one per member type, shared across members of that type)
-     *        and copied back in place, so the large persistent member
-     *        arrays keep their storage/address and the gather makes a
-     *        handful of transient allocations instead of one maxnpart
-     *        buffer per member. The *_prev arrays are intentionally not
-     *        permuted (overwritten by the next push before any read).
-     *        Only compiled when a vendor sort backend is enabled; the
-     *        BinSort path applies the permutation in place via
-     *        `sorter.sort(view)` instead.
+     *        sort_by_key) to the SoA member arrays. One kernel gathers every
+     *        member through `perm` into its persistent, grow-only `n`-sized
+     *        scratch buffer, a second copies them all back in place, so the
+     *        large persistent member arrays keep their storage/address. The
+     *        *_prev arrays are intentionally not permuted (overwritten by
+     *        the next push before any read). Only compiled when a vendor
+     *        sort backend is enabled; the BinSort path applies the
+     *        permutation in place via `sorter.sort(view)` instead.
      * @param perm Permutation: sorted position -> pre-sort slot index.
      * @param n Number of leading (alive) particles to gather. Pass
      *        `npart_partitioned` so only the alive set is moved into

@@ -185,8 +185,8 @@ namespace ntt {
 #if defined(TILED_DEPOSIT) && defined(TILED_DEPOSIT_USE_VENDOR_SORT) &&        \
   defined(SYCL_ENABLED) && defined(ONEDPL_ENABLED)
     // sort_by_key of the first n tile keys through a copy in the narrower
-    // unsigned type K (persistent `narrow` buffer); the sorted keys are
-    // written back to `keys` for the tile offsets
+    // unsigned type K (persistent `narrow` buffer, left sorted for the tile
+    // offsets)
     template <typename K>
     void sort_narrow_keys(const array_t<ncells_t*>& keys,
                           array_t<K*>&              narrow,
@@ -206,65 +206,52 @@ namespace ntt {
                                          n_bins,
                                          n,
                                          sort::backend::OneDPL {});
-      Kokkos::parallel_for(
-        "WidenTileKeys",
-        n,
-        KOKKOS_LAMBDA(const npart_t p) { k32(p) = static_cast<ncells_t>(kn(p)); });
     }
 #endif
   } // namespace
 
 #if defined(TILED_DEPOSIT)
   template <Dimension D, Coord::type C>
-  void Particles<D, C>::compute_tile_offsets(const array_t<ncells_t*>& tile_indices,
-                                             ncells_t total_tiles,
-                                             npart_t  npart_local) {
-    // Compute the per-tile prefix-sum `tile_offsets` for the tiled
-    // pusher from the (already sorted) `tile_indices` — monotonically
-    // non-decreasing for alive particles, with the dead sentinel
-    // `total_tiles + 1` clustered at the end. Transition-detect directly
-    // on it: the start of each non-empty tile is the only place a write
-    // happens — atomic-free in the dense branch. Empty tiles (no
-    // particles) are filled by a reverse pass on a small host mirror
-    // (`total_tiles ≈ 176K` at production scale → ~700 KB).
-    array_t<npart_t*> tile_offsets { "tile_offsets", total_tiles + 1u };
-    Kokkos::deep_copy(tile_offsets, static_cast<npart_t>(npart_local));
-
-    const auto total_tiles_v = total_tiles;
-    auto       ti_v          = tile_indices;
+  template <typename K>
+  void Particles<D, C>::compute_tile_offsets(const array_t<K*>& tile_indices,
+                                             ncells_t           total_tiles,
+                                             npart_t            npart_local) {
+    // Per-tile prefix sum `tile_offsets` for the tiled pusher from the
+    // (already sorted) `tile_indices`: non-decreasing for alive particles,
+    // with the dead sentinel `total_tiles + 1` clustered at the end. Tile t
+    // starts at the first particle whose key is >= t (binary search, one
+    // thread per tile), so an empty tile starts where the next non-empty one
+    // does, and tile_offsets(total_tiles) is the first dead particle, i.e.
+    // the alive count. The buffer persists across sorts (same tile count).
+    if (m_tile_layout.tile_offsets.extent(0) != total_tiles + 1u) {
+      m_tile_layout.tile_offsets = array_t<npart_t*> { "tile_offsets",
+                                                       total_tiles + 1u };
+    }
+    auto offsets = m_tile_layout.tile_offsets;
+    auto keys    = tile_indices;
     Kokkos::parallel_for(
-      "DetectTileBoundaries",
-      CreateParticleRangePolicy<Dim::_1D>({ 0u }, { npart_local }),
-      Lambda(prtlidx_t p) {
-        const auto t_curr   = ti_v(p);
-        const bool boundary = (p == 0u) || (ti_v(p - 1u) != t_curr);
-        if (!boundary) {
-          return;
+      "TileOffsets",
+      CreateParticleRangePolicy<Dim::_1D>({ 0u }, { total_tiles + 1u }),
+      Lambda(prtlidx_t t) {
+        npart_t lo = 0u, hi = npart_local;
+        while (lo < hi) {
+          const npart_t mid = lo + (hi - lo) / 2u;
+          if (static_cast<ncells_t>(keys(mid)) < static_cast<ncells_t>(t)) {
+            lo = mid + 1u;
+          } else {
+            hi = mid;
+          }
         }
-        if (t_curr < total_tiles_v) {
-          tile_offsets(t_curr) = p;
-        } else {
-          // First dead particle — also marks the alive_count boundary
-          // stored at index total_tiles.
-          Kokkos::atomic_min(&tile_offsets(total_tiles_v), p);
-        }
+        offsets(t) = lo;
       });
 
-    auto h_offsets = Kokkos::create_mirror_view(tile_offsets);
-    Kokkos::deep_copy(h_offsets, tile_offsets);
-    for (auto t = static_cast<std::size_t>(total_tiles); t-- > 0u;) {
-      if (h_offsets(t) > h_offsets(t + 1u)) {
-        h_offsets(t) = h_offsets(t + 1u);
-      }
-    }
-    Kokkos::deep_copy(tile_offsets, h_offsets);
-
-    m_tile_layout.tile_offsets      = tile_offsets;
     // tile_offsets(total_tiles) is the alive-particle count at sort time:
     // the tiles partition exactly [0, npart_partitioned). The deposit
     // launcher compares this against the live npart() to detect (and
     // separately deposit) particles appended since this sort.
-    m_tile_layout.npart_partitioned = h_offsets(total_tiles);
+    npart_t n_alive { 0u };
+    Kokkos::deep_copy(n_alive, Kokkos::subview(offsets, total_tiles));
+    m_tile_layout.npart_partitioned = n_alive;
   }
 #endif // TILED_DEPOSIT
 
@@ -339,13 +326,13 @@ namespace ntt {
 
   #if defined(TILED_DEPOSIT_USE_VENDOR_SORT)
     // Vendor path: produce an explicit permutation via sort_by_key, then
-    // apply it to each SoA member by gathering the alive prefix through a
-    // reusable scratch buffer (one per member type, copied back in place).
-    // The *_prev arrays are skipped — see apply_permutation_to_soa. On the
-    // SYCL/oneDPL path the keys, perm, and per-type gather scratch are all
+    // apply it to the SoA members by gathering the alive prefix into a
+    // scratch buffer per member (one kernel) and copying back in place (one
+    // kernel). The *_prev arrays are skipped — see apply_permutation_to_soa.
+    // On the SYCL/oneDPL path the keys, perm, and gather scratch are all
     // persistent, grow-only buffers (class members) reused across sorts, so
-    // steady state makes no per-sort device allocation; the fixed cost is a
-    // handful of `npart_partitioned`-sized buffers held resident.
+    // steady state makes no per-sort device allocation; the fixed cost is
+    // the `npart_partitioned`-sized buffers held resident.
     #if defined(SYCL_ENABLED) && defined(ONEDPL_ENABLED)
     // Persistent, reused perm: oneDPL's sort_by_key is in place and never
     // reassigns `perm`, so it can share a grow-only buffer across sorts (no
@@ -356,9 +343,11 @@ namespace ntt {
     prtl_perm_t perm = m_sort_perm;
     // sort the keys in the narrowest unsigned type that holds n_bins (the
     // radix sort makes one pass per 4 key bits); the sort is stable, so the
-    // permutation is that of the full-width keys
+    // permutation is that of the full-width keys. The tile offsets are built
+    // from the sorted keys of the type sorted.
     if (n_bins <= 256u) {
       sort_narrow_keys(tile_indices, m_sort_keys8, "tile_indices8", perm, n_bins, npart_local);
+      compute_tile_offsets(m_sort_keys8, total_tiles, npart_local);
     } else if (n_bins <= 65536u) {
       sort_narrow_keys(tile_indices,
                        m_sort_keys16,
@@ -366,12 +355,14 @@ namespace ntt {
                        perm,
                        n_bins,
                        npart_local);
+      compute_tile_offsets(m_sort_keys16, total_tiles, npart_local);
     } else {
       sort_helpers::sort_by_key_dispatch(tile_indices,
                                          perm,
                                          n_bins,
                                          npart_local,
                                          sort::backend::OneDPL {});
+      compute_tile_offsets(tile_indices, total_tiles, npart_local);
     }
     #elif defined(HIP_ENABLED) && defined(ROCTHRUST_ENABLED)
     prtl_perm_t perm { "tile_perm", npart_local };
@@ -379,21 +370,22 @@ namespace ntt {
                                        perm,
                                        n_bins,
                                        sort::backend::Rocthrust {});
+    compute_tile_offsets(tile_indices, total_tiles, npart_local);
     #else
     prtl_perm_t perm { "tile_perm", npart_local };
     sort_helpers::sort_by_key_dispatch(tile_indices,
                                        perm,
                                        n_bins,
                                        sort::backend::Thrust {});
-    #endif
-    // `tile_indices` is sorted in place by sort_by_key. Build the tile
-    // offsets from it now, then release this handle. On the CUDA/HIP vendor
-    // path this frees the transient keys buffer before the gather; on SYCL
-    // `tile_indices` aliases the persistent `m_sort_keys`, so this only
-    // drops the local handle (the buffer is retained and reused next sort).
     compute_tile_offsets(tile_indices, total_tiles, npart_local);
+    #endif
+    // `tile_indices` is sorted in place by sort_by_key and no longer needed.
+    // On the CUDA/HIP vendor path dropping the handle frees the transient
+    // keys buffer before the gather; on SYCL `tile_indices` aliases the
+    // persistent `m_sort_keys`, so this only drops the local handle (the
+    // buffer is retained and reused next sort). The copy of the alive count
+    // in compute_tile_offsets has waited for the sort.
     tile_indices = array_t<ncells_t*> {};
-    Kokkos::fence("SortSpatially: pre-gather drain");
     // Gather only the alive particles. The sort binned dead particles to
     // the sentinel tile, so they occupy [npart_partitioned, npart_local)
     // and `perm[0, npart_partitioned)` lists the alive slots in tile
@@ -536,73 +528,84 @@ namespace ntt {
 #if defined(TILED_DEPOSIT_USE_VENDOR_SORT)
   namespace permute_helpers {
 
-    // Permute a 1D SoA member `arr` by `perm` in place, using a
-    // caller-owned reusable `scratch` buffer. Gathers the live prefix
-    // `arr[perm[0..n)]` into `scratch[0..n)`, then copies it back into
-    // `arr[0..n)`. Unlike the old swap-the-handle approach, `arr` keeps
-    // its original storage and full maxnpart capacity, so the large
-    // persistent member arrays never change address between sorts (the
-    // dominant source of allocator churn / fragmentation on ROCm), and
-    // `scratch` is shared across every member of the same type within one
-    // sort -- one transient allocation per type group instead of a fresh
-    // maxnpart buffer per member. `scratch` is sized to the live count
-    // `n` (not maxnpart), which also lowers the gather's peak transient.
-    // The tail `arr[n, capacity)` is left untouched (stale, never read:
-    // consumers iterate `[0, npart())`). Cost vs the swap: one extra
-    // copy-back pass (~2x HBM traffic), negligible when sorting is a
-    // small fraction of the step. The gather and the copy-back are queued
-    // asynchronously on the default (in-order) execution space instance, so
-    // the copy-back of a member runs before the next member's gather reuses
-    // `scratch`; the caller fences once after the last member.
-    template <typename V>
-    inline void permute_1d_into(V&                 arr,
-                                const V&           scratch,
-                                const prtl_perm_t& perm,
-                                npart_t            n) {
-      if (n == 0u) {
-        return;
-      }
-      auto       perm_v = perm;
-      auto       arr_v  = arr;
-      auto       buf_v  = scratch;
-      const auto exec   = Kokkos::DefaultExecutionSpace {};
-      Kokkos::parallel_for(
-        "Permute1D",
-        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
-                            Kokkos::IndexType<npart_t>>(exec, 0, n),
-        KOKKOS_LAMBDA(const npart_t p) { buf_v(p) = arr_v(perm_v(p)); });
-      Kokkos::deep_copy(
-        exec,
-        Kokkos::subview(arr, std::make_pair(static_cast<npart_t>(0), n)),
-        Kokkos::subview(scratch, std::make_pair(static_cast<npart_t>(0), n)));
-    }
+    /**
+     * @brief The permutation of the particle SoA members in two passes over
+     *        the first `n` particles: BACK = false gathers every member
+     *        through `perm` into its scratch, BACK = true copies the scratch
+     *        back into the members (each member keeps its storage). The
+     *        *_prev arrays are not permuted; phi only in 2D non-Cartesian.
+     */
+    template <Dimension D, Coord::type C, bool BACK>
+    struct PermuteSoA_kernel {
+      ParticleArrays     a;
+      array_t<int*>      si[3];
+      array_t<prtldx_t*> sdx[3];
+      array_t<real_t*>   su[5];
+      array_t<short*>    stag;
+      array_t<real_t**>  spr;
+      array_t<npart_t**> spi;
+      prtl_perm_t        perm;
+      npart_t            npr, npi;
 
-    // 2D analogue for `pld_r` / `pld_i` (`scratch` is `(>= n, ncols)`).
-    template <typename V>
-    inline void permute_2d_into(V&                 arr,
-                                const V&           scratch,
-                                const prtl_perm_t& perm,
-                                npart_t            n,
-                                npart_t            ncols) {
-      if (n == 0u or ncols == 0u) {
-        return;
+      Inline void operator()(const npart_t p) const {
+        if constexpr (BACK) {
+          if constexpr (D == Dim::_1D or D == Dim::_2D or D == Dim::_3D) {
+            a.i1(p)  = si[0](p);
+            a.dx1(p) = sdx[0](p);
+          }
+          if constexpr (D == Dim::_2D or D == Dim::_3D) {
+            a.i2(p)  = si[1](p);
+            a.dx2(p) = sdx[1](p);
+          }
+          if constexpr (D == Dim::_3D) {
+            a.i3(p)  = si[2](p);
+            a.dx3(p) = sdx[2](p);
+          }
+          a.ux1(p)    = su[0](p);
+          a.ux2(p)    = su[1](p);
+          a.ux3(p)    = su[2](p);
+          a.weight(p) = su[3](p);
+          if constexpr (D == Dim::_2D and C != Coord::Cartesian) {
+            a.phi(p) = su[4](p);
+          }
+          a.tag(p) = stag(p);
+          for (npart_t l = 0; l < npr; ++l) {
+            a.pld_r(p, l) = spr(p, l);
+          }
+          for (npart_t l = 0; l < npi; ++l) {
+            a.pld_i(p, l) = spi(p, l);
+          }
+        } else {
+          const npart_t q = perm(p);
+          if constexpr (D == Dim::_1D or D == Dim::_2D or D == Dim::_3D) {
+            si[0](p)  = a.i1(q);
+            sdx[0](p) = a.dx1(q);
+          }
+          if constexpr (D == Dim::_2D or D == Dim::_3D) {
+            si[1](p)  = a.i2(q);
+            sdx[1](p) = a.dx2(q);
+          }
+          if constexpr (D == Dim::_3D) {
+            si[2](p)  = a.i3(q);
+            sdx[2](p) = a.dx3(q);
+          }
+          su[0](p) = a.ux1(q);
+          su[1](p) = a.ux2(q);
+          su[2](p) = a.ux3(q);
+          su[3](p) = a.weight(q);
+          if constexpr (D == Dim::_2D and C != Coord::Cartesian) {
+            su[4](p) = a.phi(q);
+          }
+          stag(p) = a.tag(q);
+          for (npart_t l = 0; l < npr; ++l) {
+            spr(p, l) = a.pld_r(q, l);
+          }
+          for (npart_t l = 0; l < npi; ++l) {
+            spi(p, l) = a.pld_i(q, l);
+          }
+        }
       }
-      auto perm_v = perm;
-      auto arr_v  = arr;
-      auto buf_v  = scratch;
-      Kokkos::parallel_for(
-        "Permute2D",
-        CreateParticleRangePolicy<Dim::_2D>({ 0u, 0u }, { n, ncols }),
-        KOKKOS_LAMBDA(const npart_t p, const npart_t l) {
-          buf_v(p, l) = arr_v(perm_v(p), l);
-        });
-      Kokkos::deep_copy(
-        Kokkos::DefaultExecutionSpace {},
-        Kokkos::subview(arr, std::make_pair(static_cast<npart_t>(0), n), Kokkos::ALL),
-        Kokkos::subview(scratch,
-                        std::make_pair(static_cast<npart_t>(0), n),
-                        Kokkos::ALL));
-    }
+    };
 
   } // namespace permute_helpers
 
@@ -612,9 +615,6 @@ namespace ntt {
     if (n == 0u) {
       return;
     }
-
-    using permute_helpers::permute_1d_into;
-    using permute_helpers::permute_2d_into;
 
     // The *_prev arrays (i{1,2,3}_prev, dx{1,2,3}_prev) are intentionally
     // NOT permuted. SortSpatially runs at the very end of the step loop
@@ -633,65 +633,56 @@ namespace ntt {
     // Permuting prev would therefore reorder data that is overwritten
     // before it is ever observed.
     //
-    // Each block below reuses a single persistent, grow-only scratch buffer
-    // (one per member type) for every member of that type. `reserve_scratch_*`
-    // (re)allocates only when the live count outgrows capacity, so the gather
-    // makes no per-sort device allocation once warmed up (grow-only, with
-    // headroom) -- instead of one fresh buffer per type group every sort.
-    // Reused across members within a group; the fences in `permute_1d_into`
-    // keep the shared buffer from being clobbered before its copy-back drains.
-    {
-      reserve_scratch_1d(m_sort_scratch_int, "perm_scratch_int", n);
-      auto& scratch = m_sort_scratch_int;
-      if constexpr (D == Dim::_1D or D == Dim::_2D or D == Dim::_3D) {
-        permute_1d_into(i1, scratch, perm, n);
-      }
-      if constexpr (D == Dim::_2D or D == Dim::_3D) {
-        permute_1d_into(i2, scratch, perm, n);
-      }
-      if constexpr (D == Dim::_3D) {
-        permute_1d_into(i3, scratch, perm, n);
-      }
+    // Every permuted member has its own persistent, grow-only scratch
+    // (`reserve_scratch_*` reallocates only when the live count outgrows the
+    // capacity), so one kernel gathers all members and one copies them back,
+    // queued asynchronously on the default (in-order) execution space; the
+    // caller fences once at the end of the sort.
+    const auto npr = static_cast<npart_t>(npld_r());
+    const auto npi = static_cast<npart_t>(npld_i());
+    for (auto d { 0u }; d < static_cast<unsigned>(D); ++d) {
+      reserve_scratch_1d(m_sort_scratch_i[d], "perm_scratch_i", n);
+      reserve_scratch_1d(m_sort_scratch_dx[d], "perm_scratch_dx", n);
     }
-    {
-      reserve_scratch_1d(m_sort_scratch_prtldx, "perm_scratch_prtldx", n);
-      auto& scratch = m_sort_scratch_prtldx;
-      if constexpr (D == Dim::_1D or D == Dim::_2D or D == Dim::_3D) {
-        permute_1d_into(dx1, scratch, perm, n);
+    const auto nu = (D == Dim::_2D and C != Coord::Cartesian) ? 5u : 4u;
+    for (auto k { 0u }; k < nu; ++k) {
+      reserve_scratch_1d(m_sort_scratch_u[k], "perm_scratch_u", n);
+    }
+    reserve_scratch_1d(m_sort_scratch_tag, "perm_scratch_tag", n);
+    if (npr > 0u) {
+      reserve_scratch_2d(m_sort_scratch_pld_r, "perm_scratch_pld_r", n, npr);
+    }
+    if (npi > 0u) {
+      reserve_scratch_2d(m_sort_scratch_pld_i, "perm_scratch_pld_i", n, npi);
+    }
+
+    const auto fill = [&](auto& k) {
+      k.a = *this;
+      for (auto d { 0u }; d < 3u; ++d) {
+        k.si[d]  = m_sort_scratch_i[d];
+        k.sdx[d] = m_sort_scratch_dx[d];
       }
-      if constexpr (D == Dim::_2D or D == Dim::_3D) {
-        permute_1d_into(dx2, scratch, perm, n);
+      for (auto u { 0u }; u < 5u; ++u) {
+        k.su[u] = m_sort_scratch_u[u];
       }
-      if constexpr (D == Dim::_3D) {
-        permute_1d_into(dx3, scratch, perm, n);
-      }
-    }
-    {
-      reserve_scratch_1d(m_sort_scratch_real, "perm_scratch_real", n);
-      auto& scratch = m_sort_scratch_real;
-      permute_1d_into(ux1, scratch, perm, n);
-      permute_1d_into(ux2, scratch, perm, n);
-      permute_1d_into(ux3, scratch, perm, n);
-      permute_1d_into(weight, scratch, perm, n);
-      if constexpr (D == Dim::_2D and C != Coord::Cartesian) {
-        permute_1d_into(phi, scratch, perm, n);
-      }
-    }
-    {
-      reserve_scratch_1d(m_sort_scratch_tag, "perm_scratch_tag", n);
-      auto& scratch = m_sort_scratch_tag;
-      permute_1d_into(tag, scratch, perm, n);
-    }
-    if (npld_r() > 0) {
-      const auto ncols = static_cast<npart_t>(npld_r());
-      reserve_scratch_2d(m_sort_scratch_pld_r, "perm_scratch_pld_r", n, ncols);
-      permute_2d_into(pld_r, m_sort_scratch_pld_r, perm, n, ncols);
-    }
-    if (npld_i() > 0) {
-      const auto ncols = static_cast<npart_t>(npld_i());
-      reserve_scratch_2d(m_sort_scratch_pld_i, "perm_scratch_pld_i", n, ncols);
-      permute_2d_into(pld_i, m_sort_scratch_pld_i, perm, n, ncols);
-    }
+      k.stag = m_sort_scratch_tag;
+      k.spr  = m_sort_scratch_pld_r;
+      k.spi  = m_sort_scratch_pld_i;
+      k.perm = perm;
+      k.npr  = npr;
+      k.npi  = npi;
+    };
+    const auto policy =
+      Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace, Kokkos::IndexType<npart_t>>(
+        Kokkos::DefaultExecutionSpace {},
+        0,
+        n);
+    permute_helpers::PermuteSoA_kernel<D, C, false> gather;
+    fill(gather);
+    Kokkos::parallel_for("PermuteGather", policy, gather);
+    permute_helpers::PermuteSoA_kernel<D, C, true> back;
+    fill(back);
+    Kokkos::parallel_for("PermuteBack", policy, back);
   }
 #endif // TILED_DEPOSIT_USE_VENDOR_SORT
 
