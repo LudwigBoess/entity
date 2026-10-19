@@ -16,6 +16,7 @@
  *   - traits::pgen::HasMatchFieldsInX3<>
  *   - traits::pgen::HasFixFieldsConst<>
  *   - traits::pgen::HasCustomPostStep<>
+ *   - traits::pgen::HasCustomPostStepEditsB<>
  *   - traits::pgen::HasCustomFieldOutput<>
  *   - traits::pgen::HasCustomStatOutput<>
  * @namespaces:
@@ -108,6 +109,14 @@ namespace traits::pgen {
   template <class PG, class DOM>
   concept HasCustomPostStep = requires(PG& pgen, timestep_t s, simtime_t t, DOM& domain) {
     { pgen.CustomPostStep(s, t, domain) } -> std::same_as<void>;
+  };
+
+  // whether CustomPostStep(step, ...) edited the magnetic field of the local
+  // domain; without it the hybrid engine assumes it did. The B ghosts are
+  // refreshed on all ranks when any rank reports an edit.
+  template <class PG>
+  concept HasCustomPostStepEditsB = requires(const PG& pgen, timestep_t s) {
+    { pgen.CustomPostStepEditsB(s) } -> std::convertible_to<bool>;
   };
 
   template <class PG, Dimension D, class DOM>

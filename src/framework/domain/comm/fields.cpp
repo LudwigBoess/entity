@@ -34,13 +34,31 @@ namespace ntt {
     const auto comm_em0  = (tags & Comm::EM0_012) or (tags & Comm::EM0_345);
     const auto comm_cur  = (tags & Comm::CUR);
     const auto comm_cur0 = (tags & Comm::CUR0);
-    const auto comm_aux  = (tags & Comm::AUX_012) or (tags & Comm::AUX_345);
+    const auto comm_aux  = (tags & Comm::AUX_012) or (tags & Comm::AUX_345) or
+                          (tags & Comm::AUX_0123);
     const auto comm_bckp = (tags & Comm::Bckp);
 
     raise::ErrorIf(not(comm_em or comm_em0 or comm_cur or comm_aux or comm_cur0 or
                        comm_bckp),
                    "CommunicateFields called with no task",
                    HERE);
+    raise::ErrorIf((tags & Comm::AUX_0123) and
+                     ((tags & Comm::AUX_012) or (tags & Comm::AUX_345)),
+                   "CommunicateFields: AUX_0123 cannot be combined with "
+                   "AUX_012/AUX_345",
+                   HERE);
+    // components of aux in the call
+    const auto aux_range = [&]() -> cell_range_t {
+      if (tags & Comm::AUX_0123) {
+        return { 0, 4 };
+      } else if ((tags & Comm::AUX_012) and (tags & Comm::AUX_345)) {
+        return { 0, 6 };
+      } else if (tags & Comm::AUX_012) {
+        return { 0, 3 };
+      } else {
+        return { 3, 6 };
+      }
+    }();
     if constexpr (not ::traits::engine::DefinesEM0Fields<S>) {
       raise::ErrorIf(comm_em0,
                      "CommunicateFields called with EM0 communication "
@@ -76,6 +94,9 @@ namespace ntt {
     if (tags & Comm::AUX_345) {
       comms += "AUX[3-5] ";
     }
+    if (tags & Comm::AUX_0123) {
+      comms += "AUX[0-3] ";
+    }
     if (tags & Comm::EM0_012) {
       comms += "EM0[0-2] ";
     }
@@ -110,10 +131,9 @@ namespace ntt {
         split_range(tags & Comm::EM_012, tags & Comm::EM_345)));
     }
     if (comm_aux) {
-      flds.push_back(comm::MakeHaloField<M::Dim, 6>(
-        domain.fields.aux,
-        domain.fields.aux,
-        split_range(tags & Comm::AUX_012, tags & Comm::AUX_345)));
+      flds.push_back(comm::MakeHaloField<M::Dim, 6>(domain.fields.aux,
+                                                    domain.fields.aux,
+                                                    aux_range));
     }
     if (comm_em0) {
       flds.push_back(comm::MakeHaloField<M::Dim, 6>(
@@ -176,16 +196,6 @@ namespace ntt {
                                           false);
       }
       if (comm_aux) {
-        auto comp_range = cell_range_t {};
-        if ((tags & Comm::AUX_012) and (tags & Comm::AUX_345)) {
-          comp_range = cell_range_t(0, 6);
-        } else if (tags & Comm::AUX_012) {
-          comp_range = cell_range_t(0, 3);
-        } else if (tags & Comm::AUX_345) {
-          comp_range = cell_range_t(3, 6);
-        } else {
-          raise::Error("Incorrect logic", HERE);
-        }
         comm::CommunicateField<M::Dim, 6>(domain.index(),
                                           domain.fields.aux,
                                           domain.fields.aux,
@@ -195,7 +205,7 @@ namespace ntt {
                                           recv_rank,
                                           send_slice,
                                           recv_slice,
-                                          comp_range,
+                                          aux_range,
                                           false);
       }
       if (comm_em0) {

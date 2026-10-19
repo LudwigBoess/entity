@@ -2,13 +2,15 @@
  * Ghost remap of the hybrid moments after a deposit: the additive halo sync,
  * the image-plasma fold at the x1 conductor walls and the ghost fills.
  *
- * Every storage cell of every domain (active and ghost) holds an
- * integer-valued deposit of comps 0..3 (V, N), so every sum is exact in
- * single precision whatever the order. Each deposit belongs to the global
- * active cell it maps to (periodic wrap on x2/x3, mirror about the x1 walls
- * with V_x odd). After the remap every active cell must hold the sum of the
- * deposits that map to it, and every ghost cell the (mirrored) value of the
- * active cell it copies.
+ * 1. Every storage cell of every domain (active and ghost) holds an
+ *    integer-valued deposit of comps 0..3 (V, N), so every sum is exact in
+ *    single precision whatever the order. Each deposit belongs to the global
+ *    active cell it maps to (periodic wrap on x2/x3, mirror about the x1
+ *    walls with V_x odd). After the remap every active cell must hold the sum
+ *    of the deposits that map to it, and every ghost cell the (mirrored)
+ *    value of the active cell it copies. Checked for the step-by-step
+ *    sequence (sync, fold, fill, wall fill) and for hybrid::RemapMoments.
+ * 2. With non-integer deposits the two must agree bitwise in every cell.
  */
 #include "enums.h"
 #include "global.h"
@@ -16,10 +18,12 @@
 #include "arch/kokkos_aliases.h"
 #include "utils/error.h"
 #include "utils/formatting.h"
+#include "utils/timer.h"
 
 #include "metrics/minkowski.h"
 
 #include "engines/hybrid/fields_bcs.h"
+#include "engines/hybrid/moments_remap.h"
 #include "framework/domain/domain.h"
 #include "framework/domain/metadomain.h"
 
@@ -35,6 +39,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <string>
@@ -44,13 +49,23 @@ using namespace ntt;
 
 namespace {
 
-  // integer-valued deposit in [1, 8] of domain `idx` at storage cell `i`
-  auto deposit(unsigned int idx, const int i[3], int c) -> real_t {
+  auto hash(unsigned int idx, const int i[3], int c) -> std::uint32_t {
     std::uint32_t h = 2166136261u;
     for (const auto v : { i[0], i[1], i[2], c, static_cast<int>(idx) }) {
       h = (h ^ static_cast<std::uint32_t>(v + 1000)) * 16777619u;
     }
-    return static_cast<real_t>(1u + (h >> 9) % 8u);
+    return h;
+  }
+
+  // integer-valued deposit in [1, 8] of domain `idx` at storage cell `i`
+  auto deposit(unsigned int idx, const int i[3], int c) -> real_t {
+    return static_cast<real_t>(1u + (hash(idx, i, c) >> 9) % 8u);
+  }
+
+  // non-integer deposit in (-1, 9) (V) or (0.1, 10) (N)
+  auto deposit_real(unsigned int idx, const int i[3], int c) -> real_t {
+    const auto u = static_cast<double>(hash(idx, i, c)) / 4294967296.0;
+    return static_cast<real_t>((c < 3) ? (10.0 * u - 1.0) : (0.1 + 9.9 * u));
   }
 
   // global active cell of storage cell `i` of a domain at `offset`, and the
@@ -84,79 +99,80 @@ namespace {
   }
 
   template <Dimension D>
-  auto run(const std::vector<ncells_t>& res,
-           const std::vector<int>&      decomposition,
-           const std::string&           label) -> bool {
-    using M  = metric::Minkowski<D>;
-    int rank = 0, nranks = 1;
-#if defined(MPI_ENABLED)
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-#endif
-    boundaries_t<real_t> extent;
-    boundaries_t<FldsBC> fldsbc;
-    boundaries_t<PrtlBC> prtlbc;
-    for (auto d { 0u }; d < static_cast<unsigned>(D); ++d) {
-      extent.push_back({ ZERO, static_cast<real_t>(res[d]) });
-      if (d == 0u) {
-        fldsbc.push_back({ FldsBC::CONDUCTOR, FldsBC::CONDUCTOR });
-        prtlbc.push_back({ PrtlBC::REFLECT, PrtlBC::REFLECT });
-      } else {
-        fldsbc.push_back({ FldsBC::PERIODIC, FldsBC::PERIODIC });
-        prtlbc.push_back({ PrtlBC::PERIODIC, PrtlBC::PERIODIC });
-      }
+  using metadomain_t = Metadomain<SimEngine::HYBRID, metric::Minkowski<D>>;
+  template <Dimension D>
+  using domain_t = Domain<SimEngine::HYBRID, metric::Minkowski<D>>;
+
+  // storage extents of a domain (1 for absent axes)
+  template <Dimension D>
+  auto extents_of(const domain_t<D>& d) -> std::vector<int> {
+    std::vector<int> e { 1, 1, 1 };
+    for (auto r { 0u }; r < static_cast<unsigned>(D); ++r) {
+      e[r] = static_cast<int>(d.mesh.n_active()[r] + 2 * N_GHOSTS);
     }
-    Metadomain<SimEngine::HYBRID, M> metadomain { static_cast<unsigned int>(nranks),
-                                                  decomposition,
-                                                  res,
-                                                  extent,
-                                                  fldsbc,
-                                                  prtlbc,
-                                                  {},
-                                                  {} };
-    const auto ldidx = metadomain.l_subdomain_indices()[0];
-    auto&      dom   = *metadomain.subdomain_ptr(ldidx);
+    return e;
+  }
 
-    // storage extents of a domain (1 for absent axes)
-    const auto extents_of = [](const Domain<SimEngine::HYBRID, M>& d) {
-      std::vector<int> e { 1, 1, 1 };
-      for (auto r { 0u }; r < static_cast<unsigned>(D); ++r) {
-        e[r] = static_cast<int>(d.mesh.n_active()[r] + 2 * N_GHOSTS);
-      }
-      return e;
-    };
+  template <Dimension D, class V>
+  auto at(const V& v, int i1, int i2, int i3, int c) -> real_t& {
+    if constexpr (D == Dim::_1D) {
+      (void)i2;
+      (void)i3;
+      return v(i1, c);
+    } else if constexpr (D == Dim::_2D) {
+      (void)i3;
+      return v(i1, i2, c);
+    } else {
+      return v(i1, i2, i3, c);
+    }
+  }
 
-    // deposits of the local domain
+  // aux of the local domain <- deposits (comps 0..3), zero (comps 4, 5)
+  template <Dimension D>
+  void fill_deposits(domain_t<D>& dom, unsigned int idx, bool integer) {
     auto       aux_h = Kokkos::create_mirror_view(dom.fields.aux);
-    const auto el    = extents_of(dom);
+    const auto el    = extents_of<D>(dom);
     for (int i1 = 0; i1 < el[0]; ++i1) {
       for (int i2 = 0; i2 < el[1]; ++i2) {
         for (int i3 = 0; i3 < el[2]; ++i3) {
           const int i[3] { i1, i2, i3 };
           for (int c = 0; c < 6; ++c) {
-            const real_t v = (c < 4) ? deposit(ldidx, i, c) : ZERO;
-            if constexpr (D == Dim::_1D) {
-              aux_h(i1, c) = v;
-            } else if constexpr (D == Dim::_2D) {
-              aux_h(i1, i2, c) = v;
-            } else {
-              aux_h(i1, i2, i3, c) = v;
-            }
+            at<D>(aux_h, i1, i2, i3, c) = (c >= 4)  ? ZERO
+                                          : integer ? deposit(idx, i, c)
+                                                    : deposit_real(idx, i, c);
           }
         }
       }
     }
     Kokkos::deep_copy(dom.fields.aux, aux_h);
+  }
 
-    // the remap after a deposit, as in the hybrid engine
-    metadomain.SynchronizeFields(dom, Comm::AUX);
-    hybrid::MomentsWallBC(dom, metadomain.mesh(), true);
-    metadomain.CommunicateFields(dom, Comm::AUX);
-    hybrid::MomentsWallBC(dom, metadomain.mesh(), false);
+  // the remap after a deposit: the step-by-step sequence, or RemapMoments
+  template <Dimension D>
+  void remap(metadomain_t<D>& metadomain, domain_t<D>& dom, bool step_by_step) {
+    if (step_by_step) {
+      metadomain.SynchronizeFields(dom, Comm::AUX);
+      hybrid::MomentsWallBC(dom, metadomain.mesh(), true);
+      metadomain.CommunicateFields(dom, Comm::AUX);
+      hybrid::MomentsWallBC(dom, metadomain.mesh(), false);
+    } else {
+      auto timers = timer::Timers { "Communications", "FieldBoundaries" };
+      hybrid::RemapMoments(metadomain, dom, timers);
+    }
+  }
 
+  // number of local cells that differ from the oracle, by category (active,
+  // wall ghost, halo ghost, corner), and the largest difference
+  template <Dimension D>
+  void check_oracle(const metadomain_t<D>& metadomain,
+                    domain_t<D>&           dom,
+                    long                   nbad[4],
+                    long                   ncell[4],
+                    double&                maxdiff,
+                    double&                sum_n,
+                    double&                total_n) {
+    auto aux_h = Kokkos::create_mirror_view(dom.fields.aux);
     Kokkos::deep_copy(aux_h, dom.fields.aux);
-
-    // expected sums over the deposits of all domains, per global active cell
     const auto       nglob = metadomain.mesh().n_active();
     std::vector<int> ng { 1, 1, 1 };
     for (auto d { 0u }; d < static_cast<unsigned>(D); ++d) {
@@ -166,12 +182,13 @@ namespace {
       return static_cast<std::size_t>(
         ((g[2] * ng[1] + g[1]) * ng[0] + g[0]) * 4 + c);
     };
+    // expected sums over the deposits of all domains, per global active cell
     std::vector<double> total(static_cast<std::size_t>(ng[0] * ng[1] * ng[2] * 4),
                               0.0);
-    double total_n = 0.0;
+    total_n = 0.0;
     for (unsigned int idx = 0; idx < metadomain.ndomains(); ++idx) {
       const auto& sd  = metadomain.subdomain(idx);
-      const auto  e   = extents_of(sd);
+      const auto  e   = extents_of<D>(sd);
       const auto  off = sd.offset_ncells();
       for (int i1 = 0; i1 < e[0]; ++i1) {
         for (int i2 = 0; i2 < e[1]; ++i2) {
@@ -189,13 +206,13 @@ namespace {
         }
       }
     }
-
-    // compare every storage cell of the local domain
-    const auto off  = dom.offset_ncells();
-    long   nbad[4]  = { 0, 0, 0, 0 }; // active, wall ghost, halo ghost, corner
-    long   ncell[4] = { 0, 0, 0, 0 };
-    double maxdiff  = 0.0;
-    double sum_n    = 0.0;
+    const auto el  = extents_of<D>(dom);
+    const auto off = dom.offset_ncells();
+    for (int k = 0; k < 4; ++k) {
+      nbad[k] = ncell[k] = 0;
+    }
+    maxdiff = 0.0;
+    sum_n   = 0.0;
     for (int i1 = 0; i1 < el[0]; ++i1) {
       for (int i2 = 0; i2 < el[1]; ++i2) {
         for (int i3 = 0; i3 < el[2]; ++i3) {
@@ -220,14 +237,7 @@ namespace {
             if (flip and c == 0) {
               expect = -expect;
             }
-            real_t got;
-            if constexpr (D == Dim::_1D) {
-              got = aux_h(i1, c);
-            } else if constexpr (D == Dim::_2D) {
-              got = aux_h(i1, i2, c);
-            } else {
-              got = aux_h(i1, i2, i3, c);
-            }
+            const real_t got  = at<D>(aux_h, i1, i2, i3, c);
             const double diff = static_cast<double>(got) - expect;
             if (diff != 0.0) {
               bad     = true;
@@ -250,15 +260,95 @@ namespace {
     MPI_Allreduce(MPI_IN_PLACE, &maxdiff, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &sum_n, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 #endif
-    const bool ok = (nbad[0] + nbad[1] + nbad[2] + nbad[3]) == 0;
+  }
+
+  template <Dimension D>
+  auto run(const std::vector<ncells_t>& res,
+           const std::vector<int>&      decomposition,
+           const std::string&           label) -> bool {
+    int rank = 0, nranks = 1;
+#if defined(MPI_ENABLED)
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+#endif
+    boundaries_t<real_t> extent;
+    boundaries_t<FldsBC> fldsbc;
+    boundaries_t<PrtlBC> prtlbc;
+    for (auto d { 0u }; d < static_cast<unsigned>(D); ++d) {
+      extent.push_back({ ZERO, static_cast<real_t>(res[d]) });
+      if (d == 0u) {
+        fldsbc.push_back({ FldsBC::CONDUCTOR, FldsBC::CONDUCTOR });
+        prtlbc.push_back({ PrtlBC::REFLECT, PrtlBC::REFLECT });
+      } else {
+        fldsbc.push_back({ FldsBC::PERIODIC, FldsBC::PERIODIC });
+        prtlbc.push_back({ PrtlBC::PERIODIC, PrtlBC::PERIODIC });
+      }
+    }
+    metadomain_t<D> metadomain { static_cast<unsigned int>(nranks),
+                                 decomposition,
+                                 res,
+                                 extent,
+                                 fldsbc,
+                                 prtlbc,
+                                 {},
+                                 {} };
+    const auto      ldidx = metadomain.l_subdomain_indices()[0];
+    auto&           dom   = *metadomain.subdomain_ptr(ldidx);
+
+    bool ok = true;
+    for (const bool step_by_step : { true, false }) {
+      fill_deposits<D>(dom, ldidx, true);
+      remap<D>(metadomain, dom, step_by_step);
+      long   nbad[4], ncell[4];
+      double maxdiff, sum_n, total_n;
+      check_oracle<D>(metadomain, dom, nbad, ncell, maxdiff, sum_n, total_n);
+      const bool good = (nbad[0] + nbad[1] + nbad[2] + nbad[3]) == 0;
+      ok              = ok and good;
+      if (rank == 0) {
+        std::cout << label << " (" << nranks << " ranks), "
+                  << (step_by_step ? "step by step" : "RemapMoments")
+                  << ": mismatched cells active " << nbad[0] << "/" << ncell[0]
+                  << ", wall ghost " << nbad[1] << "/" << ncell[1]
+                  << ", halo ghost " << nbad[2] << "/" << ncell[2] << ", corner "
+                  << nbad[3] << "/" << ncell[3] << ", max |diff| " << maxdiff
+                  << "; sum N active " << sum_n << " of deposited " << total_n
+                  << (good ? "  OK" : "  FAIL") << std::endl;
+      }
+    }
+
+    // non-integer deposits: both remaps bitwise equal in every cell
+    fill_deposits<D>(dom, ldidx, false);
+    remap<D>(metadomain, dom, true);
+    auto ref = Kokkos::create_mirror_view(dom.fields.aux);
+    Kokkos::deep_copy(ref, dom.fields.aux);
+    fill_deposits<D>(dom, ldidx, false);
+    remap<D>(metadomain, dom, false);
+    auto       got  = Kokkos::create_mirror_view(dom.fields.aux);
+    long       ndif = 0;
+    const auto el   = extents_of<D>(dom);
+    Kokkos::deep_copy(got, dom.fields.aux);
+    for (int i1 = 0; i1 < el[0]; ++i1) {
+      for (int i2 = 0; i2 < el[1]; ++i2) {
+        for (int i3 = 0; i3 < el[2]; ++i3) {
+          for (int c = 0; c < 6; ++c) {
+            const real_t a = at<D>(ref, i1, i2, i3, c);
+            const real_t b = at<D>(got, i1, i2, i3, c);
+            if (std::memcmp(&a, &b, sizeof(real_t)) != 0) {
+              ++ndif;
+            }
+          }
+        }
+      }
+    }
+#if defined(MPI_ENABLED)
+    MPI_Allreduce(MPI_IN_PLACE, &ndif, 1, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
+#endif
+    ok = ok and (ndif == 0);
     if (rank == 0) {
-      std::cout << label << " (" << nranks << " ranks): mismatched cells "
-                << "active " << nbad[0] << "/" << ncell[0] << ", wall ghost "
-                << nbad[1] << "/" << ncell[1] << ", halo ghost " << nbad[2]
-                << "/" << ncell[2] << ", corner " << nbad[3] << "/" << ncell[3]
-                << ", max |diff| " << maxdiff << "; sum N active " << sum_n
-                << " of deposited " << total_n << (ok ? "  OK" : "  FAIL")
-                << std::endl;
+      std::cout << label << " (" << nranks
+                << " ranks), RemapMoments vs step by step, non-integer "
+                   "deposits: bitwise different values "
+                << ndif << ((ndif == 0) ? "  OK" : "  FAIL") << std::endl;
     }
     return ok;
   }

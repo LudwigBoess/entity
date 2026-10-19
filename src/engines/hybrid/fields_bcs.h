@@ -350,14 +350,18 @@ namespace ntt {
      *        transverse halo copies of the near-wall cells carry the folded
      *        values. With fold = false only the (idempotent) ghost mirror fill
      *        runs, e.g. to re-fill after the halo exchange or a filter pass.
+     * @param fold_halo fold over the transverse halo ghosts too: after
+     *        SynchronizeFillFields they hold their owners' sums, so the fold
+     *        there repeats the owners' fold
      */
     template <Dimension D>
     void MomentsWallBC(Domain<SimEngine::HYBRID, metric::Minkowski<D>>& domain,
                        const Grid<D>& global_grid,
-                       bool           fold) {
+                       bool           fold,
+                       bool           fold_halo = false) {
       wall::ForEachX1Wall<D>(domain, global_grid, [&](short sign, ncells_t i_edge) {
         if (fold) {
-          const auto fold_range = wall::CellRange<D>(domain, true);
+          const auto fold_range = wall::CellRange<D>(domain, not fold_halo);
           if (sign > 0) {
             Kokkos::parallel_for("WallMomentsFold",
                                  fold_range,

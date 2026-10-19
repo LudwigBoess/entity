@@ -9,6 +9,7 @@
 #include "engines/hybrid/fields_bcs.h"
 #include "engines/hybrid/fieldsolvers.h"
 #include "engines/hybrid/moments_filter.h"
+#include "engines/hybrid/moments_remap.h"
 #include "engines/hybrid/particle_pusher.h"
 
 #include "engines/engine.hpp"
@@ -92,21 +93,9 @@ namespace ntt {
         // compute N^(0) and V^(0) -> aux::012, aux::3 (deposit-only, no push)
         hybrid::DepositMoments(dom, m_params);
 
-        timers.start("Communications");
-        m_metadomain.SynchronizeFields(dom, ::Comm::AUX); // additive remap of deposit tails
-        timers.stop("Communications");
-        // reflecting wall: fold the wall-ghost deposit tails back (image plasma)
-        // before the ghost fill, so the halo copies carry the folded values
-        timers.start("FieldBoundaries");
-        hybrid::MomentsWallBC(dom, m_metadomain.mesh(), /* fold */ true);
-        timers.stop("FieldBoundaries");
-        timers.start("Communications");
-        m_metadomain.CommunicateFields(dom, ::Comm::AUX); // fill ghosts for EMF reads
-        timers.stop("Communications");
-        // mirror-fill the wall ghosts again, now that the transverse halo is filled
-        timers.start("FieldBoundaries");
-        hybrid::MomentsWallBC(dom, m_metadomain.mesh(), /* fold */ false);
-        timers.stop("FieldBoundaries");
+        // additive remap of the deposit tails, image-plasma fold at the
+        // reflecting walls, ghost fill for the EMF reads
+        hybrid::RemapMoments(m_metadomain, dom, timers);
         // smooth N^(0),V^(0) (kills grid-scale shot noise before the field solve)
         timers.start("MomentFiltering");
         hybrid::MomentsFilter(m_metadomain, dom, m_params);
@@ -116,13 +105,28 @@ namespace ntt {
         // the problem generator's post-step runs after the last B ghost fill
         // of the previous step and may edit Bf^(n) (e.g. a sponge layer):
         // refill the Bf^(n) ghosts (periodic / MPI) and the wall conditions, so
-        // every ghost holds the current value of the cell it copies
-        timers.start("Communications");
-        m_metadomain.CommunicateFields(dom, ::Comm::EM_345);
-        timers.stop("Communications");
-        timers.start("FieldBoundaries");
-        hybrid::FieldBoundaries<M::Dim>(dom, m_metadomain.mesh(), BC::B);
-        timers.stop("FieldBoundaries");
+        // every ghost holds the current value of the cell it copies; skipped
+        // when the problem generator reports that its post-step of the
+        // previous step left Bf untouched
+        bool edited_b = true;
+        if constexpr (::traits::pgen::HasCustomPostStepEditsB<decltype(m_pgen)>) {
+          edited_b = m_pgen.CustomPostStepEditsB(step - 1);
+#if defined(MPI_ENABLED)
+          // every rank takes part in the exchange, and the neighbors of an
+          // edited domain need its new values: refresh if any rank edited B
+          int edited = edited_b ? 1 : 0;
+          MPI_Allreduce(MPI_IN_PLACE, &edited, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+          edited_b = (edited != 0);
+#endif
+        }
+        if (edited_b) {
+          timers.start("Communications");
+          m_metadomain.CommunicateFields(dom, ::Comm::EM_345);
+          timers.stop("Communications");
+          timers.start("FieldBoundaries");
+          hybrid::FieldBoundaries<M::Dim>(dom, m_metadomain.mesh(), BC::B);
+          timers.stop("FieldBoundaries");
+        }
       }
 
       // EMF calculation #0 — the un-averaged field E^(n).
@@ -236,22 +240,9 @@ namespace ntt {
       timers.start("ParticlePusher");
       hybrid::ParticlePush(dom, this->engineParams(), m_params, /* corrector */ false);
       timers.stop("ParticlePusher");
-      timers.start("Communications");
-      m_metadomain.SynchronizeFields(dom,
-                                     ::Comm::AUX); // additive remap of deposit tails
-      timers.stop("Communications");
-      // reflecting wall: image-plasma fold of the predicted moments, before the
-      // ghost fill so the halo copies carry the folded values
-      timers.start("FieldBoundaries");
-      hybrid::MomentsWallBC(dom, m_metadomain.mesh(), /* fold */ true);
-      timers.stop("FieldBoundaries");
-      timers.start("Communications");
-      m_metadomain.CommunicateFields(dom, ::Comm::AUX); // fill ghosts for EMF #2
-      timers.stop("Communications");
-      // mirror-fill the wall ghosts again, now that the transverse halo is filled
-      timers.start("FieldBoundaries");
-      hybrid::MomentsWallBC(dom, m_metadomain.mesh(), /* fold */ false);
-      timers.stop("FieldBoundaries");
+      // additive remap of the predicted moments, image-plasma fold at the
+      // reflecting walls, ghost fill for EMF #2
+      hybrid::RemapMoments(m_metadomain, dom, timers);
       // smooth predicted N',V' before EMF #2
       timers.start("MomentFiltering");
       hybrid::MomentsFilter(m_metadomain, dom, m_params);
@@ -376,21 +367,9 @@ namespace ntt {
       hybrid::ParticlePush(dom, this->engineParams(), m_params, /* corrector */ true);
       timers.stop("ParticlePusher");
 
-      timers.start("Communications");
-      m_metadomain.SynchronizeFields(dom, ::Comm::AUX);
-      timers.stop("Communications");
-      // reflecting wall: image-plasma fold of the final moments, before the
-      // ghost fill so the halo copies carry the folded values
-      timers.start("FieldBoundaries");
-      hybrid::MomentsWallBC(dom, m_metadomain.mesh(), /* fold */ true);
-      timers.stop("FieldBoundaries");
-      timers.start("Communications");
-      m_metadomain.CommunicateFields(dom, ::Comm::AUX); // fill ghosts for next step's EMF
-      timers.stop("Communications");
-      // mirror-fill the wall ghosts again, now that the transverse halo is filled
-      timers.start("FieldBoundaries");
-      hybrid::MomentsWallBC(dom, m_metadomain.mesh(), /* fold */ false);
-      timers.stop("FieldBoundaries");
+      // additive remap of the final moments, image-plasma fold at the
+      // reflecting walls, ghost fill for the next step's EMF
+      hybrid::RemapMoments(m_metadomain, dom, timers);
       // smooth final N^(n+1),V^(n+1) for next step's EMF #0/#1
       timers.start("MomentFiltering");
       hybrid::MomentsFilter(m_metadomain, dom, m_params);

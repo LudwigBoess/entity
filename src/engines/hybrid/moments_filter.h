@@ -25,10 +25,9 @@ namespace ntt {
      * inject grid-scale shot noise straight into the Ohm's-law E and drive a
      * numerical instability (see kernels/hybrid/moments_filter.hpp).
      *
-     * Must be called AFTER the deposit's additive ghost remap
-     * (SynchronizeFields(AUX)) and active->ghost copy (CommunicateFields(AUX)),
-     * since the stencil reads the i +/- 1 ghosts, which hold valid values to a
-     * depth of N_GHOSTS (>= 2) on entry.
+     * Must be called AFTER the deposit's ghost remap (RemapMoments), since the
+     * stencil reads the i +/- 1 ghosts, which hold valid values to a depth of
+     * N_GHOSTS (>= 2) on entry.
      *
      * Passes run in pairs with one halo exchange per pair: the first pass of a
      * pair filters aux -> bckp on the active cells plus one ghost layer on
@@ -104,7 +103,7 @@ namespace ntt {
           range_with_margin(0u),
           kernel::hybrid::MomentsFilter_kernel<D>(domain.fields.aux,
                                                   domain.fields.bckp));
-        metadomain.CommunicateFields(domain, ::Comm::AUX);
+        metadomain.CommunicateFields(domain, ::Comm::AUX_0123);
         // re-mirror the reflecting-wall ghosts (fill only; the deposit tails
         // were already folded once, before the filter)
         MomentsWallBC(domain, metadomain.mesh(), /* fold */ false);
@@ -116,7 +115,7 @@ namespace ntt {
           domain.mesh.rangeActiveCells(),
           kernel::hybrid::MomentsFilter_kernel<D>(domain.fields.aux,
                                                   domain.fields.bckp));
-        metadomain.CommunicateFields(domain, ::Comm::AUX);
+        metadomain.CommunicateFields(domain, ::Comm::AUX_0123);
         MomentsWallBC(domain, metadomain.mesh(), /* fold */ false);
       }
     }

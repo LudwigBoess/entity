@@ -21,8 +21,8 @@
  *
  * Each call rebuilds the `aux` ScatterView, zeroes aux, runs the kernel (which
  * scatter-deposits), and contributes. The caller then remaps/fills aux ghosts:
- *   SynchronizeFields(dom, ::Comm::AUX)  // additive ghost->active (Pegasus §3.6)
- *   CommunicateFields(dom, ::Comm::AUX)  // copy active->ghost for the EMF reads
+ *   RemapMoments(metadomain, dom, timers) // additive ghost->active (Pegasus
+ *                                         // §3.6), wall fold, ghost fill
  * and, before each push, fills the bckp (Ec/Bc) ghosts the gather reads:
  *   CommunicateFields(dom, ::Comm::Bckp)
  *

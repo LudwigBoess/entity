@@ -4,12 +4,16 @@
  *        one CommunicateFields / SynchronizeFields call is packed by one
  *        kernel, sent as one message per direction with all messages in
  *        flight at once, and unpacked by one kernel (fill) or by one kernel per
- *        direction in direction order (additive).
+ *        direction in direction order (additive). The combined mode
+ *        (SyncFill) sends the messages of the additive sync and computes the
+ *        summed owned cells and the filled ghost cells in one kernel.
  * @implements
  *   - comm::HaloSegment
+ *   - comm::HaloSlot
  *   - comm::HaloField
  *   - comm::HaloDirection
  *   - comm::MakeHaloField<> -> comm::HaloField
+ *   - comm::HaloSyncFill_kernel<>
  *   - comm::HaloExchanger<>
  * @namespaces:
  *   - comm::
@@ -32,6 +36,7 @@
 
 #include "global.h"
 
+#include "arch/directions.h"
 #include "arch/kokkos_aliases.h"
 #include "arch/mpi_aliases.h"
 #include "utils/error.h"
@@ -194,6 +199,119 @@ namespace comm {
     }
   };
 
+  /**
+   * The values a SyncFill call receives from the neighbor behind one
+   * direction e (the domain at offset -e): the block [lo, lo + n) of the
+   * field they belong to and their offset in the receive buffer, or in the
+   * send buffer for a periodic self-wrap (the domain's own values, packed
+   * there). All members are 64-bit so the struct has no padding and two
+   * tables compare with memcmp.
+   */
+  struct HaloSlot {
+    int64_t valid { 0 };
+    int64_t in_send { 0 };
+    int64_t lo[3] { 0, 0, 0 };
+    int64_t n[3] { 1, 1, 1 };
+    int64_t off { 0 };
+  };
+
+  /**
+   * Device functor of HaloExchanger::SyncFill (thread l: cell l of the field
+   * storage, i1 fastest). The offset dl of a cell is -1 / +1 along an axis
+   * below / above the owned box (on sides with a neighbor), else 0.
+   *  - owned cell (dl = 0): its own value plus the values of the neighbors'
+   *    blocks covering it, summed in direction order -- the additive sync;
+   *  - ghost cell: the value the owner, the domain at offset dl, computes
+   *    for it in the same way: the owner's own value (the block behind -dl)
+   *    plus, for the owner's directions d in order, the value of the domain
+   *    at offset -d from the owner, i.e. the block behind e = d - dl here
+   *    (this domain's own value for e = 0).
+   * The same values are summed in the same order, so every ghost cell is
+   * bitwise equal to its owner's copy.
+   */
+  template <Dimension D>
+  struct HaloSyncFill_kernel {
+    Kokkos::View<const HaloSlot*> slot; // 27 entries, by direction code
+    Kokkos::Array<int, 26>      order;  // codes of Directions<D>::all, in order
+    int                         nord;
+    Kokkos::View<const real_t*> sbuf, rbuf;
+    real_t*                     fld;
+    int64_t                     st[4];
+    int64_t                     own_lo[3], own_hi[3];
+    uint32_t                    ext[3];
+    int                         c0, nc;
+
+    // code of offset e: (e1 + 1) + 3 (e2 + 1) + 9 (e3 + 1)
+    static Inline auto code(int e0, int e1, int e2) -> int {
+      return (e0 + 1) + 3 * (e1 + 1) + 9 * (e2 + 1);
+    }
+
+    // value at cell x, comp c of the block behind direction code cd; false if
+    // there is none or it does not cover x
+    Inline auto value(int cd, const int64_t x[3], int c, real_t& v) const -> bool {
+      const HaloSlot& s = slot(cd);
+      if (s.valid == 0) {
+        return false;
+      }
+      for (auto k { 0u }; k < 3u; ++k) {
+        if (x[k] < s.lo[k] or x[k] >= s.lo[k] + s.n[k]) {
+          return false;
+        }
+      }
+      const int64_t idx = (x[0] - s.lo[0]) +
+                          s.n[0] *
+                            ((x[1] - s.lo[1]) +
+                             s.n[1] * ((x[2] - s.lo[2]) + s.n[2] * (c - c0)));
+      v = (s.in_send != 0) ? sbuf(s.off + idx) : rbuf(s.off + idx);
+      return true;
+    }
+
+    Inline void operator()(const int64_t l) const {
+      const auto     r = static_cast<uint32_t>(l);
+      const uint32_t q = r / ext[0];
+      const int64_t  x[3] { static_cast<int64_t>(r - q * ext[0]),
+                            static_cast<int64_t>(q % ext[1]),
+                            static_cast<int64_t>(q / ext[1]) };
+      int            dl[3] { 0, 0, 0 };
+      for (auto k { 0u }; k < 3u; ++k) {
+        dl[k] = (x[k] < own_lo[k]) ? -1 : ((x[k] >= own_hi[k]) ? 1 : 0);
+      }
+      const bool    owned = (dl[0] == 0) and (dl[1] == 0) and (dl[2] == 0);
+      const int64_t a     = x[0] * st[0] + x[1] * st[1] + x[2] * st[2];
+      for (int c = c0; c < c0 + nc; ++c) {
+        real_t acc = ZERO;
+        bool   any = false;
+        for (int k = 0; k < nord; ++k) {
+          const int cd = order[k];
+          const int e0 = cd % 3 - 1 - dl[0];
+          const int e1 = (cd / 3) % 3 - 1 - dl[1];
+          const int e2 = cd / 9 - 1 - dl[2];
+          if (e0 < -1 or e0 > 1 or e1 < -1 or e1 > 1 or e2 < -1 or e2 > 1) {
+            continue;
+          }
+          real_t v;
+          if (e0 == 0 and e1 == 0 and e2 == 0) {
+            v = fld[a + c * st[3]];
+          } else if (not value(code(e0, e1, e2), x, c, v)) {
+            continue;
+          }
+          acc += v;
+          any  = true;
+        }
+        if (owned) {
+          if (any) {
+            fld[a + c * st[3]] += acc;
+          }
+        } else {
+          real_t base;
+          if (value(code(-dl[0], -dl[1], -dl[2]), x, c, base)) {
+            fld[a + c * st[3]] = base + acc;
+          }
+        }
+      }
+    }
+  };
+
   template <Dimension D>
   class HaloExchanger {
     using seg_range_t = std::pair<std::size_t, std::size_t>;
@@ -218,9 +336,11 @@ namespace comm {
       std::vector<seg_range_t> per_dir;          // additive unpack, direction order
       std::vector<Message>     sends, recvs;
       int64_t                  send_total { 0 }, recv_total { 0 };
+      std::vector<HaloSlot> h_slot; // SyncFill: 27 entries, by direction code
 
       Kokkos::View<HaloSegment*> d_seg;
       Kokkos::View<int64_t*>     d_start;
+      Kokkos::View<HaloSlot*>    d_slot;
 
       auto same_as(const Plan& o) const -> bool {
         return (h_seg.size() == o.h_seg.size()) and
@@ -229,7 +349,10 @@ namespace comm {
                             h_seg.size() * sizeof(HaloSegment)) == 0) and
                (h_start == o.h_start) and (out == o.out) and (in == o.in) and
                (per_dir == o.per_dir) and (sends == o.sends) and
-               (recvs == o.recvs);
+               (recvs == o.recvs) and (h_slot.size() == o.h_slot.size()) and
+               (std::memcmp(h_slot.data(),
+                            o.h_slot.data(),
+                            h_slot.size() * sizeof(HaloSlot)) == 0);
       }
     };
 
@@ -378,6 +501,76 @@ namespace comm {
       return p;
     }
 
+    // code of the direction of Directions<D>::all with index `tag`
+    static auto direction_code(int tag) -> int {
+      const auto& d = dir::Directions<D>::all[static_cast<std::size_t>(tag)];
+      int         e[3] { 0, 0, 0 };
+      for (auto k { 0u }; k < static_cast<unsigned>(D); ++k) {
+        e[k] = d[k];
+      }
+      return HaloSyncFill_kernel<D>::code(e[0], e[1], e[2]);
+    }
+
+    /**
+     * SyncFill plan: the pack segments and messages of the additive sync of
+     * `fld` (remote sends first; the self-wrap blocks packed after them, in
+     * the send buffer), and the slot of every direction.
+     */
+    static auto build_sync_fill(const std::vector<HaloDirection>& dirs,
+                                const HaloField&                  fld) -> Plan {
+      Plan p;
+      p.h_slot.resize(27u);
+      for (auto& sl : p.h_slot) {
+        std::memset(&sl, 0, sizeof(HaloSlot));
+        sl.n[0] = sl.n[1] = sl.n[2] = 1;
+      }
+      for (const auto& dr : dirs) {
+        if (dr.local or dr.send_rank < 0) {
+          continue;
+        }
+        const int64_t msg_off = p.send_total;
+        p.h_seg.push_back(
+          segment(fld, HaloSegment::Pack, &dr.send_slice, nullptr, p.send_total));
+        p.send_total += p.h_seg.back().size();
+        p.sends.push_back({ dr.send_rank, dr.tag, msg_off, p.send_total - msg_off });
+      }
+      for (const auto& dr : dirs) {
+        auto& sl = p.h_slot[static_cast<std::size_t>(direction_code(dr.tag))];
+        if (dr.local) {
+          // the values wrapped onto the receive block, in its element order
+          const auto g = segment(fld,
+                                 HaloSegment::Pack,
+                                 &dr.send_slice,
+                                 &dr.recv_slice,
+                                 p.send_total);
+          p.h_seg.push_back(g);
+          sl.valid   = 1;
+          sl.in_send = 1;
+          sl.off     = p.send_total;
+          set_block(sl.lo, sl.n, dr.recv_slice);
+          p.send_total += g.size();
+        } else if (dr.recv_rank >= 0) {
+          HaloSegment g = segment(fld,
+                                  HaloSegment::Unpack,
+                                  nullptr,
+                                  &dr.recv_slice,
+                                  p.recv_total);
+          sl.valid      = 1;
+          sl.in_send    = 0;
+          sl.off        = p.recv_total;
+          set_block(sl.lo, sl.n, dr.recv_slice);
+          p.recvs.push_back({ dr.recv_rank, dr.tag, p.recv_total, g.size() });
+          p.recv_total += g.size();
+        }
+      }
+      p.out = { 0u, p.h_seg.size() };
+      p.h_start.resize(p.h_seg.size() + 1u, 0);
+      for (auto s { 0u }; s < p.h_seg.size(); ++s) {
+        p.h_start[s + 1] = p.h_start[s] + p.h_seg[s].size();
+      }
+      return p;
+    }
+
     void upload(Plan& p) {
       const auto nseg = p.h_seg.size();
       p.d_seg   = Kokkos::View<HaloSegment*> { "halo_segments", nseg };
@@ -392,6 +585,14 @@ namespace comm {
       }
       Kokkos::deep_copy(p.d_seg, h_seg);
       Kokkos::deep_copy(p.d_start, h_start);
+      if (not p.h_slot.empty()) {
+        p.d_slot   = Kokkos::View<HaloSlot*> { "halo_slots", p.h_slot.size() };
+        auto h_slt = Kokkos::create_mirror_view(p.d_slot);
+        for (auto s { 0u }; s < p.h_slot.size(); ++s) {
+          h_slt(s) = p.h_slot[s];
+        }
+        Kokkos::deep_copy(p.d_slot, h_slt);
+      }
     }
 
     // cached plan equal to `p` for `key`, uploading `p` if there is none
@@ -479,7 +680,80 @@ namespace comm {
       ensure_buffers(p.send_total, p.recv_total);
 
       launch(p, p.out);
+      communicate(p);
 
+      if (not additive) {
+        launch(p, p.in);
+      } else {
+        for (const auto& grp : p.per_dir) {
+          launch(p, grp);
+        }
+      }
+    }
+
+    /**
+     * @brief Additive halo sync of `fld` (deposit tails, src == dst) that
+     *        also fills its ghost cells, in one exchange: owned cells get
+     *        the sum of SynchronizeFields, ghost cells the bitwise copy of
+     *        that sum on their owner (see HaloSyncFill_kernel).
+     * @param dirs the synchronize-mode directions (active + ghost slices)
+     * @param own_lo, own_hi the owned box per axis (ghosts included on the
+     *        sides without a neighbor); 0 and 1 for absent axes
+     * @param ext the storage extent per axis; 1 for absent axes
+     */
+    void SyncFill(int                               key,
+                  const std::vector<HaloDirection>& dirs,
+                  const HaloField&                  fld,
+                  const int64_t                     own_lo[3],
+                  const int64_t                     own_hi[3],
+                  const int64_t                     ext[3]) {
+      raise::ErrorIf(fld.src != fld.dst,
+                     "HaloExchange: SyncFill acts on one field in place",
+                     HERE);
+      if (dirs.empty()) {
+        return;
+      }
+      auto& p = cached(key, build_sync_fill(dirs, fld));
+      ensure_buffers(p.send_total, p.recv_total);
+
+      launch(p, p.out);
+      communicate(p);
+
+      HaloSyncFill_kernel<D> kern;
+      kern.slot = p.d_slot;
+      kern.nord = static_cast<int>(dir::Directions<D>::all.size());
+      for (auto k { 0 }; k < kern.nord; ++k) {
+        kern.order[k] = direction_code(k);
+      }
+      kern.sbuf = m_send;
+      kern.rbuf = m_recv;
+      kern.fld  = fld.dst;
+      for (auto k { 0u }; k < 4u; ++k) {
+        kern.st[k] = fld.st[k];
+      }
+      int64_t ncells = 1;
+      for (auto k { 0u }; k < 3u; ++k) {
+        kern.own_lo[k]  = own_lo[k];
+        kern.own_hi[k]  = own_hi[k];
+        kern.ext[k]     = static_cast<uint32_t>(ext[k]);
+        ncells         *= ext[k];
+      }
+      raise::ErrorIf(ncells > static_cast<int64_t>(UINT32_MAX),
+                     "HaloExchange: SyncFill field too large",
+                     HERE);
+      kern.c0 = static_cast<int>(fld.comps.first);
+      kern.nc = static_cast<int>(fld.comps.second - fld.comps.first);
+      Kokkos::parallel_for(
+        "HaloSyncFill",
+        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace, Kokkos::IndexType<int64_t>>(
+          0,
+          ncells),
+        kern);
+    }
+
+  private:
+    // the messages of a plan, all in flight at once
+    void communicate(const Plan& p) {
       const bool remote = (not p.sends.empty()) or (not p.recvs.empty());
       if (remote) {
 #if defined(DEVICE_ENABLED)
@@ -536,16 +810,9 @@ namespace comm {
         }
 #endif
       }
-
-      if (not additive) {
-        launch(p, p.in);
-      } else {
-        for (const auto& grp : p.per_dir) {
-          launch(p, grp);
-        }
-      }
     }
 
+  public:
     /**
      * @brief Persistent zeroed accumulator shaped like `like` (zeroing is
      *        asynchronous; the buffer is reallocated when the extents change).

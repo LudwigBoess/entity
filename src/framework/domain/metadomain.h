@@ -107,6 +107,11 @@ namespace ntt {
     void SynchronizeFields(Domain<S, M>&,
                            CommTags,
                            const cell_range_t& = { 0, 0 }) const;
+#if defined(MPI_ENABLED)
+    // SynchronizeFields of aux (AUX or AUX_0123) that also fills the ghost
+    // cells, each with the bitwise copy of its owner's sum, in one exchange
+    void SynchronizeFillFields(Domain<S, M>&, CommTags) const;
+#endif
     // Halo-fill of the bckp buffer (neighbor active cells -> local ghosts),
     // used by the in-situ renderer for seamless trilinear sampling.
     void CommunicateBckp(Domain<S, M>&, const cell_range_t&) const;

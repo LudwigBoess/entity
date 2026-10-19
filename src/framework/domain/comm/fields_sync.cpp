@@ -24,6 +24,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -76,10 +77,13 @@ namespace ntt {
    *        sync delivers the neighbors' tails into the same ghost cells.
    */
   template <SimEngine::type S, MetricClass M>
-  auto ActiveAndWallGhostCells(const Domain<S, M>& domain) -> range_t<M::Dim> {
-    constexpr auto        D = M::Dim;
-    std::vector<ncells_t> lo, hi;
-    const in              axes[3] { in::x1, in::x2, in::x3 };
+  void ActiveAndWallGhostBounds(const Domain<S, M>&    domain,
+                                std::vector<ncells_t>& lo,
+                                std::vector<ncells_t>& hi) {
+    constexpr auto D = M::Dim;
+    const in       axes[3] { in::x1, in::x2, in::x3 };
+    lo.clear();
+    hi.clear();
     for (auto d { 0u }; d < static_cast<unsigned>(D); ++d) {
       lo.push_back(domain.mesh.i_min(axes[d]));
       hi.push_back(domain.mesh.i_max(axes[d]));
@@ -96,6 +100,13 @@ namespace ntt {
         hi[d] += N_GHOSTS;
       }
     }
+  }
+
+  template <SimEngine::type S, MetricClass M>
+  auto ActiveAndWallGhostCells(const Domain<S, M>& domain) -> range_t<M::Dim> {
+    constexpr auto        D = M::Dim;
+    std::vector<ncells_t> lo, hi;
+    ActiveAndWallGhostBounds(domain, lo, hi);
     if constexpr (D == Dim::_1D) {
       return CreateRangePolicy<D>({ lo[0] }, { hi[0] });
     } else if constexpr (D == Dim::_2D) {
@@ -113,7 +124,12 @@ namespace ntt {
     const bool comm_cur0 = (tags & Comm::CUR0);
     const bool comm_bckp = (tags & Comm::Bckp);
     const bool comm_buff = (tags & Comm::Buff);
-    const bool comm_aux  = (tags & Comm::AUX_012) || (tags & Comm::AUX_345);
+    const bool comm_aux  = (tags & Comm::AUX_012) || (tags & Comm::AUX_345) ||
+                          (tags & Comm::AUX_0123);
+    // components of aux in the call
+    const cell_range_t aux_range = (tags & Comm::AUX_0123)
+                                     ? cell_range_t { 0, 4 }
+                                     : cell_range_t { 0, 6 };
     raise::ErrorIf(
       not(comm_cur0 || comm_cur || comm_bckp || comm_buff || comm_aux),
       "SynchronizeFields called with no task or incorrect task",
@@ -190,7 +206,7 @@ namespace ntt {
     if (comm_aux) {
       aux_recv = g_halo.template Accumulator<6>(1, domain.fields.aux);
       flds.push_back(
-        comm::MakeHaloField<M::Dim, 6>(domain.fields.aux, aux_recv, { 0, 6 }));
+        comm::MakeHaloField<M::Dim, 6>(domain.fields.aux, aux_recv, aux_range));
     }
     if (comm_buff) {
       buff_recv = g_halo.template Accumulator<3>(0, domain.fields.buff);
@@ -318,7 +334,7 @@ namespace ntt {
                                           recv_rank,
                                           send_slice,
                                           recv_slice,
-                                          { 0, 6 },
+                                          aux_range,
                                           SYNCHRONIZE);
       }
       if (comm_buff) {
@@ -360,7 +376,7 @@ namespace ntt {
       AddBufferedFields<M::Dim, 6>(domain.fields.aux,
                                    aux_recv,
                                    ActiveAndWallGhostCells(domain),
-                                   { 0, 6 });
+                                   aux_range);
     }
     if (comm_buff) {
       AddBufferedFields<M::Dim, 3>(domain.fields.buff,
@@ -370,11 +386,73 @@ namespace ntt {
     }
   }
 
+#if defined(MPI_ENABLED)
+  template <SimEngine::type S, MetricClass M>
+  void Metadomain<S, M>::SynchronizeFillFields(Domain<S, M>& domain,
+                                               CommTags      tags) const {
+    raise::ErrorIf(tags != Comm::AUX and tags != Comm::AUX_0123,
+                   "SynchronizeFillFields acts on aux only",
+                   HERE);
+    if constexpr (not ::traits::engine::DefinesAuxFields<S>) {
+      raise::Error("SynchronizeFillFields called for an engine that does not "
+                   "define AUX fields",
+                   HERE);
+    } else {
+      logger::Checkpoint("Synchronizing and filling AUX\n", HERE);
+      const cell_range_t    aux_range = (tags & Comm::AUX_0123)
+                                          ? cell_range_t { 0, 4 }
+                                          : cell_range_t { 0, 6 };
+      // the owned cells: the active ones and the ghosts on the wall sides,
+      // which also receive the halo sums (see ActiveAndWallGhostCells)
+      std::vector<ncells_t> lo, hi;
+      ActiveAndWallGhostBounds(domain, lo, hi);
+      // the owner's sum of a ghost is rebuilt from the blocks of the direct
+      // neighbors only, which holds when no domain is narrower than its two
+      // ghost bands along a communicated axis
+      for (const auto& direction : dir::Directions<M::Dim>::orth) {
+        const auto bc = domain.mesh.flds_bc_in(direction);
+        if (bc == FldsBC::SYNC or bc == FldsBC::PERIODIC) {
+          raise::ErrorIf(
+            domain.mesh.n_active(direction.get_dim()) < 2 * N_GHOSTS,
+            "SynchronizeFillFields needs at least 2 N_GHOSTS active "
+            "cells along every communicated axis",
+            HERE);
+        }
+      }
+      int64_t own_lo[3] { 0, 0, 0 }, own_hi[3] { 1, 1, 1 }, ext[3] { 1, 1, 1 };
+      for (auto d { 0u }; d < static_cast<unsigned>(M::Dim); ++d) {
+        own_lo[d] = static_cast<int64_t>(lo[d]);
+        own_hi[d] = static_cast<int64_t>(hi[d]);
+        ext[d]    = static_cast<int64_t>(domain.fields.aux.extent(d));
+      }
+      g_halo.SyncFill(static_cast<int>(tags) | (1 << 17),
+                      HaloDirections(this, domain, g_mpi_rank, true),
+                      comm::MakeHaloField<M::Dim, 6>(domain.fields.aux,
+                                                     domain.fields.aux,
+                                                     aux_range),
+                      own_lo,
+                      own_hi,
+                      ext);
+    }
+  }
+#endif
+
   // NOLINTBEGIN(bugprone-macro-parentheses)
-#define METADOMAIN_COMM(S, M, D)                                               \
-  template void Metadomain<S, M<D>>::SynchronizeFields(Domain<S, M<D>>&,       \
-                                                       CommTags,               \
-                                                       const cell_range_t&) const;
+#if defined(MPI_ENABLED)
+  #define METADOMAIN_COMM(S, M, D)                                             \
+    template void Metadomain<S, M<D>>::SynchronizeFields(Domain<S, M<D>>&,     \
+                                                         CommTags,             \
+                                                         const cell_range_t&)  \
+      const;                                                                   \
+    template void Metadomain<S, M<D>>::SynchronizeFillFields(Domain<S, M<D>>&, \
+                                                             CommTags) const;
+#else
+  #define METADOMAIN_COMM(S, M, D)                                             \
+    template void Metadomain<S, M<D>>::SynchronizeFields(Domain<S, M<D>>&,     \
+                                                         CommTags,             \
+                                                         const cell_range_t&)  \
+      const;
+#endif
 
   NTT_FOREACH_SPECIALIZATION(METADOMAIN_COMM)
 #undef METADOMAIN_COMM
