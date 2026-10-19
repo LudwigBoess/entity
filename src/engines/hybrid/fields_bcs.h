@@ -3,7 +3,6 @@
  * @brief Non-periodic (reflecting-wall / perfect-conductor) boundary
  *        conditions for the HYBRID engine, x1 walls only.
  * @implements
- *   - ntt::hybrid::PerfectConductorFieldsIn<> -> void
  *   - ntt::hybrid::FieldBoundaries<>          -> void   (em: Ee and/or Bf)
  *   - ntt::hybrid::WallEPrime<>               -> void   (em0::345 = Ee'/Ee'')
  *   - ntt::hybrid::WallScratchB<>             -> void   (cur = Bf*, Bf**)
@@ -58,6 +57,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <type_traits>
 #include <vector>
 
 namespace ntt {
@@ -66,45 +66,17 @@ namespace ntt {
     namespace wall {
 
       /**
-       * @brief Range over the wall layer for x1-staggered (edge-E / face-B)
-       *        kernels: i1 = 0 (wall plane) .. N_GHOSTS (ghost layers; the
-       *        +x1 side has one node less), full transverse extent.
+       * @brief Range over `rows` wall-normal rows (i1 = 0 .. rows) of the wall
+       *        layer, over the full transverse extent, or the active one when
+       *        `active_transverse`.
        */
       template <Dimension D>
-      auto StaggeredRange(Domain<SimEngine::HYBRID, metric::Minkowski<D>>& domain,
-                          short sign) -> range_t<D> {
-        std::vector<ncells_t> xi_min, xi_max;
-        xi_min.push_back(0);
-        xi_max.push_back((sign < 0) ? (N_GHOSTS + 1) : N_GHOSTS);
-        const std::vector<in> all_dirs { in::x1, in::x2, in::x3 };
-        for (auto d { 1u }; d < static_cast<unsigned>(D); ++d) {
-          xi_min.push_back(0);
-          xi_max.push_back(domain.mesh.n_all(all_dirs[d]));
-        }
-        if constexpr (D == Dim::_1D) {
-          return CreateRangePolicy<D>({ xi_min[0] }, { xi_max[0] });
-        } else if constexpr (D == Dim::_2D) {
-          return CreateRangePolicy<D>({ xi_min[0], xi_min[1] },
-                                      { xi_max[0], xi_max[1] });
-        } else {
-          return CreateRangePolicy<D>({ xi_min[0], xi_min[1], xi_min[2] },
-                                      { xi_max[0], xi_max[1], xi_max[2] });
-        }
-      }
-
-      /**
-       * @brief Range over the wall layer for cell-centered kernels:
-       *        i1 = ghost layer 0 .. N_GHOSTS; transverse extent is
-       *        active-only when `active_transverse` (the moment fold; corner
-       *        tails are already remapped by the transverse sync) and full
-       *        otherwise.
-       */
-      template <Dimension D>
-      auto CellRange(Domain<SimEngine::HYBRID, metric::Minkowski<D>>& domain,
+      auto WallRange(Domain<SimEngine::HYBRID, metric::Minkowski<D>>& domain,
+                     ncells_t                                         rows,
                      bool active_transverse) -> range_t<D> {
         std::vector<ncells_t> xi_min, xi_max;
         xi_min.push_back(0);
-        xi_max.push_back(N_GHOSTS);
+        xi_max.push_back(rows);
         const std::vector<in> all_dirs { in::x1, in::x2, in::x3 };
         for (auto d { 1u }; d < static_cast<unsigned>(D); ++d) {
           const auto dd = all_dirs[d];
@@ -126,6 +98,49 @@ namespace ntt {
                                       { xi_max[0], xi_max[1], xi_max[2] });
         }
       }
+
+      // wall-normal rows of the x1-staggered (edge-E / face-B) kernels: the
+      // wall plane i1 = 0 and the ghost layers (the +x1 side has one node less)
+      inline constexpr ncells_t staggered_rows_lo = N_GHOSTS + 1;
+      inline constexpr ncells_t staggered_rows_hi = N_GHOSTS;
+
+      /**
+       * @brief The kernel of the -x1 wall on rows [0, nlo) of a launch and the
+       *        kernel of the +x1 wall on the rows after them (row = the first
+       *        index, the wall-normal layer): one launch for both walls. The
+       *        two walls touch disjoint cells, so the result is that of two
+       *        launches.
+       */
+      template <class KLo, class KHi>
+      struct BothWalls_kernel {
+        KLo       lo;
+        KHi       hi;
+        cellidx_t nlo;
+
+        Inline void operator()(cellidx_t i1) const {
+          if (i1 < nlo) {
+            lo(i1);
+          } else {
+            hi(i1 - nlo);
+          }
+        }
+
+        Inline void operator()(cellidx_t i1, cellidx_t i2) const {
+          if (i1 < nlo) {
+            lo(i1, i2);
+          } else {
+            hi(i1 - nlo, i2);
+          }
+        }
+
+        Inline void operator()(cellidx_t i1, cellidx_t i2, cellidx_t i3) const {
+          if (i1 < nlo) {
+            lo(i1, i2, i3);
+          } else {
+            hi(i1 - nlo, i2, i3);
+          }
+        }
+      };
 
       /**
        * @brief Invoke `f(sign, i_edge)` for every x1 conductor wall this rank
@@ -160,61 +175,66 @@ namespace ntt {
         }
       }
 
+      /**
+       * @brief Launch the wall kernels `make(std::false_type {}, i_edge)`
+       *        (-x1 wall, `rows_lo` wall-normal rows) and
+       *        `make(std::true_type {}, i_edge)` (+x1 wall, `rows_hi` rows) of
+       *        the x1 conductor walls this rank owns, in one launch when it
+       *        owns both; transverse extent as in WallRange.
+       */
+      template <Dimension D, class Make>
+      void LaunchX1Walls(const char* name,
+                         Domain<SimEngine::HYBRID, metric::Minkowski<D>>& domain,
+                         const Grid<D>& global_grid,
+                         ncells_t       rows_lo,
+                         ncells_t       rows_hi,
+                         bool           active_transverse,
+                         Make           make) {
+        bool has_lo = false, has_hi = false;
+        ForEachX1Wall<D>(domain, global_grid, [&](short sign, ncells_t) {
+          if (sign < 0) {
+            has_lo = true;
+          } else {
+            has_hi = true;
+          }
+        });
+        const ncells_t i_lo = domain.mesh.i_min(in::x1);
+        const ncells_t i_hi = domain.mesh.i_max(in::x1);
+        if (has_lo and has_hi) {
+          // each wall reads and writes N_GHOSTS cells on either side of its
+          // plane: the two are disjoint in a domain wider than 2 N_GHOSTS
+          raise::ErrorIf(i_hi - i_lo <= 2 * N_GHOSTS,
+                         "hybrid walls: a domain with both x1 walls needs more "
+                         "than 2 N_GHOSTS active cells in x1",
+                         HERE);
+          using klo_t = decltype(make(std::false_type {}, i_lo));
+          using khi_t = decltype(make(std::true_type {}, i_hi));
+          Kokkos::parallel_for(
+            name,
+            WallRange<D>(domain, rows_lo + rows_hi, active_transverse),
+            BothWalls_kernel<klo_t, khi_t> { make(std::false_type {}, i_lo),
+                                             make(std::true_type {}, i_hi),
+                                             static_cast<cellidx_t>(rows_lo) });
+        } else if (has_lo) {
+          Kokkos::parallel_for(name,
+                               WallRange<D>(domain, rows_lo, active_transverse),
+                               make(std::false_type {}, i_lo));
+        } else if (has_hi) {
+          Kokkos::parallel_for(name,
+                               WallRange<D>(domain, rows_hi, active_transverse),
+                               make(std::true_type {}, i_hi));
+        }
+      }
+
     } // namespace wall
 
     /**
-     * @brief Apply the perfect-conductor wall condition on `em` along one
-     *        orthogonal direction: BC::E -> Ee (comps 0..2): E_tan = 0 on the
-     *        wall plane + mirror ghosts; BC::B -> Bf (comps 3..5): even mirror
-     *        ghosts; the wall-plane B_n is left to Faraday (frozen by E_tan = 0)
-     *        at -x1 and set from div B = 0 of the last active cell at +x1.
-     */
-    template <Dimension D>
-    void PerfectConductorFieldsIn(
-      const dir::direction_t<D>&                       direction,
-      Domain<SimEngine::HYBRID, metric::Minkowski<D>>& domain,
-      BCTags                                           tags) {
-      const auto sign = direction.get_sign();
-      raise::ErrorIf(direction.get_dim() != in::x1,
-                     "hybrid engine: CONDUCTOR walls are only implemented in x1",
-                     HERE);
-      const ncells_t i_edge = (sign > 0) ? domain.mesh.i_max(in::x1)
-                                         : domain.mesh.i_min(in::x1);
-      const auto     range  = wall::StaggeredRange<D>(domain, sign);
-      if (tags & BC::E) {
-        if (sign > 0) {
-          Kokkos::parallel_for(
-            "WallEdgeE",
-            range,
-            kernel::hybrid::WallEdgeE_kernel<D, true>(domain.fields.em, i_edge, 0));
-        } else {
-          Kokkos::parallel_for(
-            "WallEdgeE",
-            range,
-            kernel::hybrid::WallEdgeE_kernel<D, false>(domain.fields.em, i_edge, 0));
-        }
-      }
-      if (tags & BC::B) {
-        if (sign > 0) {
-          Kokkos::parallel_for(
-            "WallFaceB",
-            range,
-            kernel::hybrid::WallFaceB_kernel<D, true, 6>(domain.fields.em,
-                                                         i_edge,
-                                                         3));
-        } else {
-          Kokkos::parallel_for(
-            "WallFaceB",
-            range,
-            kernel::hybrid::WallFaceB_kernel<D, false, 6>(domain.fields.em,
-                                                          i_edge,
-                                                          3));
-        }
-      }
-    }
-
-    /**
-     * @brief Apply non-periodic field boundaries to the evolved `em` fields.
+     * @brief Apply non-periodic field boundaries to the evolved `em` fields
+     *        (perfect-conductor x1 walls): BC::E -> Ee (comps 0..2): E_tan = 0
+     *        on the wall plane + mirror ghosts; BC::B -> Bf (comps 3..5): even
+     *        mirror ghosts; the wall-plane B_n is left to Faraday (frozen by
+     *        E_tan = 0) at -x1 and set from div B = 0 of the last active cell
+     *        at +x1.
      * @param global_grid the global grid (for the configured boundary type)
      * @param tags        which fields to act on (BC::E, BC::B, or both)
      */
@@ -222,19 +242,35 @@ namespace ntt {
     void FieldBoundaries(Domain<SimEngine::HYBRID, metric::Minkowski<D>>& domain,
                          const Grid<D>& global_grid,
                          BCTags         tags) {
-      for (const auto& direction : dir::Directions<D>::orth) {
-        const auto gbc = global_grid.flds_bc_in(direction);
-        if (gbc == FldsBC::PERIODIC) {
-          continue; // realized by the halo exchange
-        } else if (gbc == FldsBC::CONDUCTOR) {
-          if (domain.mesh.flds_bc_in(direction) == FldsBC::CONDUCTOR) {
-            PerfectConductorFieldsIn<D>(direction, domain, tags);
-          }
-        } else {
-          raise::Error("hybrid engine: only PERIODIC and CONDUCTOR field "
-                       "boundaries are implemented",
-                       HERE);
-        }
+      auto& em = domain.fields.em;
+      if (tags & BC::E) {
+        wall::LaunchX1Walls<D>(
+          "WallEdgeE",
+          domain,
+          global_grid,
+          wall::staggered_rows_lo,
+          wall::staggered_rows_hi,
+          false,
+          [&](auto plus, ncells_t i_edge) {
+            return kernel::hybrid::WallEdgeE_kernel<D, decltype(plus)::value>(em,
+                                                                              i_edge,
+                                                                              0);
+          });
+      }
+      if (tags & BC::B) {
+        wall::LaunchX1Walls<D>(
+          "WallFaceB",
+          domain,
+          global_grid,
+          wall::staggered_rows_lo,
+          wall::staggered_rows_hi,
+          false,
+          [&](auto plus, ncells_t i_edge) {
+            return kernel::hybrid::WallFaceB_kernel<D, decltype(plus)::value, 6>(
+              em,
+              i_edge,
+              3);
+          });
       }
     }
 
@@ -246,20 +282,19 @@ namespace ntt {
     template <Dimension D>
     void WallEPrime(Domain<SimEngine::HYBRID, metric::Minkowski<D>>& domain,
                     const Grid<D>&                                   global_grid) {
-      wall::ForEachX1Wall<D>(domain, global_grid, [&](short sign, ncells_t i_edge) {
-        const auto range = wall::StaggeredRange<D>(domain, sign);
-        if (sign > 0) {
-          Kokkos::parallel_for(
-            "WallEdgeE",
-            range,
-            kernel::hybrid::WallEdgeE_kernel<D, true>(domain.fields.em0, i_edge, 3));
-        } else {
-          Kokkos::parallel_for(
-            "WallEdgeE",
-            range,
-            kernel::hybrid::WallEdgeE_kernel<D, false>(domain.fields.em0, i_edge, 3));
-        }
-      });
+      auto& em0 = domain.fields.em0;
+      wall::LaunchX1Walls<D>(
+        "WallEdgeE",
+        domain,
+        global_grid,
+        wall::staggered_rows_lo,
+        wall::staggered_rows_hi,
+        false,
+        [&](auto plus, ncells_t i_edge) {
+          return kernel::hybrid::WallEdgeE_kernel<D, decltype(plus)::value>(em0,
+                                                                            i_edge,
+                                                                            3);
+        });
     }
 
     /**
@@ -272,24 +307,20 @@ namespace ntt {
     template <Dimension D>
     void WallScratchB(Domain<SimEngine::HYBRID, metric::Minkowski<D>>& domain,
                       const Grid<D>& global_grid) {
-      wall::ForEachX1Wall<D>(domain, global_grid, [&](short sign, ncells_t i_edge) {
-        const auto range = wall::StaggeredRange<D>(domain, sign);
-        if (sign > 0) {
-          Kokkos::parallel_for(
-            "WallFaceB",
-            range,
-            kernel::hybrid::WallFaceB_kernel<D, true, 3>(domain.fields.cur,
-                                                         i_edge,
-                                                         0));
-        } else {
-          Kokkos::parallel_for(
-            "WallFaceB",
-            range,
-            kernel::hybrid::WallFaceB_kernel<D, false, 3>(domain.fields.cur,
-                                                          i_edge,
-                                                          0));
-        }
-      });
+      auto& cur = domain.fields.cur;
+      wall::LaunchX1Walls<D>(
+        "WallFaceB",
+        domain,
+        global_grid,
+        wall::staggered_rows_lo,
+        wall::staggered_rows_hi,
+        false,
+        [&](auto plus, ncells_t i_edge) {
+          return kernel::hybrid::WallFaceB_kernel<D, decltype(plus)::value, 3>(
+            cur,
+            i_edge,
+            0);
+        });
     }
 
     /**
@@ -301,20 +332,18 @@ namespace ntt {
     template <Dimension D>
     void WallBckpFill(Domain<SimEngine::HYBRID, metric::Minkowski<D>>& domain,
                       const Grid<D>& global_grid) {
-      wall::ForEachX1Wall<D>(domain, global_grid, [&](short sign, ncells_t i_edge) {
-        const auto range = wall::CellRange<D>(domain, false);
-        if (sign > 0) {
-          Kokkos::parallel_for(
-            "WallBckp",
-            range,
-            kernel::hybrid::WallBckp_kernel<D, true>(domain.fields.bckp, i_edge));
-        } else {
-          Kokkos::parallel_for(
-            "WallBckp",
-            range,
-            kernel::hybrid::WallBckp_kernel<D, false>(domain.fields.bckp, i_edge));
-        }
-      });
+      auto& bckp = domain.fields.bckp;
+      wall::LaunchX1Walls<D>(
+        "WallBckp",
+        domain,
+        global_grid,
+        N_GHOSTS,
+        N_GHOSTS,
+        false,
+        [&](auto plus, ncells_t i_edge) {
+          return kernel::hybrid::WallBckp_kernel<D, decltype(plus)::value>(bckp,
+                                                                           i_edge);
+        });
     }
 
     /**
@@ -326,20 +355,18 @@ namespace ntt {
     void MomentsWallFill(Domain<SimEngine::HYBRID, metric::Minkowski<D>>& domain,
                          const Grid<D>&                                   global_grid,
                          ndfield_t<D, 6>&                                 fld) {
-      wall::ForEachX1Wall<D>(domain, global_grid, [&](short sign, ncells_t i_edge) {
-        const auto fill_range = wall::CellRange<D>(domain, false);
-        if (sign > 0) {
-          Kokkos::parallel_for(
-            "WallMomentsFill",
-            fill_range,
-            kernel::hybrid::WallMoments_kernel<D, true, false>(fld, i_edge));
-        } else {
-          Kokkos::parallel_for(
-            "WallMomentsFill",
-            fill_range,
-            kernel::hybrid::WallMoments_kernel<D, false, false>(fld, i_edge));
-        }
-      });
+      wall::LaunchX1Walls<D>(
+        "WallMomentsFill",
+        domain,
+        global_grid,
+        N_GHOSTS,
+        N_GHOSTS,
+        false,
+        [&](auto plus, ncells_t i_edge) {
+          return kernel::hybrid::WallMoments_kernel<D, decltype(plus)::value, false>(
+            fld,
+            i_edge);
+        });
     }
 
     /**
@@ -348,8 +375,9 @@ namespace ntt {
      *        (V_x sign-flipped) -- exactly once per deposit, after
      *        SynchronizeFields(AUX) and before CommunicateFields(AUX), so the
      *        transverse halo copies of the near-wall cells carry the folded
-     *        values. With fold = false only the (idempotent) ghost mirror fill
-     *        runs, e.g. to re-fill after the halo exchange or a filter pass.
+     *        values; fold and ghost fill run in one kernel. With fold = false
+     *        only the (idempotent) ghost mirror fill runs, e.g. to re-fill
+     *        after the halo exchange or a filter pass.
      * @param fold_halo fold over the transverse halo ghosts too: after
      *        SynchronizeFillFields they hold their owners' sums, so the fold
      *        there repeats the owners' fold
@@ -359,38 +387,33 @@ namespace ntt {
                        const Grid<D>& global_grid,
                        bool           fold,
                        bool           fold_halo = false) {
-      wall::ForEachX1Wall<D>(domain, global_grid, [&](short sign, ncells_t i_edge) {
-        if (fold) {
-          const auto fold_range = wall::CellRange<D>(domain, not fold_halo);
-          if (sign > 0) {
-            Kokkos::parallel_for("WallMomentsFold",
-                                 fold_range,
-                                 kernel::hybrid::WallMoments_kernel<D, true, true>(
-                                   domain.fields.aux,
-                                   i_edge));
-          } else {
-            Kokkos::parallel_for("WallMomentsFold",
-                                 fold_range,
-                                 kernel::hybrid::WallMoments_kernel<D, false, true>(
-                                   domain.fields.aux,
-                                   i_edge));
-          }
+      auto& aux = domain.fields.aux;
+      if (fold) {
+        // transverse extent of the fold: the active cells, or all with fold_halo
+        ncells_t t_lo[2] { 0, 0 }, t_hi[2] { 1, 1 };
+        const in axes[2] { in::x2, in::x3 };
+        for (auto d { 1u }; d < static_cast<unsigned>(D); ++d) {
+          t_lo[d - 1] = fold_halo ? 0 : domain.mesh.i_min(axes[d - 1]);
+          t_hi[d - 1] = fold_halo ? domain.mesh.n_all(axes[d - 1])
+                                  : domain.mesh.i_max(axes[d - 1]);
         }
-        const auto fill_range = wall::CellRange<D>(domain, false);
-        if (sign > 0) {
-          Kokkos::parallel_for("WallMomentsFill",
-                               fill_range,
-                               kernel::hybrid::WallMoments_kernel<D, true, false>(
-                                 domain.fields.aux,
-                                 i_edge));
-        } else {
-          Kokkos::parallel_for("WallMomentsFill",
-                               fill_range,
-                               kernel::hybrid::WallMoments_kernel<D, false, false>(
-                                 domain.fields.aux,
-                                 i_edge));
-        }
-      });
+        wall::LaunchX1Walls<D>(
+          "WallMomentsFoldFill",
+          domain,
+          global_grid,
+          N_GHOSTS,
+          N_GHOSTS,
+          false,
+          [&](auto plus, ncells_t i_edge) {
+            return kernel::hybrid::WallMomentsFoldFill_kernel<D, decltype(plus)::value>(
+              aux,
+              i_edge,
+              t_lo,
+              t_hi);
+          });
+      } else {
+        MomentsWallFill<D>(domain, global_grid, aux);
+      }
     }
 
   } // namespace hybrid

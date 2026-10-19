@@ -163,11 +163,13 @@ namespace ntt {
     // slowly growing npart triggers a handful of reallocations over a run
     // instead of one device alloc/free per sort. The old buffer is released
     // before the new one is allocated, keeping the transient peak at a single
-    // buffer during the (rare) grow. Callers always operate on the leading
+    // buffer during the (rare) grow, after a fence: kernels still queued may
+    // read the buffer being replaced. Callers always operate on the leading
     // `[0, n)` prefix, so the extra headroom slots are never read.
     template <typename V>
     inline void reserve_scratch_1d(V& v, const char* label, npart_t n) {
       if (static_cast<npart_t>(v.extent(0)) < n) {
+        Kokkos::fence("SortSpatially: scratch resize");
         v = V {};
         v = V { label, n + n / 8u };
       }
@@ -177,6 +179,7 @@ namespace ntt {
     inline void reserve_scratch_2d(V& v, const char* label, npart_t n, npart_t ncols) {
       if (static_cast<npart_t>(v.extent(0)) < n or
           static_cast<npart_t>(v.extent(1)) != ncols) {
+        Kokkos::fence("SortSpatially: scratch resize");
         v = V {};
         v = V { label, n + n / 8u, ncols };
       }
@@ -224,6 +227,8 @@ namespace ntt {
     // does, and tile_offsets(total_tiles) is the first dead particle, i.e.
     // the alive count. The buffer persists across sorts (same tile count).
     if (m_tile_layout.tile_offsets.extent(0) != total_tiles + 1u) {
+      // kernels still queued may read the offsets being replaced
+      Kokkos::fence("SortSpatially: tile offsets resize");
       m_tile_layout.tile_offsets = array_t<npart_t*> { "tile_offsets",
                                                        total_tiles + 1u };
     }
@@ -463,8 +468,9 @@ namespace ntt {
     // instead of ratcheting up with dead slots between clearing intervals.
     // (RemoveDead remains the compactor when spatial sorting is disabled.)
     set_npart(m_tile_layout.npart_partitioned);
-
-    Kokkos::fence("SortSpatially: end of tiled_deposit path");
+    // No fence: the permutation kernels are queued in order before any later
+    // use of the particle arrays, and the next sort waits (on the copy of the
+    // alive count) before it reallocates any scratch they read.
 #else  // !TILED_DEPOSIT — legacy in-place BinSort by global cell index
     const auto nx2         = grid.n_active(in::x2);
     const auto nx3         = grid.n_active(in::x3);
@@ -635,8 +641,8 @@ namespace ntt {
     // Every permuted member has its own persistent, grow-only scratch
     // (`reserve_scratch_*` reallocates only when the live count outgrows the
     // capacity), so one kernel gathers all members and one copies them back,
-    // queued asynchronously on the default (in-order) execution space; the
-    // caller fences once at the end of the sort.
+    // queued asynchronously on the default (in-order) execution space; no
+    // host synchronization waits for them.
     const auto npr = static_cast<npart_t>(npld_r());
     const auto npi = static_cast<npart_t>(npld_i());
     for (auto d { 0u }; d < static_cast<unsigned>(D); ++d) {

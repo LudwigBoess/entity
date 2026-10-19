@@ -10,6 +10,8 @@
  *     set from div B = 0 at +x1 (where it lies outside the active range)
  *   - kernel::hybrid::WallMoments_kernel<> -> cell-centered moments (aux):
  *     additive fold of the ghost deposit tails (image plasma) + mirror fill
+ *   - kernel::hybrid::WallMomentsFoldFill_kernel<> -> the fold and the mirror
+ *     fill of WallMoments_kernel in one pass
  *   - kernel::hybrid::WallBckp_kernel<>   -> cell-centered Ec/Bc gather
  *     fields: conductor-sign mirror fill of the ghosts
  * @namespaces:
@@ -340,6 +342,51 @@ namespace kernel::hybrid {
         raise::KernelError(HERE,
                            "WallMoments_kernel: 3D implementation called for D != 3");
       }
+    }
+  };
+
+  /**
+   * @brief Fold of the ghost deposit tails into the active cells, on the
+   *        transverse cells [t_lo, t_hi) (x2, x3), then the mirror fill of
+   *        the ghosts, on all transverse cells: WallMoments_kernel with FOLD =
+   *        true and then false, in one pass. Each thread folds and fills the
+   *        same ghost/active pair, which no other thread touches.
+   * @tparam D dimension
+   * @tparam P true for the +x1 wall
+   * Launch range: i1 in [0, N_GHOSTS); other indices: full extent.
+   */
+  template <Dimension D, bool P>
+  struct WallMomentsFoldFill_kernel {
+    const WallMoments_kernel<D, P, true>  fold;
+    const WallMoments_kernel<D, P, false> fill;
+    ncells_t                              t_lo[2], t_hi[2];
+
+    WallMomentsFoldFill_kernel(ndfield_t<D, 6>& Fld,
+                               ncells_t         i_edge,
+                               const ncells_t   lo[2],
+                               const ncells_t   hi[2])
+      : fold { Fld, i_edge }
+      , fill { Fld, i_edge }
+      , t_lo { lo[0], lo[1] }
+      , t_hi { hi[0], hi[1] } {}
+
+    Inline void operator()(cellidx_t i1) const {
+      fold(i1);
+      fill(i1);
+    }
+
+    Inline void operator()(cellidx_t i1, cellidx_t i2) const {
+      if (i2 >= t_lo[0] and i2 < t_hi[0]) {
+        fold(i1, i2);
+      }
+      fill(i1, i2);
+    }
+
+    Inline void operator()(cellidx_t i1, cellidx_t i2, cellidx_t i3) const {
+      if (i2 >= t_lo[0] and i2 < t_hi[0] and i3 >= t_lo[1] and i3 < t_hi[1]) {
+        fold(i1, i2, i3);
+      }
+      fill(i1, i2, i3);
     }
   };
 

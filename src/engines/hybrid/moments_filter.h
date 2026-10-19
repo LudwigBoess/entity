@@ -109,7 +109,9 @@ namespace ntt {
         MomentsWallBC(domain, metadomain.mesh(), /* fold */ false);
       }
       if (i < nfilter) {
-        Kokkos::deep_copy(domain.fields.bckp, domain.fields.aux);
+        Kokkos::deep_copy(Kokkos::DefaultExecutionSpace {},
+                          domain.fields.bckp,
+                          domain.fields.aux);
         Kokkos::parallel_for(
           "MomentsFilter",
           domain.mesh.rangeActiveCells(),

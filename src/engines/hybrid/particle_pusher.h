@@ -186,7 +186,8 @@ namespace ntt::hybrid {
       domain.mesh.prtl_bc()
     };
 
-    Kokkos::deep_copy(domain.fields.aux, ZERO);
+    // queued without a host synchronization; the kernels below follow in order
+    Kokkos::deep_copy(Kokkos::DefaultExecutionSpace {}, domain.fields.aux, ZERO);
 
 #if !defined(TILED_DEPOSIT)
     (void)team_size_req;
