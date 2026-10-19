@@ -4,6 +4,7 @@
  * @implements
  *   - mpi::PrtlSendTag<>
  *   - mpi::SendTag<> -> short
+ *   - mpi::MaxPrtlTags
  * @namespaces:
  *   - mpi::
  */
@@ -16,8 +17,14 @@
 #include "arch/kokkos_aliases.h"
 #include "utils/error.h"
 
+#include <cstddef>
+
 namespace mpi {
   using namespace dir;
+
+  // number of particle tags of a 3D domain: dead, alive and one per neighbor
+  // direction (tag = 2 + index of the direction in Directions<D>::all)
+  inline constexpr std::size_t MaxPrtlTags { 28 };
 
   template <Dimension D>
   struct PrtlSendTag {

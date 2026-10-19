@@ -2,6 +2,7 @@
  * @file kernels/comm.hpp
  * @brief Kernels used during communications
  * @implements
+ *   - kernel::comm::WrapAndCountPrtlTags_kernel<>
  *   - kernel::comm::PrepareOutgoingPrtls_kernel<>
  *   - kernel::comm::PopulatePrtlSendBuffer_kernel<>
  *   - kernel::comm::ExtractReceivedPrtls_kernel<>
@@ -16,95 +17,172 @@
 #include "global.h"
 
 #include "arch/kokkos_aliases.h"
+#include "arch/mpi_tags.h"
 
 #include <Kokkos_Core.hpp>
 
 namespace kernel::comm {
   using namespace ntt;
 
+  // per-tag tables passed by value (indexed by the particle tag)
+  using prtl_tag_table_t   = Kokkos::Array<int, mpi::MaxPrtlTags>;
+  using prtl_tag_offsets_t = Kokkos::Array<npart_t, mpi::MaxPrtlTags>;
+
+  /**
+   * @brief Wraps the particles leaving through a periodic self-wrap (`local`
+   *        tags) in place: cell indices shifted by the domain size, tag back
+   *        to alive. With `count`, counts the particles of every other
+   *        non-alive tag into `counts`.
+   */
   template <Dimension D>
-  class PrepareOutgoingPrtls_kernel {
-    const array_t<int*> shifts_in_x1, shifts_in_x2, shifts_in_x3;
-    array_t<npart_t*>   outgoing_indices;
-
-    const npart_t npart, npart_alive, npart_dead;
-    const uint8_t ntags;
-
-    array_t<int*>         i1, i1_prev, i2, i2_prev, i3, i3_prev;
-    const array_t<short*> tag;
-
-    const array_t<npart_t*> tag_offsets;
-
-    array_t<npart_t*> current_offset;
+  class WrapAndCountPrtlTags_kernel {
+    array_t<int*>          i1, i1_prev, i2, i2_prev, i3, i3_prev;
+    array_t<short*>        tag;
+    array_t<npart_t*>      counts;
+    const prtl_tag_table_t local, shift1, shift2, shift3;
+    const short            ntags;
+    const bool             count;
 
   public:
-    PrepareOutgoingPrtls_kernel(const array_t<int*>&     shifts_in_x1,
-                                const array_t<int*>&     shifts_in_x2,
-                                const array_t<int*>&     shifts_in_x3,
-                                array_t<npart_t*>&       outgoing_indices,
-                                npart_t                  npart,
-                                npart_t                  npart_alive,
-                                npart_t                  npart_dead,
-                                uint8_t                  ntags,
-                                array_t<int*>&           i1,
+    WrapAndCountPrtlTags_kernel(array_t<int*>&           i1,
                                 array_t<int*>&           i1_prev,
                                 array_t<int*>&           i2,
                                 array_t<int*>&           i2_prev,
                                 array_t<int*>&           i3,
                                 array_t<int*>&           i3_prev,
-                                const array_t<short*>&   tag,
-                                const array_t<npart_t*>& tag_offsets)
-      : shifts_in_x1 { shifts_in_x1 }
-      , shifts_in_x2 { shifts_in_x2 }
-      , shifts_in_x3 { shifts_in_x3 }
-      , outgoing_indices { outgoing_indices }
-      , npart { npart }
-      , npart_alive { npart_alive }
-      , npart_dead { npart_dead }
-      , ntags { ntags }
-      , i1 { i1 }
+                                array_t<short*>&         tag,
+                                const array_t<npart_t*>& counts,
+                                const prtl_tag_table_t&  local,
+                                const prtl_tag_table_t&  shift1,
+                                const prtl_tag_table_t&  shift2,
+                                const prtl_tag_table_t&  shift3,
+                                short                    ntags,
+                                bool                     count)
+      : i1 { i1 }
       , i1_prev { i1_prev }
       , i2 { i2 }
       , i2_prev { i2_prev }
       , i3 { i3 }
       , i3_prev { i3_prev }
       , tag { tag }
-      , tag_offsets { tag_offsets }
-      , current_offset { "current_offset", ntags } {}
+      , counts { counts }
+      , local { local }
+      , shift1 { shift1 }
+      , shift2 { shift2 }
+      , shift3 { shift3 }
+      , ntags { ntags }
+      , count { count } {}
 
     Inline void operator()(prtlidx_t p) const {
-      if (tag(p) != ParticleTag::alive) {
-        // dead or to-be-sent
-        auto idx_for_tag = Kokkos::atomic_fetch_add(&current_offset(tag(p)), 1);
-        if (tag(p) != ParticleTag::dead) {
-          idx_for_tag += npart_dead;
+      const short t = tag(p);
+      if (t < 0 or t >= ntags) {
+        raise::KernelError(HERE, "Invalid tag value");
+      }
+      if (t == ParticleTag::alive) {
+        return;
+      }
+      if (local[t] != 0) {
+        if constexpr (D == Dim::_1D or D == Dim::_2D or D == Dim::_3D) {
+          i1(p)      += shift1[t];
+          i1_prev(p) += shift1[t];
         }
-        if (tag(p) > 2) {
-          idx_for_tag += tag_offsets(tag(p) - 3);
+        if constexpr (D == Dim::_2D or D == Dim::_3D) {
+          i2(p)      += shift2[t];
+          i2_prev(p) += shift2[t];
         }
-        if (idx_for_tag >= npart - npart_alive) {
-          raise::KernelError(HERE, "Outgoing indices idx exceeds the array size");
+        if constexpr (D == Dim::_3D) {
+          i3(p)      += shift3[t];
+          i3_prev(p) += shift3[t];
         }
-        outgoing_indices(idx_for_tag) = p;
-        // apply offsets
-        if (tag(p) != ParticleTag::dead) {
-          if constexpr (D == Dim::_1D or D == Dim::_2D or D == Dim::_3D) {
-            i1(p)      += shifts_in_x1(tag(p) - 2);
-            i1_prev(p) += shifts_in_x1(tag(p) - 2);
-          }
-          if constexpr (D == Dim::_2D or D == Dim::_3D) {
-            i2(p)      += shifts_in_x2(tag(p) - 2);
-            i2_prev(p) += shifts_in_x2(tag(p) - 2);
-          }
-          if constexpr (D == Dim::_3D) {
-            i3(p)      += shifts_in_x3(tag(p) - 2);
-            i3_prev(p) += shifts_in_x3(tag(p) - 2);
-          }
+        tag(p) = ParticleTag::alive;
+      } else if (count) {
+        Kokkos::atomic_add(&counts(t), static_cast<npart_t>(1));
+      }
+    }
+  };
+
+  /**
+   * @brief Lists the slots of the non-alive particles in `holes`: the dead
+   *        ones first, then the leaving ones grouped by tag in tag order
+   *        (`start[t]` is the first slot of tag t), and shifts the cell
+   *        indices of every leaving particle into the frame of the neighbor
+   *        it leaves to.
+   */
+  template <Dimension D>
+  class PrepareOutgoingPrtls_kernel {
+    array_t<int*>            i1, i1_prev, i2, i2_prev, i3, i3_prev;
+    const array_t<short*>    tag;
+    array_t<npart_t*>        holes;
+    array_t<npart_t*>        cursor;
+    const prtl_tag_offsets_t start;
+    const prtl_tag_table_t   shift1, shift2, shift3;
+    const npart_t            nholes;
+
+  public:
+    PrepareOutgoingPrtls_kernel(array_t<int*>&            i1,
+                                array_t<int*>&            i1_prev,
+                                array_t<int*>&            i2,
+                                array_t<int*>&            i2_prev,
+                                array_t<int*>&            i3,
+                                array_t<int*>&            i3_prev,
+                                const array_t<short*>&    tag,
+                                const array_t<npart_t*>&  holes,
+                                const array_t<npart_t*>&  cursor,
+                                const prtl_tag_offsets_t& start,
+                                const prtl_tag_table_t&   shift1,
+                                const prtl_tag_table_t&   shift2,
+                                const prtl_tag_table_t&   shift3,
+                                npart_t                   nholes)
+      : i1 { i1 }
+      , i1_prev { i1_prev }
+      , i2 { i2 }
+      , i2_prev { i2_prev }
+      , i3 { i3 }
+      , i3_prev { i3_prev }
+      , tag { tag }
+      , holes { holes }
+      , cursor { cursor }
+      , start { start }
+      , shift1 { shift1 }
+      , shift2 { shift2 }
+      , shift3 { shift3 }
+      , nholes { nholes } {}
+
+    Inline void operator()(prtlidx_t p) const {
+      const short t = tag(p);
+      if (t == ParticleTag::alive) {
+        return;
+      }
+      const auto k = start[t] + Kokkos::atomic_fetch_add(&cursor(t),
+                                                         static_cast<npart_t>(1));
+      if (k >= nholes) {
+        raise::KernelError(HERE, "Outgoing indices idx exceeds the array size");
+      }
+      holes(k) = p;
+      if (t != ParticleTag::dead) {
+        if constexpr (D == Dim::_1D or D == Dim::_2D or D == Dim::_3D) {
+          i1(p)      += shift1[t];
+          i1_prev(p) += shift1[t];
+        }
+        if constexpr (D == Dim::_2D or D == Dim::_3D) {
+          i2(p)      += shift2[t];
+          i2_prev(p) += shift2[t];
+        }
+        if constexpr (D == Dim::_3D) {
+          i3(p)      += shift3[t];
+          i3_prev(p) += shift3[t];
         }
       }
     }
   };
 
+  /**
+   * @brief Packs the leaving particles listed in `holes` from `idx_offset`
+   *        on into the send buffers, at the position they have in that list
+   *        (so the particles of one direction form one contiguous segment),
+   *        and tags them dead. Particles whose tag belongs to no exchanged
+   *        direction (`packed[tag] == 0`) are left untouched.
+   */
   template <Dimension D, Coord::type C>
   class PopulatePrtlSendBuffer_kernel {
     array_t<int*>      send_buff_int;
@@ -123,6 +201,7 @@ namespace kernel::comm {
     const array_t<npart_t**> pld_i;
     array_t<short*>          tag;
     const array_t<npart_t*>  outgoing_indices;
+    const prtl_tag_table_t   packed;
 
   public:
     PopulatePrtlSendBuffer_kernel(array_t<int*>&            send_buff_int,
@@ -156,7 +235,8 @@ namespace kernel::comm {
                                   const array_t<real_t**>&  pld_r,
                                   const array_t<npart_t**>& pld_i,
                                   array_t<short*>&          tag,
-                                  const array_t<npart_t*>&  outgoing_indices)
+                                  const array_t<npart_t*>&  outgoing_indices,
+                                  const prtl_tag_table_t&   packed)
       : send_buff_int { send_buff_int }
       , send_buff_real { send_buff_real }
       , send_buff_prtldx { send_buff_prtldx }
@@ -188,10 +268,14 @@ namespace kernel::comm {
       , pld_r { pld_r }
       , pld_i { pld_i }
       , tag { tag }
-      , outgoing_indices { outgoing_indices } {}
+      , outgoing_indices { outgoing_indices }
+      , packed { packed } {}
 
     Inline void operator()(prtlidx_t p) const {
       const auto idx = outgoing_indices(idx_offset + p);
+      if (packed[tag(idx)] == 0) {
+        return;
+      }
       if constexpr (D == Dim::_1D or D == Dim::_2D or D == Dim::_3D) {
         send_buff_int(NINTS * p + 0)      = i1(idx);
         send_buff_int(NINTS * p + 1)      = i1_prev(idx);
@@ -231,6 +315,11 @@ namespace kernel::comm {
     }
   };
 
+  /**
+   * @brief Unpacks the received particles: the first `npart_holes` go to the
+   *        slots listed in `outgoing_indices`, the rest are appended after
+   *        `npart`.
+   */
   template <Dimension D, Coord::type C>
   class ExtractReceivedPrtls_kernel {
     const array_t<int*>      recv_buff_int;
@@ -262,6 +351,7 @@ namespace kernel::comm {
                                 unsigned short            NPLDS_R,
                                 unsigned short            NPLDS_I,
                                 npart_t                   npart,
+                                npart_t                   npart_holes,
                                 array_t<int*>&            i1,
                                 array_t<int*>&            i1_prev,
                                 array_t<prtldx_t*>&       dx1,
@@ -294,7 +384,7 @@ namespace kernel::comm {
       , NPLDS_R { NPLDS_R }
       , NPLDS_I { NPLDS_I }
       , npart { npart }
-      , npart_holes { static_cast<npart_t>(outgoing_indices.extent(0)) }
+      , npart_holes { npart_holes }
       , i1 { i1 }
       , i1_prev { i1_prev }
       , i2 { i2 }

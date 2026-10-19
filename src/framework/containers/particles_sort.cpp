@@ -30,54 +30,6 @@
 
 namespace ntt {
 
-  template <Dimension D, Coord::type C>
-  auto Particles<D, C>::NpartsPerTagAndOffsets() const
-    -> std::pair<std::vector<npart_t>, array_t<npart_t*>> {
-    auto              this_tag = tag;
-    const auto        num_tags = ntags();
-    array_t<npart_t*> npptag { "nparts_per_tag", ntags() };
-
-    // count # of particles per each tag, skipping the alive bin in-kernel.
-    constexpr short tag_alive_s = static_cast<short>(ParticleTag::alive);
-    Kokkos::parallel_for(
-      "NpartPerTag",
-      rangeActiveParticles(),
-      Lambda(prtlidx_t p) {
-        const short t = this_tag(p);
-        if (t < 0 || t >= static_cast<short>(num_tags)) {
-          raise::KernelError(HERE, "Invalid tag value");
-        }
-        if (t != tag_alive_s) {
-          Kokkos::atomic_add(&npptag(t), static_cast<npart_t>(1));
-        }
-      });
-
-    // copy the count to a vector on the host and reconstruct the alive bin
-    auto npptag_h = Kokkos::create_mirror_view(npptag);
-    Kokkos::deep_copy(npptag_h, npptag);
-    std::vector<npart_t> npptag_vec(num_tags);
-    npart_t              non_alive_total = 0;
-    for (auto t { 0u }; t < num_tags; ++t) {
-      npptag_vec[t] = npptag_h(t);
-      if (static_cast<short>(t) != tag_alive_s) {
-        non_alive_total += npptag_h(t);
-      }
-    }
-    npptag_vec[tag_alive_s] = npart() - non_alive_total;
-
-    // count the offsets on the host and copy to device
-    const array_t<npart_t*> tag_offsets("tag_offsets", num_tags - 3);
-    auto tag_offsets_h = Kokkos::create_mirror_view(tag_offsets);
-
-    tag_offsets_h(0) = npptag_vec[2]; // offset for tag = 3
-    for (auto t { 1u }; t < num_tags - 3; ++t) {
-      tag_offsets_h(t) = npptag_vec[t + 2] + tag_offsets_h(t - 1);
-    }
-    Kokkos::deep_copy(tag_offsets, tag_offsets_h);
-
-    return { npptag_vec, tag_offsets };
-  }
-
   template <typename T>
   void RemoveDeadInArray(array_t<T*>& arr, const array_t<npart_t*>& indices_alive) {
     const npart_t n_alive = indices_alive.extent(0);
@@ -752,8 +704,6 @@ namespace ntt {
 #endif
 
 #define PARTICLES_SORT(D, C)                                                   \
-  template auto Particles<D, C>::NpartsPerTagAndOffsets() const                \
-    -> std::pair<std::vector<npart_t>, array_t<npart_t*>>;                     \
   template void Particles<D, C>::RemoveDead();                                 \
   template void Particles<D, C>::SortSpatially(const Grid<D>&);                \
   APPLY_PERM_INSTANTIATE(D, C)

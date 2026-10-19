@@ -31,7 +31,7 @@
 #include "framework/domain/grid.h"
 
 #if defined(MPI_ENABLED)
-  #include "arch/directions.h"
+  #include "arch/mpi_tags.h"
 #endif
 
 #include <Kokkos_Core.hpp>
@@ -45,6 +45,26 @@
 #include <vector>
 
 namespace ntt {
+
+#if defined(MPI_ENABLED)
+  /**
+   * @brief Particle exchange plan of a domain, shared by its species: the
+   *        communicated neighbor directions, in the order of
+   *        dir::Directions<D>::all, and the cell-index shift of a particle
+   *        leaving with each tag (indexed by tag, per axis).
+   */
+  struct PrtlCommPlan {
+    struct Direction {
+      short tag { 0 };        // tag of the particles leaving in this direction
+      int   send_rank { -1 }; // rank of the neighbor in this direction
+      int   recv_rank { -1 }; // rank of the neighbor in the opposite direction
+      bool  local { false };  // periodic self-wrap: wrapped in place, not sent
+    };
+
+    std::vector<Direction>               dirs;
+    Kokkos::Array<int, mpi::MaxPrtlTags> shift1 {}, shift2 {}, shift3 {};
+  };
+#endif
 
   struct ParticleArrays {
     spidx_t sp;
@@ -129,6 +149,20 @@ namespace ntt {
     array_t<short*>         m_sort_scratch_tag {};
     array_t<real_t**>       m_sort_scratch_pld_r {};
     array_t<npart_t**>      m_sort_scratch_pld_i {};
+#endif
+
+#if defined(MPI_ENABLED)
+    // persistent, grow-only buffers of the particle exchange (Communicate):
+    // per-tag counts and cursors, the slots of the non-alive particles, and
+    // the send and receive buffers per type
+    array_t<npart_t*>  m_comm_counts {};
+    array_t<npart_t*>  m_comm_cursor {};
+    array_t<npart_t*>  m_comm_holes {};
+    array_t<int*>      m_comm_send_int {}, m_comm_recv_int {};
+    array_t<real_t*>   m_comm_send_real {}, m_comm_recv_real {};
+    array_t<prtldx_t*> m_comm_send_prtldx {}, m_comm_recv_prtldx {};
+    array_t<real_t*>   m_comm_send_pld_r {}, m_comm_recv_pld_r {};
+    array_t<npart_t*>  m_comm_send_pld_i {}, m_comm_recv_pld_i {};
 #endif
 
   public:
@@ -279,22 +313,6 @@ namespace ntt {
       return footprint;
     }
 
-    /**
-     * @brief Count the number of particles with a specific tag.
-     * @return The vector of counts for each tag + offsets
-     * @note For instance, given the counts: 0 -> n0, 1 -> n1, 2 -> n2, 3 -> n3,
-     * ... it returns:
-     * ... [n0, n1, n2, n3, ...] of size ntags
-     * ... [n2, n2 + n3, n2 + n3 + n4, ...]  of size ntags - 3
-     * ... so in buffer array:
-     * ... tag=2 particles are offset by 0
-     * ... tag=3 particles are offset by n2
-     * ... tag=4 particles are offset by n2 + n3
-     * ... etc.
-     */
-    auto NpartsPerTagAndOffsets() const
-      -> std::pair<std::vector<npart_t>, array_t<npart_t*>>;
-
     /* setters -------------------------------------------------------------- */
     /**
      * @brief Set the number of particles
@@ -388,19 +406,14 @@ namespace ntt {
 #if defined(MPI_ENABLED)
     /**
      * @brief Communicate particles across neighboring meshblocks
-     * @param dirs_to_comm The directions requiring communication
-     * @param shifts_in_x1 The coordinate shifts in x1 direction per each communicated particle
-     * @param shifts_in_x2 The coordinate shifts in x2 direction per each communicated particle
-     * @param shifts_in_x3 The coordinate shifts in x3 direction per each communicated particle
-     * @param send_ranks The map of ranks per each send direction
-     * @param recv_ranks The map of ranks per each recv direction
+     * @param plan The communicated directions, their partner ranks and the
+     *        cell-index shifts per tag
+     * @note Particles leaving through a periodic self-wrap are wrapped in
+     *       place. The others are exchanged with all directions in flight at
+     *       once: one count message and one message per buffer type and
+     *       direction, one fence before the data messages.
      */
-    void Communicate(const dir::dirs_t<D>&,
-                     const array_t<int*>&,
-                     const array_t<int*>&,
-                     const array_t<int*>&,
-                     const dir::map_t<D, int>&,
-                     const dir::map_t<D, int>&);
+    void Communicate(const PrtlCommPlan& plan);
 #endif
 
 #if defined(OUTPUT_ENABLED)
