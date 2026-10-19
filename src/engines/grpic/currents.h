@@ -74,8 +74,7 @@ namespace ntt {
                                 real_t                      dt,
                                 int                         team_size_req) {
       static_assert(O <= 11u, "Shape order must be <= 11");
-      constexpr unsigned short T = static_cast<unsigned short>(
-        TILED_DEPOSIT_TILE_SIZE);
+      constexpr unsigned short T      = TiledDepositTileSize<M::Dim>();
       const auto& layout = species.tile_layout();
       raise::ErrorIf(layout.ntiles_total == 0u,
                      "CallDepositKernelTiled: tile_layout has 0 tiles — call "

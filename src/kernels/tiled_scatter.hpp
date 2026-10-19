@@ -238,7 +238,7 @@ namespace kernel {
    *   REACH   : one-sided stencil reach in cells, used ONLY for halo
    *             sizing: HALO = REACH + DRIFT (DRIFT = TILED_DEPOSIT_DRIFT,
    *             default 1)
-   *   T_TILE  : tile edge length (TILED_DEPOSIT_TILE_SIZE)
+   *   T_TILE  : tile edge length (TiledDepositTileSize<D>())
    *   Body    : per-particle functor, see contract below
    *   FIXED   : accumulate the scratch in two-word fixed point with native
    *             integer atomics (TileScratchFixed) instead of real_t atomic

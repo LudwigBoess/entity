@@ -397,6 +397,20 @@ struct TileLayout {
   prtl_perm_t       tile_perm;
 };
 
+#if defined(TILED_DEPOSIT)
+// Tile edge length of the tiled deposit in D dimensions: the CMake knob
+// tiled_deposit_tile_size, or tiled_deposit_tile_size_3d in 3D if set.
+template <Dimension D>
+constexpr auto TiledDepositTileSize() -> unsigned short {
+  #if defined(TILED_DEPOSIT_TILE_SIZE_3D)
+  if constexpr (D == Dim::_3D) {
+    return static_cast<unsigned short>(TILED_DEPOSIT_TILE_SIZE_3D);
+  }
+  #endif
+  return static_cast<unsigned short>(TILED_DEPOSIT_TILE_SIZE);
+}
+#endif
+
 // Random number pool/generator type alias
 // (using math:: instead of Kokkos:: to suppress compiler warning on unused namespace alias)
 using random_number_pool_t = math::Random_XorShift64_Pool<Kokkos::DefaultExecutionSpace>;

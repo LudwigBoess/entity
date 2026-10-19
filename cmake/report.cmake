@@ -256,6 +256,11 @@ string(
   ${TILED_DEPOSIT_TILE_SIZE_REPORT}
   "\n"
   "    "
+  "- Tile size in 3D [${Magenta}tiled_deposit_tile_size_3d${ColorReset}]:    "
+  ${tiled_deposit_tile_size_3d}
+  " ${Dim}(0: the same)${ColorReset}"
+  "\n"
+  "    "
   "- Deposit drift [${Magenta}tiled_deposit_drift${ColorReset}]:    "
   ${tiled_deposit_drift}
   "\n"

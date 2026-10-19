@@ -122,7 +122,7 @@ auto main(int argc, char* argv[]) -> int {
       // Tile geometry, mirroring sort::PositionToTileIndex. T = 1 (no
       // tiled_deposit) reproduces the legacy per-cell ordering.
 #if defined(TILED_DEPOSIT)
-      const ncells_t T = static_cast<ncells_t>(TILED_DEPOSIT_TILE_SIZE);
+      const ncells_t T = static_cast<ncells_t>(TiledDepositTileSize<Dim::_2D>());
 #else
       const ncells_t T = 1u;
 #endif
@@ -319,7 +319,7 @@ auto main(int argc, char* argv[]) -> int {
       // the legacy path keeps them as a weight == -1 suffix. T = 1
       // reproduces the legacy per-cell order.
 #if defined(TILED_DEPOSIT)
-      const ncells_t T = static_cast<ncells_t>(TILED_DEPOSIT_TILE_SIZE);
+      const ncells_t T = static_cast<ncells_t>(TiledDepositTileSize<Dim::_3D>());
 #else
       const ncells_t T = 1u;
 #endif
@@ -388,7 +388,7 @@ auto main(int argc, char* argv[]) -> int {
            std::pair<ncells_t, ncells_t> {  4u,  3u },
            std::pair<ncells_t, ncells_t> { 20u, 15u }
     }) {
-      const ncells_t T      = static_cast<ncells_t>(TILED_DEPOSIT_TILE_SIZE);
+      const ncells_t T = static_cast<ncells_t>(TiledDepositTileSize<Dim::_2D>());
       const ncells_t nt1    = nt.first;
       const ncells_t nt2    = nt.second;
       const ncells_t ntiles = nt1 * nt2;
@@ -478,6 +478,84 @@ auto main(int argc, char* argv[]) -> int {
                          "tile layout: order within a tile not kept",
                          HERE);
           w_prev = w_h(p);
+        }
+      }
+    }
+    {
+      // 3D tile layout at the 3D tile size: 3 x 2 x 2 tiles, every other one
+      // empty
+      const ncells_t T = static_cast<ncells_t>(TiledDepositTileSize<Dim::_3D>());
+      auto grid = ntt::Grid<Dim::_3D> {
+        {                               3u * T,2u * T,                       2u * T        },
+        { { 0.0, static_cast<real_t>(3u * T) },
+         { 0.0, static_cast<real_t>(2u * T) },
+         { 0.0, static_cast<real_t>(2u * T) } }
+      };
+      constexpr npart_t n0    = 240u;
+      auto              prtls = ntt::Particles<Dim::_3D, ntt::Coord::Cartesian>(
+        1,
+        "test",
+        1.0f,
+        1.0f,
+        n0,
+        0u,
+        0u,
+        ntt::ParticlePusher::BORIS,
+        false,
+        ntt::RadiativeDrag::NONE,
+        ntt::EmissionType::NONE,
+        0u,
+        0u);
+      auto                 i1_h = Kokkos::create_mirror_view(prtls.i1);
+      auto                 i2_h = Kokkos::create_mirror_view(prtls.i2);
+      auto                 i3_h = Kokkos::create_mirror_view(prtls.i3);
+      auto                 i1p  = Kokkos::create_mirror_view(prtls.i1_prev);
+      auto                 i2p  = Kokkos::create_mirror_view(prtls.i2_prev);
+      auto                 i3p  = Kokkos::create_mirror_view(prtls.i3_prev);
+      auto                 tg_h = Kokkos::create_mirror_view(prtls.tag);
+      std::vector<npart_t> count(12u, 0u);
+      for (npart_t p = 0; p < n0; ++p) {
+        const auto t = static_cast<ncells_t>((2u * p * 7u) % 12u);
+        const auto a = t / 4u, b = (t / 2u) % 2u, c = t % 2u;
+        i1_h(p) = static_cast<int>(a * T + (p * 3u) % T);
+        i2_h(p) = static_cast<int>(b * T + (p * 5u) % T);
+        i3_h(p) = static_cast<int>(c * T + (p * 7u) % T);
+        i1p(p)  = i1_h(p);
+        i2p(p)  = i2_h(p);
+        i3p(p)  = i3_h(p);
+        tg_h(p) = ntt::ParticleTag::alive;
+        ++count[static_cast<std::size_t>(t)];
+      }
+      Kokkos::deep_copy(prtls.i1, i1_h);
+      Kokkos::deep_copy(prtls.i2, i2_h);
+      Kokkos::deep_copy(prtls.i3, i3_h);
+      Kokkos::deep_copy(prtls.i1_prev, i1p);
+      Kokkos::deep_copy(prtls.i2_prev, i2p);
+      Kokkos::deep_copy(prtls.i3_prev, i3p);
+      Kokkos::deep_copy(prtls.tag, tg_h);
+      prtls.set_npart(n0);
+      prtls.SortSpatially(grid);
+      const auto& layout = prtls.tile_layout();
+      raise::ErrorIf(layout.ntiles_total != 12u or layout.tile_size != T,
+                     "3D tile layout: wrong tiles",
+                     HERE);
+      auto off_h = Kokkos::create_mirror_view(layout.tile_offsets);
+      Kokkos::deep_copy(off_h, layout.tile_offsets);
+      Kokkos::deep_copy(i1_h, prtls.i1);
+      Kokkos::deep_copy(i2_h, prtls.i2);
+      Kokkos::deep_copy(i3_h, prtls.i3);
+      for (auto t { 0u }; t < 12u; ++t) {
+        raise::ErrorIf(off_h(t + 1) - off_h(t) != count[t],
+                       "3D tile layout: wrong particle count of a tile",
+                       HERE);
+        for (auto p = off_h(t); p < off_h(t + 1); ++p) {
+          const auto tile = ((static_cast<ncells_t>(i1_h(p)) / T) * 2u +
+                             static_cast<ncells_t>(i2_h(p)) / T) *
+                              2u +
+                            static_cast<ncells_t>(i3_h(p)) / T;
+          raise::ErrorIf(tile != t,
+                         "3D tile layout: particle in the wrong tile",
+                         HERE);
         }
       }
     }

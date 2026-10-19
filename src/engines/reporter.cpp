@@ -34,6 +34,9 @@ namespace ntt {
     reporter::AddParam(report, 4, "Engine", "%s", SimEngine(S).to_string());
 #if defined(TILED_DEPOSIT)
     reporter::AddParam(report, 4, "Tile size", "%d", TILED_DEPOSIT_TILE_SIZE);
+  #if defined(TILED_DEPOSIT_TILE_SIZE_3D)
+    reporter::AddParam(report, 4, "Tile size (3D)", "%d", TILED_DEPOSIT_TILE_SIZE_3D);
+  #endif
   #if defined(TILED_DEPOSIT_DRIFT)
     reporter::AddParam(report, 4, "Halo drift", "%d", TILED_DEPOSIT_DRIFT);
   #endif

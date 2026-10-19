@@ -127,6 +127,11 @@ set(default_tiled_deposit_tile_size
     8
     CACHE INTERNAL "Default tile edge length in cells for tiled_deposit")
 
+set(default_tiled_deposit_tile_size_3d
+    0
+    CACHE INTERNAL
+          "Default 3D tile edge length for tiled_deposit (0: the common one)")
+
 set(default_tiled_deposit_drift
     1
     CACHE INTERNAL

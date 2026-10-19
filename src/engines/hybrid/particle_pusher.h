@@ -284,8 +284,7 @@ namespace ntt::hybrid {
                                                   4, // NC: V (0..2) + N (3)
                                                   6, // NG: aux comps
                                                   body_t::window,
-                                                  static_cast<unsigned short>(
-                                                    TILED_DEPOSIT_TILE_SIZE),
+                                                  TiledDepositTileSize<M::Dim>(),
                                                   body_t,
                                                   fixed_point>;
       const body_t body { ctx,

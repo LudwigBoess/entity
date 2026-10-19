@@ -266,9 +266,8 @@ namespace ntt {
       return;
     }
 
-    constexpr unsigned short T = static_cast<unsigned short>(
-      TILED_DEPOSIT_TILE_SIZE);
-    static_assert(T > 0u, "TILED_DEPOSIT_TILE_SIZE must be > 0");
+    constexpr unsigned short T = TiledDepositTileSize<D>();
+    static_assert(T > 0u, "the tiled-deposit tile size must be > 0");
 
     // 1. Compute per-axis tile counts and total_tiles.
     const auto ncells_active = grid.n_active();

@@ -67,6 +67,10 @@ set(tiled_deposit_tile_size
 set(tiled_deposit_tile_sizes
     "4;6;8;10;12;14;16"
     CACHE STRING "tiled deposit tile-size choices")
+set(tiled_deposit_tile_size_3d
+    ${default_tiled_deposit_tile_size_3d}
+    CACHE STRING
+          "tiled deposit tile edge length in cells in 3D (0: tiled_deposit_tile_size)")
 set(tiled_deposit_drift
     ${default_tiled_deposit_drift}
     CACHE STRING "tiled deposit scratch halo drift in cells")
