@@ -2,6 +2,7 @@
  * @file engines/hybrid/particle_pusher.h
  * @brief Particle push + fused ion-moment deposit drivers for the HYBRID engine
  * @implements
+ *   - ntt::hybrid::StoredMaxima
  *   - ntt::hybrid::ParticlePush<>   -> void
  *   - ntt::hybrid::DepositMoments<> -> void
  * @namespaces:
@@ -62,27 +63,77 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_ScatterView.hpp>
 
+#include <vector>
+
 namespace ntt::hybrid {
 
+  /**
+   * @brief Largest |weight| and largest |v| component of the stored particles
+   *        of a species, for the bounds of the fixed-point deposit scratch.
+   */
+  struct StoredMaxima {
+    real_t weight { ZERO };
+    real_t speed { ZERO };
+    bool   valid { false };
+  };
+
 #if defined(TILED_DEPOSIT) && defined(TILED_DEPOSIT_FIXED_POINT)
+  // one reduction over the stored particles (weights only with use_weights)
+  template <Dimension D, Coord::type C>
+  auto StoredParticleMaxima(const Particles<D, C>& species, bool use_weights)
+    -> StoredMaxima {
+    StoredMaxima m;
+    const auto   weight = species.weight;
+    const auto   ux1    = species.ux1;
+    const auto   ux2    = species.ux2;
+    const auto   ux3    = species.ux3;
+    if (use_weights) {
+      Kokkos::parallel_reduce(
+        "StoredParticleMaxima",
+        species.rangeActiveParticles(),
+        Lambda(prtlidx_t p, real_t & w, real_t & v) {
+          w = math::max(w, math::abs(weight(p)));
+          v = math::max(v,
+                        math::max(math::abs(ux1(p)),
+                                  math::max(math::abs(ux2(p)), math::abs(ux3(p)))));
+        },
+        Kokkos::Max<real_t>(m.weight),
+        Kokkos::Max<real_t>(m.speed));
+    } else {
+      Kokkos::parallel_reduce(
+        "StoredParticleMaxima",
+        species.rangeActiveParticles(),
+        Lambda(prtlidx_t p, real_t & v) {
+          v = math::max(v,
+                        math::max(math::abs(ux1(p)),
+                                  math::max(math::abs(ux2(p)), math::abs(ux3(p)))));
+        },
+        Kokkos::Max<real_t>(m.speed));
+      m.weight = ONE;
+    }
+    m.valid = true;
+    return m;
+  }
+
   /**
    * @brief Bounds on |value| of one write of the fused moment deposit per
    *        component (V 0..2, N 3), for the fixed-point tile scratch.
    *
    * A write is w q S (N) or w q v_i S (V), with the shape weight S <= 1 and
-   * w = 1 / (n0 sqrt_det_h), times the particle weight with use_weights. For
-   * a push the speed is bounded by 2 dx / dt, the largest displacement the
+   * w = 1 / (n0 sqrt_det_h), times the particle weight with use_weights. The
+   * speed bound is twice the largest stored speed component (the pushed
+   * speed of a particle grows by the electric kicks of one step only), for a
+   * push clamped to [1e-3, 1] times 2 dx / dt, the largest displacement the
    * single-cell rebucket of each half drift represents (a faster particle is
-   * not advanced correctly in any case); for the moments-only deposit the
-   * bound is twice the largest stored speed. A write above its bound goes to
-   * the global field instead of the scratch, so the bounds affect only speed
-   * and rounding, never the sum.
+   * not advanced correctly in any case). A write above its bound goes to the
+   * global field instead of the scratch, so the bounds affect only speed and
+   * rounding, never the sum.
    */
   template <kernel::hybrid::PushMode Mode, CartesianMetricClass M>
-  auto DepositWriteBound(const Domain<SimEngine::HYBRID, M>&    domain,
-                         const Particles<M::Dim, M::CoordType>& species,
-                         const kernel::hybrid::PusherContext&   ctx,
-                         real_t dt) -> Kokkos::Array<real_t, 4> {
+  auto DepositWriteBound(const Domain<SimEngine::HYBRID, M>&  domain,
+                         const kernel::hybrid::PusherContext& ctx,
+                         real_t                               dt,
+                         const StoredMaxima& stored) -> Kokkos::Array<real_t, 4> {
     // Minkowski: sqrt_det_h is uniform
     coord_t<M::Dim> xc { ZERO };
     for (auto d = 0u; d < static_cast<unsigned int>(M::Dim); ++d) {
@@ -90,36 +141,17 @@ namespace ntt::hybrid {
     }
     real_t w = ctx.inv_n0 / domain.mesh.metric.sqrt_det_h(xc);
     if (ctx.use_weights) {
-      real_t     wmax   = ZERO;
-      const auto weight = species.weight;
-      Kokkos::parallel_reduce(
-        "DepositWriteBoundW",
-        species.rangeActiveParticles(),
-        Lambda(prtlidx_t p, real_t & m) {
-          m = math::max(m, math::abs(weight(p)));
-        },
-        Kokkos::Max<real_t>(wmax));
-      w *= wmax;
+      w *= stored.weight;
     }
     const real_t bN = w * math::abs(static_cast<real_t>(ctx.charge));
     real_t       vmax;
     if constexpr (Mode == kernel::hybrid::PushMode::MomentsOnly) {
-      real_t     vm  = ZERO;
-      const auto ux1 = species.ux1;
-      const auto ux2 = species.ux2;
-      const auto ux3 = species.ux3;
-      Kokkos::parallel_reduce(
-        "DepositWriteBoundV",
-        species.rangeActiveParticles(),
-        Lambda(prtlidx_t p, real_t & m) {
-          m = math::max(m,
-                        math::max(math::abs(ux1(p)),
-                                  math::max(math::abs(ux2(p)), math::abs(ux3(p)))));
-        },
-        Kokkos::Max<real_t>(vm));
-      vmax = TWO * vm;
+      vmax = TWO * stored.speed;
     } else {
-      vmax = TWO * domain.mesh.metric.get_dx() / dt;
+      const real_t vlim = TWO * domain.mesh.metric.get_dx() / dt;
+      vmax              = math::min(
+        vlim,
+        math::max(TWO * stored.speed, static_cast<real_t>(1e-3) * vlim));
     }
     // at rest every V write is zero: any positive bound will do
     const real_t bV = bN * math::max(vmax, static_cast<real_t>(1e-6));
@@ -135,12 +167,17 @@ namespace ntt::hybrid {
    * @param dt time-step (unused for MomentsOnly).
    * @param team_size_req explicit tiled team size (0 = Kokkos::AUTO); only
    *        read on the TILED_DEPOSIT path.
+   * @param maxima per species the largest stored weight and speed, for the
+   *        fixed-point deposit bounds: set by the Predictor, used (once) by
+   *        the Corrector of the same step, whose particles have not moved
+   *        since; computed on the spot when absent
    */
   template <kernel::hybrid::PushMode Mode, CartesianMetricClass M>
   void runPusher(Domain<SimEngine::HYBRID, M>& domain,
                  const SimulationParams&       params,
                  real_t                        dt,
-                 int                           team_size_req = 0) {
+                 int                           team_size_req = 0,
+                 std::vector<StoredMaxima>*    maxima        = nullptr) {
     const auto omegaB0     = params.template get<real_t>("scales.omegaB0");
     const auto inv_n0      = ONE / params.template get<real_t>("scales.n0");
     const auto use_weights = params.template get<bool>("particles.use_weights");
@@ -156,7 +193,11 @@ namespace ntt::hybrid {
     auto scatter_aux = Kokkos::Experimental::create_scatter_view(domain.fields.aux);
 #endif
 
-    for (auto& species : domain.species) {
+    if (maxima != nullptr) {
+      maxima->resize(domain.species.size());
+    }
+    for (auto s { 0u }; s < domain.species.size(); ++s) {
+      auto& species = domain.species[s];
       if ((species.npart() == 0) or cmp::AlmostZero_host(species.mass())) {
         continue;
       }
@@ -254,7 +295,22 @@ namespace ntt::hybrid {
                           domain.mesh.metric };
       Kokkos::Array<real_t, 4> write_bound {};
       if constexpr (fixed_point) {
-        write_bound = DepositWriteBound<Mode>(domain, species, ctx, dt);
+        StoredMaxima stored;
+        if constexpr (Mode == kernel::hybrid::PushMode::Corrector) {
+          if (maxima != nullptr and (*maxima)[s].valid) {
+            stored             = (*maxima)[s];
+            (*maxima)[s].valid = false;
+          }
+        }
+        if (not stored.valid) {
+          stored = StoredParticleMaxima(species, use_weights);
+          if constexpr (Mode == kernel::hybrid::PushMode::Predictor) {
+            if (maxima != nullptr) {
+              (*maxima)[s] = stored;
+            }
+          }
+        }
+        write_bound = DepositWriteBound<Mode>(domain, ctx, dt, stored);
       }
       const tiled_t kern { domain.fields.aux, body, layout,
                            species.npart(),   0,    write_bound };
@@ -301,16 +357,19 @@ namespace ntt::hybrid {
   }
 
   /**
-   * @brief Advance all ion species from x^(n),v^(n) to x^(n+1),v^(n+1) and deposit
-   *        the corresponding ion moments into `aux` in the same pass.
-   * @param corrector false -> transient predictor push (no store, no particle BCs);
-   *                  true  -> accepted corrector push (store-back + particle BCs).
+   * @brief Advance all ion species from x^(n),v^(n) to x^(n+1),v^(n+1) and
+   * deposit the corresponding ion moments into `aux` in the same pass.
+   * @param corrector false -> transient predictor push (no store, no particle
+   * BCs); true  -> accepted corrector push (store-back + particle BCs).
+   * @param maxima per-species maxima of the stored particles, passed from the
+   *        predictor to the corrector of a step (see runPusher)
    */
   template <CartesianMetricClass M>
   void ParticlePush(Domain<SimEngine::HYBRID, M>& domain,
                     const prm::Parameters&        engine_params,
                     const SimulationParams&       params,
-                    bool                          corrector) {
+                    bool                          corrector,
+                    std::vector<StoredMaxima>&    maxima) {
     const auto dt = engine_params.get<real_t>("dt");
     // Optional runtime override for the tiled team (work-group) size;
     // 0 (default) keeps Kokkos::AUTO. Clamped to the backend max in
@@ -322,12 +381,14 @@ namespace ntt::hybrid {
       runPusher<kernel::hybrid::PushMode::Corrector>(domain,
                                                      params,
                                                      dt,
-                                                     team_size_req);
+                                                     team_size_req,
+                                                     &maxima);
     } else {
       runPusher<kernel::hybrid::PushMode::Predictor>(domain,
                                                      params,
                                                      dt,
-                                                     team_size_req);
+                                                     team_size_req,
+                                                     &maxima);
     }
   }
 

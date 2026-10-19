@@ -14,6 +14,8 @@
 
 #include "engines/engine.hpp"
 
+#include <vector>
+
 namespace ntt {
 
   template <CartesianMetricClass M>
@@ -38,6 +40,10 @@ namespace ntt {
 
     // time-centered moments for the corrector field advance (subcycle_centered)
     ndfield_t<M::Dim, 6> m_moments_half;
+
+    // largest stored weight and speed per species, from the predictor push to
+    // the corrector push of a step (bounds of the fixed-point deposit)
+    std::vector<hybrid::StoredMaxima> m_prtl_maxima;
 
   public:
     static constexpr auto S { SimEngine::HYBRID };
@@ -238,7 +244,11 @@ namespace ntt {
         timers.stop("FieldSolver");
       }
       timers.start("ParticlePusher");
-      hybrid::ParticlePush(dom, this->engineParams(), m_params, /* corrector */ false);
+      hybrid::ParticlePush(dom,
+                           this->engineParams(),
+                           m_params,
+                           /* corrector */ false,
+                           m_prtl_maxima);
       timers.stop("ParticlePusher");
       // additive remap of the predicted moments, image-plasma fold at the
       // reflecting walls, ghost fill for EMF #2
@@ -364,7 +374,11 @@ namespace ntt {
       // aux::012 <-- V^(n+1), aux::3 <-- N^(n+1) (bckp ghosts already filled
       // after EMF #2; Faraday push #3 does not touch bckp)
       timers.start("ParticlePusher");
-      hybrid::ParticlePush(dom, this->engineParams(), m_params, /* corrector */ true);
+      hybrid::ParticlePush(dom,
+                           this->engineParams(),
+                           m_params,
+                           /* corrector */ true,
+                           m_prtl_maxima);
       timers.stop("ParticlePusher");
 
       // additive remap of the final moments, image-plasma fold at the
